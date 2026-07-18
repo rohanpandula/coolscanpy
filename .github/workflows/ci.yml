@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # No --all-extras: the optional `scanner` extra (python-sane) is a
+        # source-only distribution that compiles against system libsane
+        # headers, which these runners don't have. The suite is
+        # hardware-free and never imports it for real (SANE-touching tests
+        # fake sys.modules["sane"]), so it isn't needed here.
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Run ruff
+        run: uv run ruff check .
