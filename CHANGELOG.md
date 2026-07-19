@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+0.1.3's live-table-vs-fingerprint frame count check broke full-roll scanning.
+A batch run over slots 3 and 20 of a reviewed 36-exposure roll failed with
+a `RollMismatch` reporting a live table of 37 scanner-addressable records
+against the reviewed fingerprint's 40, even though the same roll had
+scanned successfully six times earlier the same night on 0.1.1 and 0.1.2,
+neither of which had this check. A separate hardware investigation found
+why: the transport's native-origin ramp is clean while the feeder grips
+the film, then jumps by several frames' worth of distance the instant the
+trailing edge clears the drive, and every record built from that jump is
+garbage that gets excluded downstream. A live count several frames below
+the reviewed count is the ordinary shape of a roll ending, not a sign of a
+wrong roll, so 0.1.3's plus-or-minus-one tolerance was refusing a normal
+case in the direction it should never have restricted.
+
+The comparison is now a one-directional bound instead of a symmetric
+tolerance: it refuses a live count more than one above the reviewed count
+(the direction with no benign explanation), and no longer bounds how far
+the live count can fall below it. Roll identity was never this check's
+job in the first place -- the reviewed-fingerprint visual comparison
+refuses a genuinely different or reordered roll on its own, and the
+per-slot addressing checks that already run downstream refuse any
+requested slot the live table cannot address regardless of this count.
+
 ## 0.1.3
 
 A live hardware session scanning a 6-frame strip found two bugs in the
