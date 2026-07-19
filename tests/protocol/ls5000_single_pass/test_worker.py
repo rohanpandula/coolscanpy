@@ -1009,10 +1009,14 @@ def _one_slot_batch(tmp_path: Path, root_name: str, slot: int) -> tuple[worker_m
     )
 
 
-def test_batch_selections_refuse_when_live_table_count_is_far_from_reviewed(
+def test_batch_selections_refuse_when_live_table_count_is_far_above_reviewed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The comparison is one-directional: a live count above the reviewed
+    # count by more than the one-frame sliver tolerance has no benign
+    # explanation and must still be refused, even though a live count below
+    # the reviewed count is tolerated without limit elsewhere in this suite.
     mapping, records = _short_strip_mapping(9)
     reviewed = _reviewed_fingerprint_with_count(6)
     context = _batch_selection_context(mapping, records, reviewed)
@@ -1039,7 +1043,7 @@ def test_batch_selections_refuse_when_live_table_count_is_far_from_reviewed(
     with pytest.raises(
         ProtocolError,
         match=r"live table has 9 scanner-addressable frame records, more than "
-        r"one away from the 6",
+        r"one above the 6",
     ):
         worker_module._derive_live_batch_selections(
             [],

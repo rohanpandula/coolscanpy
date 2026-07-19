@@ -1118,17 +1118,42 @@ def _derive_live_batch_selections(
     # unrelated pipelines: the reviewed count only includes preview intervals
     # long enough to visually sign (MIN_FINGERPRINT_FRAME_ROWS, 16 rows, in
     # capture_process.py), while the live table includes any addressable
-    # transport-index slot regardless of its visual size. A short strip's
-    # trailing sliver can be addressable but too short to sign, so the live
-    # count can legitimately run one ahead of the reviewed count -- but no
-    # further, since a reread can only shift that one sliver across the
-    # 16-row signing threshold, not invent or lose a whole extra frame.
+    # transport-index slot regardless of its visual size, minus whatever this
+    # traversal's own table validation already excluded as unaddressable.
+    #
+    # The two directions this can diverge are not symmetric, so this is a
+    # one-directional bound rather than a tolerance band around zero. A short
+    # strip's trailing sliver can be addressable but too short to sign, so
+    # the live count can legitimately run one ahead of the reviewed count --
+    # but no further, since a reread can only shift that one sliver across
+    # the 16-row signing threshold, not invent a whole extra frame. Nothing
+    # benign pushes the live count higher than that, so the excess direction
+    # stays a hard refusal.
+    #
+    # The live count can legitimately fall several frames *short* of the
+    # reviewed count, though. The transport's native-origin ramp jumps by
+    # several frames' worth of distance the instant the trailing edge clears
+    # the feeder, and every record built from that jump is garbage that
+    # build_live_frame_table_payload already dropped above. That shortfall
+    # has no fixed size -- it depends on exactly where the roll's last frame
+    # sat relative to the drive's end-stop -- so, unlike the sliver case, it
+    # cannot be bounded by a small constant, and refusing on it would refuse
+    # an ordinary roll ending for reaching the end of its film.
+    #
+    # Refusing a genuinely different or reordered roll is not this
+    # comparison's job either way: compare_reviewed_roll_fingerprints and
+    # compare_selected_roll_fingerprint above already gate roll identity on
+    # visual content, and apply_batch_boundary_offsets and
+    # _bind_plan_to_live_selection below already refuse any requested slot
+    # the live table cannot address. So the only direction left for this
+    # comparison to refuse on its own is the one with no legitimate cause at
+    # all: more addressable live records than the reviewed roll described.
     live_signable_frame_count = build_live_frame_table_payload(combined)[2]
     reviewed_frame_count = len(reviewed_fingerprint.frame_start_rows)
-    if abs(live_signable_frame_count - reviewed_frame_count) > 1:
+    if live_signable_frame_count > reviewed_frame_count + 1:
         raise ProtocolError(
             f"live table has {live_signable_frame_count} scanner-addressable "
-            f"frame records, more than one away from the {reviewed_frame_count} "
+            f"frame records, more than one above the {reviewed_frame_count} "
             "the reviewed roll fingerprint described"
         )
     for origin in combined.origins[:FRAME_TABLE_SEND_RECORDS]:
