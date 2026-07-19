@@ -24,6 +24,7 @@ __all__ = [
     "RollMismatch",
     "FingerprintRefused",
     "ManualReviewRequired",
+    "RefeedRequired",
     "GeometryValidationError",
     "TransportSmearDetected",
     "SplitAlignmentError",
@@ -88,6 +89,18 @@ class ManualReviewRequired(RollMismatch):
     def __init__(self, message: str, *, slot: int) -> None:
         super().__init__(message)
         self.slot = slot
+
+
+class RefeedRequired(RollMismatch):
+    """The transport is parked at a physical end-stop and will not answer a
+    fresh index read.
+
+    A preview traversal of a strip shorter than a full roll can leave the
+    transport parked at the end of its travel. The next batch's fine-scan
+    fresh index read then fails outright. No automatic recovery is
+    attempted: the operator has to physically refeed the strip before
+    retrying.
+    """
 
 
 class GeometryValidationError(PyCoolscanError):

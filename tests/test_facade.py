@@ -1441,6 +1441,29 @@ class TestRollBatchRefusal:
             roll.close()
             dev.close()
 
+    def test_command_64_end_stop_status_raises_refeed_required(self, fake_service_factory, tmp_path: Path) -> None:
+        # This is the sense-failure signature a short-strip preview leaves
+        # behind: the fine-scan fresh index read's command 64 comes back
+        # with a non-zero status because the transport is parked at its
+        # end-stop.
+        message = (
+            "SynchronizedProtocolError: command 64 status 022b4b0000000000 "
+            "!= 0000000000000000"
+        )
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_refusal_spawner(message))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+                next(iter(roll.scan_many([1])))
+            assert "refeed" in str(excinfo.value) or "reinsert" in str(excinfo.value)
+            assert isinstance(excinfo.value, coolscanpy.RollMismatch)
+        finally:
+            roll.close()
+            dev.close()
+
 
 # ===========================================================================
 # SANE-free fallback: get_devices()/open()/scan()/eject()/roll() when
@@ -1581,6 +1604,7 @@ class TestExceptionHierarchy:
             "RollMismatch",
             "FingerprintRefused",
             "ManualReviewRequired",
+            "RefeedRequired",
             "GeometryValidationError",
             "TransportSmearDetected",
             "SplitAlignmentError",
@@ -1592,6 +1616,7 @@ class TestExceptionHierarchy:
     def test_fingerprint_refused_and_manual_review_required_are_roll_mismatch(self) -> None:
         assert issubclass(coolscanpy.FingerprintRefused, coolscanpy.RollMismatch)
         assert issubclass(coolscanpy.ManualReviewRequired, coolscanpy.RollMismatch)
+        assert issubclass(coolscanpy.RefeedRequired, coolscanpy.RollMismatch)
 
     def test_fingerprint_refused_carries_comparison(self) -> None:
         comparison = coolscanpy.FingerprintComparison(
