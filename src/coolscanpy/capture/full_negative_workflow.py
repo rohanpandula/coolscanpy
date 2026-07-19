@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import threading
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has byte-range locks instead of flock
+    fcntl = None
+    import msvcrt
 import json
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -102,13 +106,19 @@ def _exclusive_output_lock(root: Path):
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
             raise RuntimeError(f"full-negative capture is already in progress for {root}") from exc
         yield
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            else:
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
         finally:
             os.close(descriptor)
 

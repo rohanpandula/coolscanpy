@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+Windows: the exclusive output lock in the full-negative capture workflow
+used `fcntl.flock`, which does not exist on Windows and broke test
+collection there. The lock now uses `msvcrt` byte-range locking on
+Windows with the same refuse-overlapping-writers behavior.
+
 ## 0.1.1
 
 Fixes a bug found during the first live-hardware validation of 0.1.0: a
