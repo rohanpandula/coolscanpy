@@ -1113,6 +1113,24 @@ def _derive_live_batch_selections(
             if spec.manual_review_approval is not None
         ),
     )
+    # The reviewed fingerprint's frame count is in scope here, so cross-check
+    # it against the live table's addressable count. The two come from
+    # unrelated pipelines: the reviewed count only includes preview intervals
+    # long enough to visually sign (MIN_FINGERPRINT_FRAME_ROWS, 16 rows, in
+    # capture_process.py), while the live table includes any addressable
+    # transport-index slot regardless of its visual size. A short strip's
+    # trailing sliver can be addressable but too short to sign, so the live
+    # count can legitimately run one ahead of the reviewed count -- but no
+    # further, since a reread can only shift that one sliver across the
+    # 16-row signing threshold, not invent or lose a whole extra frame.
+    live_signable_frame_count = build_live_frame_table_payload(combined)[2]
+    reviewed_frame_count = len(reviewed_fingerprint.frame_start_rows)
+    if abs(live_signable_frame_count - reviewed_frame_count) > 1:
+        raise ProtocolError(
+            f"live table has {live_signable_frame_count} scanner-addressable "
+            f"frame records, more than one away from the {reviewed_frame_count} "
+            "the reviewed roll fingerprint described"
+        )
     for origin in combined.origins[:FRAME_TABLE_SEND_RECORDS]:
         if origin.native_origin + FINE_NATIVE_HEIGHT > context.geometry.native_height:
             raise ProtocolError(
@@ -1495,18 +1513,25 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
         ):
             break
         origins.append(origin)
-    # This parameter page is fixed-size even though the preview exposes up to
-    # 40 candidate cells. Every Nikon host SEND observed on this firmware uses
-    # 37 records / 300 bytes. The device accepted that exact shape and rejected
-    # otherwise well-formed 36-, 39-, and 40-record variants with 05/26/00.
-    if len(origins) < FRAME_TABLE_SEND_RECORDS:
+    # Every full-roll Nikon host SEND observed on this firmware used exactly
+    # 37 records / 300 bytes, so this function used to require at least 37
+    # origins before building anything and always truncated to exactly 37.
+    # That was a full-roll-era tripwire against truncated indexes, not a
+    # hardware minimum: roll identity is guarded by the reviewed-fingerprint
+    # comparison that runs immediately after, and addressing safety only
+    # requires that every requested slot actually exist in the table this
+    # function returns. apply_batch_boundary_offsets and
+    # _bind_plan_to_live_selection both already refuse a requested frame
+    # beyond the table they receive, so the only floor this function needs
+    # to hold on its own is unconditional: fewer than 2 records cannot
+    # describe an addressable roll or strip at all. The preview UI's own
+    # advisory ceiling above stays capped at the proven 37, since nothing
+    # bigger than a full roll has ever been sent.
+    if len(origins) < 2:
         raise ProtocolError(
-            "live mapping has fewer than 37 scanner-addressable frame records"
+            "live mapping has fewer than 2 scanner-addressable frame records"
         )
-    origins = origins[:FRAME_TABLE_SEND_RECORDS]
-    origins = tuple(origins)
-    if len(origins) != FRAME_TABLE_SEND_RECORDS:
-        raise ProtocolError("SEND(0x8f) frame table is not the proven 37 records")
+    origins = tuple(origins[:FRAME_TABLE_SEND_RECORDS])
     payload = bytearray((0x01, 0x2A, len(origins), 0x00))
     previous = -1
     for expected_frame, origin in enumerate(origins, start=1):
@@ -1609,12 +1634,17 @@ def _bind_plan_to_live_selection(
         expected[18:22] = native_origin.to_bytes(4, "big")
         entry["expected_data_in"] = expected.hex()
 
-    # Recheck the exact values that cross the unsafe hardware boundary.
+    # Recheck the exact values that cross the unsafe hardware boundary. The
+    # table's byte length is no longer pinned to the full-roll 300-byte shape
+    # (build_live_frame_table_payload now sizes it from the live mapping); what
+    # still has to hold, unconditionally, is that the bytes the CDB declares
+    # are exactly the bytes being transferred, so a short or long USB transfer
+    # can never desynchronize the device.
     if (
-        len(table_payload) != FRAME_TABLE_SEND_BYTES
-        or int.from_bytes(table_cdb[6:9], "big") != FRAME_TABLE_SEND_BYTES
+        len(table_payload) != 4 + table_count * 8
+        or int.from_bytes(table_cdb[6:9], "big") != len(table_payload)
     ):
-        raise ProtocolError("SEND(0x8f) transfer is not the proven 300 bytes")
+        raise ProtocolError("SEND(0x8f) transfer length does not match its declared table")
     if int.from_bytes(autofocus[5:9], "big") != autofocus_y:
         raise ProtocolError("dynamic autofocus Y was not bound")
     for sequence in DYNAMIC_WINDOW_SEQUENCES:

@@ -105,6 +105,20 @@ def _reviewed_fingerprint() -> ReviewedRollFingerprint:
     )
 
 
+def _reviewed_fingerprint_with_count(count: int) -> ReviewedRollFingerprint:
+    """A reviewed fingerprint describing exactly ``count`` signed slots."""
+
+    return ReviewedRollFingerprint(
+        source_preview_sha256="1" * 64,
+        source_table_sha256="2" * 64,
+        preview_shape=(6_104, 96, 3),
+        frame_start_rows=tuple(100 + 143 * index for index in range(count)),
+        frame_native_origins=tuple(6_000 + 6_000 * index for index in range(count)),
+        frame_visual_hashes=tuple(f"{index:064x}" for index in range(count)),
+        frame_visual_log_spans=(2.0,) * count,
+    )
+
+
 def test_frozen_worker_uses_pinned_meter_identity_without_loose_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,6 +448,52 @@ def _mapping(fields: tuple[tuple[int, int, int], ...]) -> TransportMapping:
     )
 
 
+def _short_strip_mapping(
+    count: int,
+    *,
+    non_addressable_trailing: int = 0,
+) -> tuple[TransportMapping, tuple[TransportRecord, ...]]:
+    """A live-shaped mapping/records pair shorter than a full roll.
+
+    ``non_addressable_trailing`` marks that many of the last ``count``
+    origins as outside the index raster, the same way a real detector would
+    flag a candidate slot build_live_frame_table_payload must not address.
+    """
+
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(2_000)
+    )
+    lookup_rows = tuple(100 + 143 * index for index in range(count))
+    origins = tuple(
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=row - 4,
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(
+                ("outside-index-raster",)
+                if frame > count - non_addressable_trailing
+                else ()
+            ),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(lookup_rows, start=1)
+    )
+    return TransportMapping(2_000, 0.0, 42.0, 0.0, 0.0, origins), records
+
+
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
     payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS))
     send = next(entry for entry in load_canonical_plan() if entry["seq"] == 174)
@@ -446,9 +506,16 @@ def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
     assert hashlib.sha256(payload).hexdigest() == "b78f6d8a1df1e0d5b242eda27eca88d121a6db2d2e64cf55ae9305142e39fc08"
 
 
-def test_frame_table_refuses_to_guess_when_fewer_than_37_origins_are_proven() -> None:
-    with pytest.raises(ProtocolError, match="fewer than 37"):
-        build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:36]))
+def test_frame_table_refuses_fewer_than_two_origins() -> None:
+    with pytest.raises(ProtocolError, match="fewer than 2"):
+        build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:1]))
+
+
+def test_frame_table_accepts_a_short_strip_mapping_below_37_origins() -> None:
+    payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:6]))
+
+    assert payload[2] == 6
+    assert len(payload) == 4 + 6 * 8
 
 
 def test_frame_table_ignores_advisory_slots_after_the_fixed_37_records() -> None:
@@ -684,6 +751,41 @@ def test_inferred_batch_origin_requires_its_receipt_bound_operator_approval() ->
     assert combined.origins[17] is resolved[0][1]
 
 
+def test_batch_offsets_accept_every_requested_slot_in_a_short_strip_mapping() -> None:
+    mapping, records = _short_strip_mapping(6)
+
+    combined, resolved = apply_batch_boundary_offsets(mapping, records, ((1, 0), (6, 0)))
+
+    assert len(combined.origins) == 6
+    assert [selected.frame for _base, selected in resolved] == [1, 6]
+
+    bound_plan = load_canonical_plan()
+    geometry = _derive_index_geometry(bound_plan)
+    for slot in (1, 6):
+        selection = SimpleNamespace(
+            frame=slot,
+            frame_count=len(combined.origins),
+            geometry=geometry,
+            mapping=combined,
+            selected=combined.origins[slot - 1],
+        )
+        _bind_plan_to_live_selection(bound_plan, selection)
+
+
+def test_batch_offsets_refuse_a_requested_slot_beyond_the_addressable_short_table() -> None:
+    # 7 candidate origins, but the 7th lies outside the index raster the same
+    # way a real detector would flag an inflated preview candidate -- so the
+    # scanner-addressable table this mapping can produce is only 1..6, even
+    # though frame 7 exists structurally in `mapping.origins`.
+    mapping, records = _short_strip_mapping(7, non_addressable_trailing=1)
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"requested frame 7 is outside the scanner-addressable table 1\.\.6",
+    ):
+        apply_batch_boundary_offsets(mapping, records, ((7, 0),))
+
+
 def test_fresh_batch_index_refuses_a_different_roll_before_plan_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -871,6 +973,130 @@ def test_batch_selected_slot_gate_runs_for_every_slot_before_plan_binding(
 
     assert checked == [7, 17]
     assert plan_bound is False
+
+
+def _batch_selection_context(
+    mapping: TransportMapping,
+    records: tuple[TransportRecord, ...],
+    reviewed: ReviewedRollFingerprint,
+) -> SimpleNamespace:
+    fresh = reviewed
+    return SimpleNamespace(
+        mapping=mapping,
+        geometry=SimpleNamespace(height=len(records), native_height=1_000_000),
+        usable_rows=0,
+        detection=None,
+        preview_sha256="a" * 64,
+        table_sha256="b" * 64,
+        decode_report={},
+        reviewed_fingerprint_sha256=reviewed.binding_sha256,
+        fresh_fingerprint=fresh,
+        fingerprint_comparison=worker_module.compare_reviewed_roll_fingerprints(reviewed, fresh),
+    )
+
+
+def _one_slot_batch(tmp_path: Path, root_name: str, slot: int) -> tuple[worker_module.BatchFrameSpec, ...]:
+    frame_root = tmp_path / root_name
+    return (
+        worker_module.BatchFrameSpec(
+            slot=slot,
+            boundary_offset_rows=0,
+            manual_review_approval=None,
+            output=frame_root / f"frame-{slot:03d}" / "capture.bin",
+            journal=frame_root / f"frame-{slot:03d}" / "journal.json",
+            ack=frame_root / f"frame-{slot:03d}" / "parent-ack.json",
+        ),
+    )
+
+
+def test_batch_selections_refuse_when_live_table_count_is_far_from_reviewed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping, records = _short_strip_mapping(9)
+    reviewed = _reviewed_fingerprint_with_count(6)
+    context = _batch_selection_context(mapping, records, reviewed)
+    frames = _one_slot_batch(tmp_path, "far-from-reviewed", 1)
+
+    monkeypatch.setattr(worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context)
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(records)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"live table has 9 scanner-addressable frame records, more than "
+        r"one away from the 6",
+    ):
+        worker_module._derive_live_batch_selections(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frames,
+            reviewed_fingerprint=reviewed,
+        )
+
+
+def test_batch_selections_accept_one_addressable_sliver_beyond_reviewed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The live table has one more addressable record than the reviewed
+    # fingerprint described -- exactly the shape of a trailing sliver that
+    # was too short to visually sign on the reviewed traversal but is still
+    # an addressable transport slot on this one.
+    mapping, records = _short_strip_mapping(7)
+    reviewed = _reviewed_fingerprint_with_count(6)
+    context = _batch_selection_context(mapping, records, reviewed)
+    frames = _one_slot_batch(tmp_path, "one-sliver-beyond-reviewed", 1)
+    bound_frames: list[int] = []
+
+    monkeypatch.setattr(worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context)
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(records)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_bind_plan_to_live_selection",
+        lambda _plan, selection: bound_frames.append(selection.frame),
+    )
+
+    selections = worker_module._derive_live_batch_selections(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frames,
+        reviewed_fingerprint=reviewed,
+    )
+
+    assert [selection.frame for selection in selections] == [1]
+    assert bound_frames == [1]
 
 
 def test_continuation_executor_runs_all_89_steps_with_fake_usb(
