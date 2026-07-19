@@ -467,7 +467,7 @@ def _short_strip_mapping(
             selector=row // 18,
             native_origin=42 * row,
         )
-        for row in range(2_000)
+        for row in range(6_000)
     )
     lookup_rows = tuple(100 + 143 * index for index in range(count))
     origins = tuple(
@@ -491,7 +491,7 @@ def _short_strip_mapping(
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    return TransportMapping(2_000, 0.0, 42.0, 0.0, 0.0, origins), records
+    return TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins), records
 
 
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
@@ -1101,6 +1101,72 @@ def test_batch_selections_accept_one_addressable_sliver_beyond_reviewed(
 
     assert [selection.frame for selection in selections] == [1]
     assert bound_frames == [1]
+
+
+def test_batch_selections_accept_a_live_count_several_frames_below_reviewed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: a live batch run over slots 3 and 20 of a reviewed
+    # 40-frame roll, where the transport's trailing edge cleared the feeder
+    # a few frames before the end and every record built from that jump was
+    # excluded as unaddressable -- leaving 37 scanner-addressable records
+    # against the reviewed fingerprint's 40. 0.1.3's plus-or-minus-one
+    # comparison refused this batch outright even though both requested
+    # slots were well within the addressable table; a live count several
+    # frames below the reviewed count is the ordinary shape of a roll
+    # ending, not a sign of a wrong or reordered roll, and must succeed.
+    mapping, records = _short_strip_mapping(40, non_addressable_trailing=3)
+    assert build_live_frame_table_payload(mapping)[2] == 37
+    reviewed = _reviewed_fingerprint_with_count(40)
+    context = _batch_selection_context(mapping, records, reviewed)
+    frame_root = tmp_path / "several-below-reviewed"
+    frames = tuple(
+        worker_module.BatchFrameSpec(
+            slot=slot,
+            boundary_offset_rows=0,
+            manual_review_approval=None,
+            output=frame_root / f"frame-{slot:03d}" / "capture.bin",
+            journal=frame_root / f"frame-{slot:03d}" / "journal.json",
+            ack=frame_root / f"frame-{slot:03d}" / "parent-ack.json",
+        )
+        for slot in (3, 20)
+    )
+    bound_frames: list[int] = []
+
+    monkeypatch.setattr(worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context)
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(records)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_bind_plan_to_live_selection",
+        lambda _plan, selection: bound_frames.append(selection.frame),
+    )
+
+    selections = worker_module._derive_live_batch_selections(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frames,
+        reviewed_fingerprint=reviewed,
+    )
+
+    assert [selection.frame for selection in selections] == [3, 20]
+    assert bound_frames == [3, 20]
 
 
 def test_continuation_executor_runs_all_89_steps_with_fake_usb(
