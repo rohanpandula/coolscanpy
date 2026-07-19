@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.3
+
+A live hardware session scanning a 6-frame strip found two bugs in the
+fine-scan path, both specific to strips shorter than a full roll.
+
+The frame table sent to SEND(0x8f) required at least 37 scanner-addressable
+records, a full-roll assumption left over from when every roll filled all
+37 slots. The live mapping's record count now only has to cover every
+requested slot in the batch, with a floor of 2. When a reviewed roll
+fingerprint is available at the same point, the live table's addressable
+count is also checked against the fingerprint's frame count, tolerating a
+difference of one for a trailing sliver that crosses the 16-row
+visual-signing threshold between traversals.
+
+A preview traversal of a short strip parks the transport at its physical
+end-stop. The next fine-scan attempt's fresh index read then fails with a
+non-zero status on command 64. That failure now raises a new
+`RefeedRequired` instead of a generic protocol error, with a message
+telling the operator to pull the strip out, reinsert it until the feeder
+grips, and retry the batch. No automatic eject or retry is attempted.
+
 ## 0.1.2
 
 The exclusive output lock in the full-negative capture workflow no longer

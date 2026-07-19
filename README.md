@@ -128,6 +128,17 @@ against other bodies are welcome, and an LS-50 test is particularly wanted:
 its transport and optics differ from the LS-5000, and none of those
 differences are covered here yet.
 
+Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
+scanning too. A preview traversal parks a short strip at the transport
+end-stop, so a batch run started right after a preview can raise
+`RefeedRequired`. Pull the strip out, reinsert it until the feeder grips,
+and run the batch again.
+
+The converted SA-21 parks the strip a few minutes after feeding, and the
+transport will not wake from parked. Start a capture within about ninety
+seconds of feeding. A stall in the transport-index read means the feeder
+parked; refeed rather than retry.
+
 ## Relationship to NegPy
 
 coolscanpy is a dependency, the way NegPy already consumes python-sane or
