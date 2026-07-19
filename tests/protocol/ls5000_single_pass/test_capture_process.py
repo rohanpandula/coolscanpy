@@ -1739,3 +1739,62 @@ def test_default_runner_uses_argv_without_shell_and_isolates_child_signals(
     assert recorded["shell"] is False
     assert recorded["start_new_session"] is True
     assert recorded["capture_output"] is True
+
+
+def test_roll_fingerprint_skips_trailing_sliver_and_filters_origins_in_lockstep() -> None:
+    rgb, intervals = _fingerprint_raster()
+    sliver_rows = capture.MIN_FINGERPRINT_FRAME_ROWS - 14
+    padded = np.concatenate((rgb, rgb[-sliver_rows:, :, :]), axis=0)
+    with_sliver = intervals + ((len(rgb), len(rgb) + sliver_rows),)
+    origins = tuple(6_000 + 6_000 * index for index in range(len(with_sliver)))
+
+    fingerprint = capture.build_reviewed_roll_fingerprint(
+        padded,
+        frame_intervals=with_sliver,
+        frame_native_origins=origins,
+        source_preview_sha256="1" * 64,
+        source_table_sha256="2" * 64,
+    )
+
+    assert len(fingerprint.frame_start_rows) == len(intervals)
+    assert len(fingerprint.frame_native_origins) == len(intervals)
+    assert len(fingerprint.frame_visual_hashes) == len(intervals)
+    assert origins[-1] not in fingerprint.frame_native_origins
+    assert len(rgb) not in fingerprint.frame_start_rows
+
+
+def test_sliver_bearing_and_sliver_free_traversals_stay_comparable() -> None:
+    rgb, intervals = _fingerprint_raster()
+    sliver_rows = 3
+    padded = np.concatenate((rgb, rgb[-sliver_rows:, :, :]), axis=0)
+    origins = tuple(6_000 + 6_000 * index for index in range(len(intervals)))
+
+    reviewed = capture.build_reviewed_roll_fingerprint(
+        padded,
+        frame_intervals=intervals + ((len(rgb), len(rgb) + sliver_rows),),
+        frame_native_origins=origins + (origins[-1] + 6_000,),
+        source_preview_sha256="1" * 64,
+        source_table_sha256="2" * 64,
+    )
+    fresh = capture.build_reviewed_roll_fingerprint(
+        rgb,
+        frame_intervals=intervals,
+        frame_native_origins=origins,
+        source_preview_sha256="4" * 64,
+        source_table_sha256="5" * 64,
+    )
+
+    comparison = capture.compare_reviewed_roll_fingerprints(reviewed, fresh)
+    assert comparison.matches is True
+
+
+def test_roll_fingerprint_rejects_all_sliver_rolls() -> None:
+    rgb, _ = _fingerprint_raster()
+    with pytest.raises(ValueError, match="at least one frame interval"):
+        capture.build_reviewed_roll_fingerprint(
+            rgb,
+            frame_intervals=((0, 2), (2, 5)),
+            frame_native_origins=(6_000, 12_000),
+            source_preview_sha256="1" * 64,
+            source_table_sha256="2" * 64,
+        )

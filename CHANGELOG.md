@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.1
+
+Fixes a bug found during the first live-hardware validation of 0.1.0: a
+roll whose strip end leaves a trailing sliver shorter than 16 preview rows
+crashed `build_reviewed_roll_fingerprint` on both the reviewed and the
+fresh traversal. Sliver intervals are now skipped deterministically on
+every traversal, frame native origins are filtered in lockstep with the
+visual hashes, and an all-sliver roll raises a clear `ValueError`.
+
+Live validation results from 2026-07-18, using the packaged wheel in a
+clean environment against an LS-5000: SANE-free USB enumeration, `open()`,
+option introspection, and a full roll preview of a 6-slot strip. Slots 1
+through 4 aligned automatically at offset 0, slot 5 was flagged for manual
+review near the strip end, and slot 6 was correctly reported as a 2-row
+trailing sliver rather than a frame.
+
 ## 0.1.0
 
 Initial standalone release, extracted from a NegPy integration branch.

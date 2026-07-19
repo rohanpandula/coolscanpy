@@ -454,6 +454,9 @@ class SelectedRollFingerprintComparison:
         }
 
 
+MIN_FINGERPRINT_FRAME_ROWS = 16
+
+
 def _roll_frame_visual_signature(frame: np.ndarray) -> tuple[str, float]:
     """Return a robust hash and calibrated information span for one slot."""
 
@@ -509,6 +512,7 @@ def build_reviewed_roll_fingerprint(
     if len(intervals) != len(origins):
         raise ValueError("roll fingerprint intervals and native origins differ")
     starts: list[int] = []
+    kept_origins: list[int] = []
     visual_hashes: list[str] = []
     visual_log_spans: list[float] = []
     for slot, interval in enumerate(intervals, start=1):
@@ -521,16 +525,27 @@ def build_reviewed_roll_fingerprint(
         start, end = interval
         if not 0 <= start < end <= len(array):
             raise ValueError(f"roll fingerprint interval {slot} is outside the preview")
+        if end - start < MIN_FINGERPRINT_FRAME_ROWS:
+            # A trailing sliver (strip end past the last gap) is physically
+            # real but carries too few rows to sign. Skip it on every
+            # traversal so reviewed and fresh fingerprints stay parallel.
+            continue
         starts.append(start)
+        kept_origins.append(origins[slot - 1])
         visual_hash, visual_log_span = _roll_frame_visual_signature(array[start:end])
         visual_hashes.append(visual_hash)
         visual_log_spans.append(visual_log_span)
+    if not starts:
+        raise ValueError(
+            "roll fingerprint requires at least one frame interval of "
+            f"{MIN_FINGERPRINT_FRAME_ROWS}+ preview rows"
+        )
     return ReviewedRollFingerprint(
         source_preview_sha256=source_preview_sha256,
         source_table_sha256=source_table_sha256,
         preview_shape=tuple(int(value) for value in array.shape),
         frame_start_rows=tuple(starts),
-        frame_native_origins=origins,
+        frame_native_origins=tuple(kept_origins),
         frame_visual_hashes=tuple(visual_hashes),
         frame_visual_log_spans=tuple(visual_log_spans),
     )

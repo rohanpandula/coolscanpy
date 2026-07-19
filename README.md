@@ -21,13 +21,16 @@ After extraction, a hardware-free test suite (807 tests) exercises the
 transport protocol, the roll engine, the receipt assembly, and the public
 facade against synthetic fixtures. It passes on Ubuntu, macOS, and Windows.
 
-Live checks resumed on 2026-07-18 with the packaged wheel installed into a
-clean environment: USB enumeration, `open()`, option introspection, and a
-clean `close()` all worked against a powered LS-5000 with no SANE
-installed. A full-roll preview attempted the same day stalled in the
-transport-index read; the film had sat through a power cycle, which this
-feeder answers by parking or releasing the strip. Preview and capture
-against a freshly fed roll are the next validation step.
+Live validation ran on 2026-07-18 with the packaged wheel installed into a
+clean environment against a powered LS-5000, with no SANE installed: USB
+enumeration, `open()`, option introspection, and a full roll preview of a
+6-slot strip. The transport index read cleanly, slots 1 through 4 came
+back aligned with no manual spacing offset, slot 5 was flagged for manual
+review near the strip end, and slot 6 was correctly reported as a 2-row
+trailing sliver rather than a frame. That run exposed one real bug, fixed
+in 0.1.1: roll fingerprinting rejected strips with a trailing sliver.
+Fine scans and IR capture have not been re-run live since the extraction;
+they are the remaining validation step.
 
 Coverage is uneven by material. `Material.COLOR_NEGATIVE` scans through a
 direct-USB single-pass path and is implemented end to end, preview through
