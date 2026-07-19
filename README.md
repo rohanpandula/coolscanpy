@@ -113,6 +113,13 @@ sugar for scanning one slot. Calling `roll.safe_stop()` from another thread
 lets the frame in flight finish normally; the next one raises
 `SafeStopRequested` instead of starting.
 
+`dev.roll(attempts_root=...)` names a directory that receives every capture
+attempt's on-disk evidence: the raw preview raster, the transport table,
+and the worker journals. A caller-supplied directory survives
+`roll.close()`, so a refused preview or batch can be diagnosed offline
+without another pass of the film. When omitted, attempts are written to a
+temporary directory that is removed on close.
+
 ## Hardware support
 
 Tested: Nikon Super Coolscan 5000 ED (LS-5000), firmware 1.03, with an SA-21
@@ -130,9 +137,11 @@ differences are covered here yet.
 
 Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
 scanning too. A preview traversal parks a short strip at the transport
-end-stop, so a batch run started right after a preview can raise
-`RefeedRequired`. Pull the strip out, reinsert it until the feeder grips,
-and run the batch again.
+end-stop, so the next index read, whether it starts another preview or a
+batch, can raise `RefeedRequired`. The Roll that observed the park then
+refuses every further hardware attempt: retrying against a parked
+transport can wedge it until a power cycle. Pull the strip out, reinsert
+it until the feeder grips, and open a fresh Roll.
 
 The converted SA-21 parks the strip a few minutes after feeding, and the
 transport will not wake from parked. Start a capture within about ninety

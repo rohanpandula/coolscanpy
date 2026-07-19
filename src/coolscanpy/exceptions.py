@@ -96,10 +96,12 @@ class RefeedRequired(RollMismatch):
     fresh index read.
 
     A preview traversal of a strip shorter than a full roll can leave the
-    transport parked at the end of its travel. The next batch's fine-scan
-    fresh index read then fails outright. No automatic recovery is
-    attempted: the operator has to physically refeed the strip before
-    retrying.
+    transport parked at the end of its travel. The next index read, whether
+    it starts another preview or a fine-scan batch, then fails outright. No
+    automatic recovery is attempted, and the Roll that observed the park
+    refuses every further hardware attempt: retrying against a parked
+    transport can wedge it until a power cycle. The operator has to
+    physically refeed the strip and open a fresh Roll.
     """
 
 

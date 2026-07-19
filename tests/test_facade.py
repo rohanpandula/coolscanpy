@@ -37,6 +37,7 @@ from coolscanpy.protocol.ls5000_single_pass.bundle import CAPTURE_BUNDLE_SHA256
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
+    POWER_CYCLE_RECOVERY,
     CaptureProcessAdapter,
 )
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import CANONICAL_CONTINUATION_PLAN_SHA256
@@ -299,6 +300,41 @@ class _PreviewAndBatchWorker:
         journal_path.write_text(json.dumps(journal), encoding="utf-8")
         self.events.append("preview")
         return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+
+@dataclass
+class _RefusedPreviewWorker:
+    """ProcessRunner double for a preview attempt the worker itself refused.
+
+    Writes the failed journal the real worker leaves behind, so
+    ``CaptureProcessAdapter._interpret_result`` exercises its real
+    synchronized-refusal/recovery-required classification."""
+
+    worker_sha256: str
+    message: str
+    recovery: str = "none"
+    events: list[str] = field(default_factory=list)
+
+    def __call__(self, argv: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+        assert "--preview-only" in argv, "this double only fakes preview attempts"
+        del cwd
+        journal = {
+            "status": "failed",
+            "error": self.message,
+            "recovery_required": self.recovery,
+            "capture_mode": "preview-only",
+            "requested_frame": None,
+            "requested_boundary_offset_rows": 0,
+            "expected_frame_count": None,
+            "expected_reads": 0,
+            "expected_bytes": 0,
+            "output": str(Path(_arg(argv, "--output")).resolve()),
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "capture_engine_sha256": self.worker_sha256,
+        }
+        Path(_arg(argv, "--journal")).write_text(json.dumps(journal), encoding="utf-8")
+        self.events.append("preview-refused")
+        return subprocess.CompletedProcess(list(argv), 1, "", "")
 
 
 def _roll_identity_payload(reviewed_sha: str, *, slot: int) -> dict[str, Any]:
@@ -666,6 +702,25 @@ def _make_roll(
     roll = Roll(
         device,
         material,
+        adapter=adapter,
+        workflow=_make_workflow(),
+        attempts_root=tmp_path / "attempts",
+    )
+    return roll, worker
+
+
+def _make_refused_preview_roll(
+    tmp_path: Path,
+    device: "coolscanpy.Device",
+    message: str,
+    *,
+    recovery: str = "none",
+) -> tuple[Roll, _RefusedPreviewWorker]:
+    worker = _RefusedPreviewWorker(worker_sha256="", message=message, recovery=recovery)
+    adapter = _adapter(tmp_path, worker, batch_spawner=_refusal_spawner("unused"))
+    roll = Roll(
+        device,
+        coolscanpy.Material.COLOR_NEGATIVE,
         adapter=adapter,
         workflow=_make_workflow(),
         attempts_root=tmp_path / "attempts",
@@ -1463,6 +1518,210 @@ class TestRollBatchRefusal:
         finally:
             roll.close()
             dev.close()
+
+
+# ===========================================================================
+# Roll preview refusal -> typed exceptions
+# ===========================================================================
+
+
+class TestRollPreviewRefusal:
+    def test_preview_command_64_end_stop_raises_refeed_required(self, fake_service_factory, tmp_path: Path) -> None:
+        # The same end-stop park signature as the batch case, but hit by a
+        # second preview instead of a fine scan: a short strip's first
+        # preview traversal parks the transport, and the next whole-roll
+        # index read is refused before any row is read.
+        message = (
+            "SynchronizedProtocolError: command 64 status 022b4b0000000000 "
+            "!= 0000000000000000"
+        )
+        dev = _open_device(fake_service_factory)
+        roll, worker = _make_refused_preview_roll(tmp_path, dev, message)
+        try:
+            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+                roll.preview()
+            assert "reinsert" in str(excinfo.value)
+            assert isinstance(excinfo.value, coolscanpy.RollMismatch)
+            assert worker.events == ["preview-refused"]
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_preview_recovery_required_raises_feeder_parked(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_refused_preview_roll(
+            tmp_path,
+            dev,
+            "worker desynchronized during the whole-roll index read",
+            recovery=POWER_CYCLE_RECOVERY,
+        )
+        try:
+            with pytest.raises(coolscanpy.FeederParked):
+                roll.preview()
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_preview_other_refusal_raises_generic_error(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_refused_preview_roll(
+            tmp_path, dev, "SynchronizedProtocolError: metering refused"
+        )
+        try:
+            with pytest.raises(coolscanpy.PyCoolscanError) as excinfo:
+                roll.preview()
+            assert not isinstance(
+                excinfo.value, (coolscanpy.RefeedRequired, coolscanpy.FeederParked)
+            )
+        finally:
+            roll.close()
+            dev.close()
+
+
+# ===========================================================================
+# Transport-fault latch: a parked transport refuses further attempts
+# ===========================================================================
+
+
+class TestRollTransportFaultLatch:
+    _PARK_MESSAGE = (
+        "SynchronizedProtocolError: command 64 status 022b4b0000000000 "
+        "!= 0000000000000000"
+    )
+
+    def test_preview_park_latches_all_further_attempts(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, worker = _make_refused_preview_roll(tmp_path, dev, self._PARK_MESSAGE)
+        try:
+            with pytest.raises(coolscanpy.RefeedRequired):
+                roll.preview()
+            # The second preview is refused before any hardware attempt:
+            # the worker ran exactly once.
+            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+                roll.preview()
+            assert "no hardware attempt was made" in str(excinfo.value)
+            assert worker.events == ["preview-refused"]
+            # Scanning is refused the same way, ahead of the missing-preview
+            # session check.
+            with pytest.raises(coolscanpy.RefeedRequired):
+                roll.scan(1)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_preview_recovery_latch_raises_feeder_parked(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, worker = _make_refused_preview_roll(
+            tmp_path,
+            dev,
+            "worker desynchronized during the whole-roll index read",
+            recovery=POWER_CYCLE_RECOVERY,
+        )
+        try:
+            with pytest.raises(coolscanpy.FeederParked):
+                roll.preview()
+            with pytest.raises(coolscanpy.FeederParked) as excinfo:
+                roll.preview()
+            assert "no hardware attempt was made" in str(excinfo.value)
+            assert worker.events == ["preview-refused"]
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_batch_park_latches_preview_and_scan(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, worker = _make_roll(
+            tmp_path, dev, batch_spawner=_refusal_spawner(self._PARK_MESSAGE)
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.RefeedRequired):
+                next(iter(roll.scan_many([1])))
+            # No new preview traversal is attempted on the parked transport.
+            with pytest.raises(coolscanpy.RefeedRequired):
+                roll.preview()
+            assert worker.events == ["preview"]
+            # scan_many refuses eagerly, at call time, not on first
+            # iteration.
+            with pytest.raises(coolscanpy.RefeedRequired):
+                roll.scan_many([1])
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_fingerprint_refusal_does_not_latch(self, fake_service_factory, tmp_path: Path) -> None:
+        message = (
+            "SynchronizedProtocolError: fresh live index does not match the "
+            "reviewed roll fingerprint: visual-content-mismatch"
+        )
+        dev = _open_device(fake_service_factory)
+        roll, worker = _make_roll(tmp_path, dev, batch_spawner=_refusal_spawner(message))
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            with pytest.raises(coolscanpy.FingerprintRefused):
+                next(iter(roll.scan_many([1])))
+            # A fingerprint disagreement is not a transport fault: the
+            # documented recovery is a fresh preview on this same Roll.
+            roll.preview()
+            assert worker.events == ["preview", "preview"]
+        finally:
+            roll.close()
+            dev.close()
+
+
+# ===========================================================================
+# attempts_root: caller-supplied evidence directories survive close()
+# ===========================================================================
+
+
+class TestRollAttemptsRoot:
+    def test_supplied_attempts_root_survives_close(self, fake_service_factory, tmp_path: Path) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path, dev, batch_spawner=_refusal_spawner("unused")
+        )
+        try:
+            roll.preview()
+        finally:
+            roll.close()
+            dev.close()
+        root = tmp_path / "attempts"
+        assert root.is_dir()
+        # The preview attempt's persisted artifacts are still readable
+        # after close, which is what makes offline re-detection possible.
+        assert list(root.rglob("capture-preview.bin"))
+        assert list(root.rglob("journal.json"))
+
+    def test_default_attempts_root_removed_on_close(self, fake_service_factory) -> None:
+        dev = _open_device(fake_service_factory)
+        roll = Roll(dev, coolscanpy.Material.COLOR_NEGATIVE)
+        root = roll._attempts_root
+        assert root.is_dir()
+        roll.close()
+        dev.close()
+        assert not root.exists()
+
+    def test_device_roll_passes_attempts_root_through(self, fake_service_factory, tmp_path: Path) -> None:
+        keep = tmp_path / "keep"
+        keep.mkdir()
+        marker = keep / "marker.txt"
+        marker.write_text("evidence", encoding="utf-8")
+        dev = _open_device(fake_service_factory)
+        roll = dev.roll(attempts_root=keep)
+        assert roll._attempts_root == keep
+        roll.close()
+        assert marker.read_text(encoding="utf-8") == "evidence"
+        # Omitting attempts_root keeps the self-cleaning default.
+        second = dev.roll()
+        temporary = second._attempts_root
+        assert temporary.is_dir()
+        second.close()
+        assert not temporary.exists()
+        dev.close()
 
 
 # ===========================================================================

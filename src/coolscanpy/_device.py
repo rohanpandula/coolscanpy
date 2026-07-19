@@ -34,6 +34,7 @@ unaffected by its absence.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from coolscanpy.exceptions import DeviceBusy, DeviceNotFound, EjectFailed
@@ -403,8 +404,20 @@ class Device:
         if event is not None:
             event.set()
 
-    def roll(self, *, material: Material = Material.COLOR_NEGATIVE) -> "Roll":
-        """Open the 40-slot roll-feeder extension."""
+    def roll(
+        self,
+        *,
+        material: Material = Material.COLOR_NEGATIVE,
+        attempts_root: str | Path | None = None,
+    ) -> "Roll":
+        """Open the 40-slot roll-feeder extension.
+
+        ``attempts_root`` names a directory that receives every capture
+        attempt's on-disk evidence and survives ``Roll.close()``, so a
+        refused preview or batch can be diagnosed offline. When omitted,
+        attempts are written to a temporary directory that is removed on
+        close.
+        """
 
         self._require_open()
         caps = self._info.capabilities
@@ -415,7 +428,11 @@ class Device:
         try:
             from coolscanpy._roll import Roll
 
-            return Roll(self, material)
+            return Roll(
+                self,
+                material,
+                attempts_root=None if attempts_root is None else Path(attempts_root),
+            )
         except BaseException:
             self._roll_lock.release()
             raise

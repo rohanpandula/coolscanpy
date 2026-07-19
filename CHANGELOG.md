@@ -15,11 +15,30 @@ difference of one for a trailing sliver that crosses the 16-row
 visual-signing threshold between traversals.
 
 A preview traversal of a short strip parks the transport at its physical
-end-stop. The next fine-scan attempt's fresh index read then fails with a
-non-zero status on command 64. That failure now raises a new
-`RefeedRequired` instead of a generic protocol error, with a message
-telling the operator to pull the strip out, reinsert it until the feeder
-grips, and retry the batch. No automatic eject or retry is attempted.
+end-stop. The next index read then fails with a non-zero status on
+command 64, whether that read starts a fine-scan batch or another
+preview. Both paths now raise a new `RefeedRequired` instead of a generic
+protocol error, with a message telling the operator to pull the strip
+out, reinsert it until the feeder grips, and open a fresh Roll. No
+automatic eject or retry is attempted.
+
+A Roll that observed a parked or wedged transport (`RefeedRequired` or
+`FeederParked`) now refuses every further hardware attempt on the same
+Roll, raising the same exception with a message saying no hardware
+attempt was made. Live testing showed that retrying against a parked
+transport escalates a recoverable park into a wedge that only a power
+cycle clears. The fault cannot be sensed as cleared from software, so the
+latch lasts for the Roll's lifetime and the operator opens a fresh Roll
+after refeeding.
+
+`Device.roll()` accepts a new `attempts_root` argument naming the
+directory that receives each capture attempt's on-disk evidence: the raw
+preview raster, the transport table, and the worker journals. A
+caller-supplied directory now survives `Roll.close()` instead of being
+deleted with the Roll's temporary state, so a refused preview or batch
+can be rerun and diagnosed offline without another pass of the film.
+When omitted, behaviour is unchanged: a temporary directory is created
+and removed on close.
 
 ## 0.1.2
 

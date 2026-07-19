@@ -119,6 +119,14 @@ class Roll:
     ``runner``/``batch_spawner``, or an ``LS5000SinglePassWorkflow`` built
     with a fake decoder/quality assessor, mirroring the concrete test
     suite's own seams (see tests/test_facade.py).
+
+    ``attempts_root`` selects where per-attempt evidence (the preview
+    raster, transport table, journals, and capture scratch) is written.
+    When omitted, a private temporary directory is created and removed on
+    :meth:`close`. When supplied, the directory and everything written
+    under it are preserved after :meth:`close`, so a refused preview or
+    batch can be rerun and diagnosed offline without another hardware
+    attempt.
     """
 
     def __init__(
@@ -136,11 +144,13 @@ class Roll:
         self._approvals: dict[int, Any] = {}
         self._stop_event = threading.Event()
         self._closed = False
+        self._owns_attempts_root = attempts_root is None
         self._attempts_root = (
             Path(attempts_root)
             if attempts_root is not None
             else Path(tempfile.mkdtemp(prefix="coolscanpy-roll-"))
         )
+        self._transport_fault: tuple[type[PyCoolscanError], str] | None = None
         self._adapter = adapter
         self._workflow = workflow if workflow is not None else LS5000SinglePassWorkflow()
 
@@ -164,12 +174,20 @@ class Roll:
         self.close()
 
     def close(self) -> None:
-        """Idempotent. Ends the batch reservation."""
+        """Idempotent. Ends the batch reservation.
+
+        When this Roll created its own temporary attempts directory, close
+        removes it. A caller-supplied ``attempts_root`` is preserved, along
+        with every attempt directory written under it, so a failed preview
+        or batch can be diagnosed offline from its persisted raster, table,
+        and journal.
+        """
 
         if self._closed:
             return
         self._closed = True
-        shutil.rmtree(self._attempts_root, ignore_errors=True)
+        if self._owns_attempts_root:
+            shutil.rmtree(self._attempts_root, ignore_errors=True)
         self._device._release_roll_lock()
 
     # -- preview ---------------------------------------------------------
@@ -187,9 +205,16 @@ class Roll:
         Calling ``preview()`` again re-reads the transport, replaces the
         fingerprint and all Thumbnails, and clears any recorded approvals
         (they become stale).
+
+        Raises ``RefeedRequired`` when the transport is parked at its
+        end-stop, which an earlier preview traversal of a strip shorter
+        than a full roll leaves behind. After that, or after
+        ``FeederParked``, this Roll refuses every further hardware attempt:
+        resolve the fault physically and open a fresh Roll.
         """
 
         self._require_open()
+        self._refuse_if_transport_fault()
         adapter = self._ensure_adapter()
         if on_progress is not None:
             on_progress(
@@ -209,14 +234,28 @@ class Roll:
             raise SafeStopRequested(str(error)) from error
 
         if attempt.outcome is CaptureOutcome.RECOVERY_REQUIRED:
-            raise FeederParked(
-                _journal_error(attempt)
-                or "scanner requires a power cycle before the next attempt"
+            raise self._record_transport_fault(
+                FeederParked(
+                    _journal_error(attempt)
+                    or "scanner requires a power cycle before the next attempt"
+                )
             )
         if attempt.outcome is not CaptureOutcome.COMPLETE:
-            raise PyCoolscanError(
+            message = (
                 _journal_error(attempt) or f"preview attempt did not complete: {attempt.outcome}"
             )
+            if _is_end_stop_park(message):
+                raise self._record_transport_fault(
+                    RefeedRequired(
+                        "the whole-roll index read was refused because the "
+                        "transport is parked at its end-stop, most often left "
+                        "there by an earlier preview traversal of a strip "
+                        "shorter than a full roll; pull the strip fully out, "
+                        "reinsert it until the feeder grips, then open a "
+                        "fresh Roll"
+                    )
+                )
+            raise PyCoolscanError(message)
 
         session = build_roll_preview_session(attempt, material=self._material)
         self._session = session
@@ -323,6 +362,8 @@ class Roll:
         the returned iterator is consumed.
         """
 
+        self._require_open()
+        self._refuse_if_transport_fault()
         session = self._require_session()
         ordered_slots = tuple(slots)
         if not ordered_slots:
@@ -435,9 +476,11 @@ class Roll:
                 if result.outcome is CaptureOutcome.RECOVERY_REQUIRED:
                     frame_queue.put((
                         "error",
-                        FeederParked(
-                            (result.session_journal or {}).get("error")
-                            or "scanner requires a power cycle before the next attempt"
+                        self._record_transport_fault(
+                            FeederParked(
+                                (result.session_journal or {}).get("error")
+                                or "scanner requires a power cycle before the next attempt"
+                            )
                         ),
                     ))
                     return
@@ -468,18 +511,21 @@ class Roll:
                     if "transport origin requires manual review" in message:
                         frame_queue.put(("error", ManualReviewRequired(message, slot=slots[0])))
                         return
-                    if "command 64 status" in message and "!= 0000000000000000" in message:
+                    if _is_end_stop_park(message):
                         # The fine-scan fresh index read's startup status came
                         # back non-zero: the transport is parked at its
                         # end-stop, most often left there by a preview
                         # traversal of a strip shorter than a full roll.
                         frame_queue.put((
                             "error",
-                            RefeedRequired(
-                                "the fine-scan fresh index read failed because the "
-                                "transport is parked at the end-stop from an earlier "
-                                "preview; pull the strip fully out, reinsert it until "
-                                "the feeder grips, then retry the batch"
+                            self._record_transport_fault(
+                                RefeedRequired(
+                                    "the fine-scan fresh index read failed because "
+                                    "the transport is parked at the end-stop from an "
+                                    "earlier preview; pull the strip fully out, "
+                                    "reinsert it until the feeder grips, then open a "
+                                    "fresh Roll and preview again"
+                                )
                             ),
                         ))
                         return
@@ -538,6 +584,37 @@ class Roll:
             self._adapter = CaptureProcessAdapter.packaged(self._attempts_root)
         return self._adapter
 
+    def _record_transport_fault(self, error: PyCoolscanError) -> PyCoolscanError:
+        """Latch the first parked/wedged-transport fault this Roll observes.
+
+        Returns ``error`` unchanged so refusal sites can raise or enqueue the
+        recorded exception in one expression.
+        """
+
+        if self._transport_fault is None:
+            self._transport_fault = (type(error), str(error))
+        return error
+
+    def _refuse_if_transport_fault(self) -> None:
+        """Refuse further hardware attempts after a parked-transport fault.
+
+        Retrying against a transport that refused its index read does not
+        recover it; observed live, it escalates a recoverable park into a
+        wedge that only a physical power cycle clears. The fault latches for
+        this Roll's whole lifetime because the library cannot sense a refeed:
+        the operator resolves the fault physically and opens a fresh Roll.
+        """
+
+        if self._transport_fault is None:
+            return
+        fault_type, original = self._transport_fault
+        raise fault_type(
+            "no hardware attempt was made: this Roll already observed a "
+            f"transport fault ({original}); retrying against a parked "
+            "transport can wedge it until a power cycle, so resolve the "
+            "fault physically and open a fresh Roll"
+        )
+
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("this Roll has been closed")
@@ -588,6 +665,14 @@ def _thumbnail_from_slot(slot: Any) -> Thumbnail:
         needs_approval=slot.manual_review,
         warnings=slot.warnings,
     )
+
+
+def _is_end_stop_park(message: str) -> bool:
+    """Recognize the worker refusal left by a transport parked at its
+    end-stop: the whole-roll or fine-scan index read's startup status came
+    back non-zero where the protocol requires all zeroes."""
+
+    return "command 64 status" in message and "!= 0000000000000000" in message
 
 
 def _journal_error(attempt: Any) -> str | None:
