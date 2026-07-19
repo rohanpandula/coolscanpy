@@ -104,21 +104,24 @@ def _exclusive_output_lock(root: Path):
     root.mkdir(parents=True, exist_ok=True)
     path = root / ".full-negative.lock"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
     try:
         try:
             if fcntl is not None:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:
                 msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            locked = True
         except OSError as exc:
             raise RuntimeError(f"full-negative capture is already in progress for {root}") from exc
         yield
     finally:
         try:
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            else:
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            if locked:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                else:
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
         finally:
             os.close(descriptor)
 

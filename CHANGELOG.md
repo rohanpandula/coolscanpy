@@ -2,10 +2,14 @@
 
 ## 0.1.2
 
-Windows: the exclusive output lock in the full-negative capture workflow
-used `fcntl.flock`, which does not exist on Windows and broke test
-collection there. The lock now uses `msvcrt` byte-range locking on
-Windows with the same refuse-overlapping-writers behavior.
+The exclusive output lock in the full-negative capture workflow no longer
+hard-imports `fcntl`, which does not exist on Windows and broke test
+collection there. Windows now uses `msvcrt` byte-range locking, and the
+lock is only released when it was actually acquired.
+
+CI runs on Linux and macOS. Windows stays out of scope for now: the
+transport layer has never run there and the concurrency tests assume
+POSIX lock semantics. The README says the same.
 
 ## 0.1.1
 

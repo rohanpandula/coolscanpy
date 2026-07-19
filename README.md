@@ -119,7 +119,9 @@ Tested: Nikon Super Coolscan 5000 ED (LS-5000), firmware 1.03, with an SA-21
 roll feeder wired for SA-30 compatibility.
 
 Untested: every other Coolscan model, and any roll feeder other than the
-SA-21/SA-30 configuration above. The code does not assume LS-5000-only
+SA-21/SA-30 configuration above. Platforms: the suite runs on Linux and
+macOS in CI. Windows is untested; the transport layer has never run there
+and the concurrency tests assume POSIX file-lock semantics. The code does not assume LS-5000-only
 behavior where the protocol is generic, but nothing beyond the one
 combination above has run against real film. Reports and pull requests
 against other bodies are welcome, and an LS-50 test is particularly wanted:
