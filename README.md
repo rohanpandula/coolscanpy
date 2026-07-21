@@ -1,13 +1,19 @@
 # coolscanpy
 
-coolscanpy is a direct-USB acquisition library for Nikon Coolscan film scanners.
-It exposes a python-sane-style API: open a device, read and set typed options,
-call `scan()` and get back an array. On top of that plain surface it adds a
-roll-feeder extension for whole-roll workflows. A roll can be previewed
-across all 40 addressable slots, each frame's transport spacing adjusted
-individually, then batch-scanned in one continuous reservation. Each
-scanned frame comes back as scanner-linear RGB, an aligned infrared plane,
-and an in-memory receipt.
+coolscanpy is a direct-USB acquisition library for Nikon Coolscan film
+scanners. It exposes a python-sane-style API: open a device, read and set
+typed options, call `scan()` and get back an array. On top of that plain
+surface it adds a roll-feeder extension for whole-roll workflows. A roll can
+be previewed across all 40 addressable slots, each frame's transport spacing
+adjusted individually, then batch-scanned in one continuous reservation.
+
+Each scanned frame comes back as:
+- scanner-linear RGB (4000 dpi, 16-bit)
+- an aligned infrared plane
+- the 285 dpi RGBI meter pass the scanner captured for auto-exposure (see
+  `Frame.meter_rgbi`)
+- an in-memory receipt with exposure, clipping, focus, and transport-smear
+  telemetry
 
 ## Status
 
@@ -29,16 +35,60 @@ back aligned with no manual spacing offset, slot 5 was flagged for manual
 review near the strip end, and slot 6 was correctly reported as a 2-row
 trailing sliver rather than a frame. That run exposed one real bug, fixed
 in 0.1.1: roll fingerprinting rejected strips with a trailing sliver.
-Fine scans and IR capture have not been re-run live since the extraction;
-they are the remaining validation step.
+
+As of 0.1.3, short strips (fewer than 6 frames) work for both preview and
+fine scanning. A fingerprint-count regression that rejected short strips
+was fixed in this release.
+
+The 285 dpi meter pass is now surfaced on every frame. The scanner already
+captures three of these per frame during auto-exposure; the third (settled
+exposure) is decoded and attached to the `Frame`. Downstream tools that
+need a dual-capture (prepass + main) can use it directly. See the
+[downstream pipeline](#downstream-pipeline) section.
 
 Coverage is uneven by material. `Material.COLOR_NEGATIVE` scans through a
 direct-USB single-pass path and is implemented end to end, preview through
-receipt. `Material.BLACK_AND_WHITE_NEGATIVE` previews and approves correctly,
-but its fine-scan path routes through SANE and that route is not yet wired
-into the roll batch engine; calling `scan()` or `scan_many()` on a
-black-and-white roll raises `NotImplementedError` with a message explaining
-the gap.
+receipt. `Material.BLACK_AND_WHITE_NEGATIVE` previews and approves
+correctly, but its fine-scan path routes through SANE and that route is not
+yet wired into the roll batch engine; calling `scan()` or `scan_many()` on
+a black-and-white roll raises `NotImplementedError` with a message
+explaining the gap.
+
+## Downstream pipeline
+
+coolscanpy gets the raw data off the scanner. Three other projects turn it
+into a finished image:
+
+**[digital-fauxice](https://github.com/rohanpandula/digital-fauxice)** —
+infrared dust and scratch repair. A byte-exact, from-scratch
+reimplementation of Digital ICE (the Nikon/Applied Science Fiction process
+that uses the IR channel to find defects and reconstruct the RGB underneath).
+Validated against Nikon's own output: 68 million 16-bit values per frame,
+zero mismatches. It takes the 4000 dpi RGBI main scan plus the 285 dpi
+meter pass as its prepass, and produces the same repaired output Nikon
+would have. An optional hybrid mode routes the worst damage (where the
+exact repair leaves visible scars) to a LaMa inpainting model, disclosed
+and bounded. The meter pass coolscanpy now surfaces on `Frame` is exactly
+what fauxice's input contract expects — same physical frame, same focus,
+same transport position, captured milliseconds before the fine scan.
+
+**[cool-colors](https://github.com/rohanpandula/cool-colors)** — C-41
+color inversion. Turns the scanner-linear negative into a positive,
+reproducing Nikon Scan 4's CMS-off color pipeline bit-for-bit (the
+per-frame inversion LUT, fixed tone curve, and gamma 2.2). With a
+captured per-frame builder LUT, output matches Nikon Scan byte-for-byte.
+Without it, a principled density inversion (film-base estimation, log
+inversion, normalization) gets you a natural positive from any C-41 scan.
+
+**[NegPy](https://github.com/marcinz606/NegPy)** — the desktop
+application that ties capture, repair, and inversion together behind a
+GUI. It consumes coolscanpy as an optional scanner backend, digital-fauxice
+as an optional IR repair engine, and runs its own inversion pipeline for
+the final print rendering.
+
+The pipeline in order: coolscanpy captures → fauxice repairs dust →
+cool-colors (or NegPy) inverts to a positive. Each step is optional and
+independently installable.
 
 ## Install
 
@@ -103,6 +153,9 @@ with coolscanpy.open("ls5000") as dev:
         selected = [thumb.slot for thumb in thumbnails[:36]]
         for frame in roll.scan_many(selected):
             print(frame.slot, frame.rgb.shape, frame.receipt.transport_smear.verdict)
+            # The 285 dpi RGBI meter pass, if present:
+            if frame.meter_rgbi is not None:
+                print("  prepass for fauxice:", frame.meter_rgbi.shape)
 
         roll.eject()
 ```
@@ -170,12 +223,15 @@ returned with smeared rows.
 ## What this package is not
 
 There is no GUI. The RGB comes back scanner-linear and unmodified; color
-inversion and print rendering belong to the application above this library.
+inversion and print rendering belong to the application above this library
+(see [cool-colors](https://github.com/rohanpandula/cool-colors) for a
+standalone C-41 inverter, or
+[NegPy](https://github.com/marcinz606/NegPy) for the full desktop app).
 The infrared plane comes back raw as well. Turning it into a defect mask
 and healing the dust it reveals is the job of
-[digital-fauxice](https://github.com/rohanpandula/digital-fauxice), a
-from-scratch reimplementation of Digital ICE built to consume exactly this
-kind of RGBI capture.
+[digital-fauxice](https://github.com/rohanpandula/digital-fauxice), which
+consumes this package's RGBI output directly — the `Frame.meter_rgbi`
+field is the 285 dpi prepass its input contract requires.
 
 ## License
 
