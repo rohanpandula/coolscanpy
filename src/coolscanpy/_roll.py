@@ -92,6 +92,7 @@ if TYPE_CHECKING:
 RECEIPT_VERSION = 1
 LS5000_FINE_DPI = 4_000
 LS5000_FINE_DEPTH = 16
+_METER_PASS_BYTES = 1_088_000
 
 # Generous defensive backstop for winding down scan_many's worker thread --
 # not a hardware operation timeout (a real fine-scan frame is never
@@ -385,10 +386,12 @@ class Roll:
                 finalization = workflow.finalize_attempt(single_pass_attempt)
             except SinglePassWorkflowError as error:
                 raise _translate_finalization_error(error) from error
+            meter_rgbi = _read_meter_rgbi(single_pass_attempt)
             frame = _read_frame(
                 finalization,
                 slot=attempt_result.request.selected_slot,
                 device_id=device_id,
+                meter_rgbi=meter_rgbi,
             )
             produced_count += 1
             if on_progress is not None:
@@ -752,11 +755,36 @@ def _build_receipt(
     )
 
 
+def _read_meter_rgbi(attempt: SinglePassAttempt) -> "np.ndarray | None":
+    """Pull the third 285-dpi meter pass out of ``{stem}-meter.bin`` and
+    hand it back as a (425, 281, 4) uint16 RGBI array.
+
+    The worker writes three consecutive meter passes next to the packed
+    stream. All three cover the same physical frame -- the third one
+    carries the settled exposure, so it doubles as the prepass fauxice
+    expects. Returns None when the sidecar is missing (preview-only
+    captures, older runs).
+    """
+
+    meter_path = attempt.stream_path.with_name(f"{attempt.stream_path.stem}-meter.bin")
+    if not meter_path.exists():
+        return None
+    raw = meter_path.read_bytes()
+    if len(raw) < _METER_PASS_BYTES * 3:
+        return None
+    last_pass = raw[_METER_PASS_BYTES * 2 : _METER_PASS_BYTES * 3]
+    from coolscanpy.protocol.ls5000_single_pass.meter import decode_meter_pass
+
+    decoded = decode_meter_pass(last_pass)
+    return decoded.image
+
+
 def _read_frame(
     finalization: SinglePassFinalizationResult,
     *,
     slot: int,
     device_id: str,
+    meter_rgbi: "np.ndarray | None" = None,
 ) -> Frame:
     output_paths = finalization.output_paths
     rgb = tifffile.imread(output_paths["rgb"])
@@ -765,7 +793,7 @@ def _read_frame(
     artifacts = {"rgb": _array_evidence(rgb), "ir": _array_evidence(ir)}
     receipt = _build_receipt(finalization.manifest, device_id=device_id, artifacts=artifacts)
     _cleanup_finalization(finalization)
-    return Frame(slot=slot, rgb=rgb, ir=ir, ir_validity=ir_validity, receipt=receipt)
+    return Frame(slot=slot, rgb=rgb, ir=ir, ir_validity=ir_validity, receipt=receipt, meter_rgbi=meter_rgbi)
 
 
 def _cleanup_finalization(finalization: SinglePassFinalizationResult) -> None:

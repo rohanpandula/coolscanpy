@@ -258,3 +258,4 @@ class Frame:
     ir: np.ndarray | None
     ir_validity: np.ndarray | None
     receipt: Receipt
+    meter_rgbi: np.ndarray | None = None
