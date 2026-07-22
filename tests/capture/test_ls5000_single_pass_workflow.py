@@ -28,6 +28,13 @@ from coolscanpy.capture.single_pass_workflow import (
     SinglePassWorkflowError,
 )
 from coolscanpy.capture import single_pass_workflow as workflow_module
+from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import (
+    STREAM_DATA_SUFFIX,
+    STREAM_RECEIPT_KIND,
+    STREAM_RECEIPT_STATUS,
+    STREAM_RECEIPT_SUFFIX,
+    STREAM_RECEIPT_VERSION,
+)
 from coolscanpy.receipts.quality import (
     FocusDetailTelemetry,
     ScanClippingTelemetry,
@@ -262,7 +269,9 @@ def _workflow(**overrides: object) -> LS5000SinglePassWorkflow:
     return LS5000SinglePassWorkflow(**arguments)
 
 
-def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(tmp_path: Path) -> None:
+def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(
+    tmp_path: Path,
+) -> None:
     attempt, stream = _attempt(tmp_path)
     decoded = _decoded()
     workflow = _workflow()
@@ -274,8 +283,12 @@ def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(tmp_
     assert completed.manifest_path.is_file()
     rgb_path = completed.output_paths["rgb"]
     ir_path = completed.output_paths["ir"]
-    np.testing.assert_array_equal(tifffile.imread(rgb_path), np.rot90(decoded, k=1)[..., :3])
-    np.testing.assert_array_equal(tifffile.imread(ir_path), np.rot90(decoded, k=1)[..., 3])
+    np.testing.assert_array_equal(
+        tifffile.imread(rgb_path), np.rot90(decoded, k=1)[..., :3]
+    )
+    np.testing.assert_array_equal(
+        tifffile.imread(ir_path), np.rot90(decoded, k=1)[..., 3]
+    )
     with tifffile.TiffFile(rgb_path) as tiff:
         assert has_linear_scanner_rgb_marker(tiff.pages[0].tags)
 
@@ -288,7 +301,9 @@ def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(tmp_
     assert manifest["frame_evidence"]["selected"]["manual_review"] is True
     assert manifest["frame_evidence"]["roll_identity"]["comparison"]["matches"] is True
     assert manifest["frame_evidence"]["manual_review_approval"]["slot"] == 39
-    assert manifest["orientation"]["source_to_storage"] == "numpy rot90(k=1, axes=(0,1))"
+    assert (
+        manifest["orientation"]["source_to_storage"] == "numpy rot90(k=1, axes=(0,1))"
+    )
     smear_qc = manifest["quality_control"]["stopped_transport_smear"]
     assert smear_qc["coordinate_space"] == "scanner-native RGB before storage rotation"
     assert smear_qc["required_verdict"] == "clean"
@@ -580,7 +595,9 @@ def test_smear_qc_refuses_before_write_and_retains_scratch(
     attempt, stream = _attempt(tmp_path)
     writer_called = False
 
-    def forbidden_writer(*_args: object, **_kwargs: object) -> dict[str, dict[str, object]]:
+    def forbidden_writer(
+        *_args: object, **_kwargs: object
+    ) -> dict[str, dict[str, object]]:
         nonlocal writer_called
         writer_called = True
         raise AssertionError("refused RGB must not reach the writer")
@@ -599,7 +616,9 @@ def test_smear_qc_refuses_before_write_and_retains_scratch(
     assert not (attempt.directory / "final" / "manifest.json").exists()
 
 
-def test_boundary_offset_is_bound_from_request_through_completion_manifest(tmp_path: Path) -> None:
+def test_boundary_offset_is_bound_from_request_through_completion_manifest(
+    tmp_path: Path,
+) -> None:
     attempt, _stream = _attempt(tmp_path, selected_slot=7, boundary_offset_rows=-23)
 
     completed = _workflow().finalize_attempt(attempt, delete_scratch=False)
@@ -633,14 +652,21 @@ def test_smear_qc_receives_scanner_native_rgb_before_rotation(tmp_path: Path) ->
     ("mutate", "message"),
     [
         (lambda journal: journal.__setitem__("status", "failed"), "status"),
-        (lambda journal: journal.__setitem__("scanner_identity", "Other scanner"), "identity"),
+        (
+            lambda journal: journal.__setitem__("scanner_identity", "Other scanner"),
+            "identity",
+        ),
         (lambda journal: journal.__setitem__("requested_frame", 38), "requested_frame"),
         (
-            lambda journal: journal["fine_set_windows_preflight"][0].__setitem__("exposure_raw_10ns", 1),
+            lambda journal: journal["fine_set_windows_preflight"][0].__setitem__(
+                "exposure_raw_10ns", 1
+            ),
             "changed between SET_WINDOW and GET_WINDOW",
         ),
         (
-            lambda journal: journal["meter_final_exposures"]["wire_colors_raw_10ns"].__setitem__("9", 1),
+            lambda journal: journal["meter_final_exposures"][
+                "wire_colors_raw_10ns"
+            ].__setitem__("9", 1),
             "exposure echo",
         ),
     ],
@@ -688,7 +714,9 @@ def test_decode_failure_retains_scratch(tmp_path: Path) -> None:
     def broken_decoder(_path: Path) -> tuple[np.ndarray, dict[str, object]]:
         raise ValueError("padding counter mismatch")
 
-    with pytest.raises(SinglePassIntegrityError, match="decode refused.*padding counter mismatch"):
+    with pytest.raises(
+        SinglePassIntegrityError, match="decode refused.*padding counter mismatch"
+    ):
         _workflow(decoder=broken_decoder).finalize_attempt(attempt)
 
     assert stream.is_file()
@@ -698,7 +726,9 @@ def test_decode_failure_retains_scratch(tmp_path: Path) -> None:
 def test_writer_failure_retains_scratch(tmp_path: Path) -> None:
     attempt, stream = _attempt(tmp_path)
 
-    def broken_writer(*_args: object, **_kwargs: object) -> dict[str, dict[str, object]]:
+    def broken_writer(
+        *_args: object, **_kwargs: object
+    ) -> dict[str, dict[str, object]]:
         raise OSError("disk full")
 
     with pytest.raises(SinglePassWorkflowError, match="writer failed.*disk full"):
@@ -708,10 +738,14 @@ def test_writer_failure_retains_scratch(tmp_path: Path) -> None:
     assert not (attempt.directory / "final" / "manifest.json").exists()
 
 
-def test_output_reverification_failure_retains_scratch_and_withholds_manifest(tmp_path: Path) -> None:
+def test_output_reverification_failure_retains_scratch_and_withholds_manifest(
+    tmp_path: Path,
+) -> None:
     attempt, stream = _attempt(tmp_path)
 
-    def corrupting_writer(*args: object, **kwargs: object) -> dict[str, dict[str, object]]:
+    def corrupting_writer(
+        *args: object, **kwargs: object
+    ) -> dict[str, dict[str, object]]:
         evidence = write_full_negative_tiff(*args, **kwargs)
         rgb_path = attempt.directory / "final" / "frame039.tif"
         rgb_path.write_bytes(rgb_path.read_bytes() + b"changed-after-writer-evidence")
@@ -724,7 +758,9 @@ def test_output_reverification_failure_retains_scratch_and_withholds_manifest(tm
     assert not (attempt.directory / "final" / "manifest.json").exists()
 
 
-def test_manifest_failure_retains_scratch_after_tiffs_are_durable(tmp_path: Path) -> None:
+def test_manifest_failure_retains_scratch_after_tiffs_are_durable(
+    tmp_path: Path,
+) -> None:
     attempt, stream = _attempt(tmp_path)
 
     def broken_manifest(_path: Path, _payload: bytes) -> None:
@@ -738,7 +774,9 @@ def test_manifest_failure_retains_scratch_after_tiffs_are_durable(tmp_path: Path
     assert not (attempt.directory / "final" / "manifest.json").exists()
 
 
-def test_cleanup_failure_keeps_verified_archive_and_retains_scratch(tmp_path: Path) -> None:
+def test_cleanup_failure_keeps_verified_archive_and_retains_scratch(
+    tmp_path: Path,
+) -> None:
     attempt, stream = _attempt(tmp_path)
 
     def broken_cleanup(_path: Path) -> None:
@@ -752,13 +790,19 @@ def test_cleanup_failure_keeps_verified_archive_and_retains_scratch(tmp_path: Pa
     assert len(list((attempt.directory / "final").glob("*.tif"))) == 3
 
 
-def test_success_deletes_scratch_only_after_checkpoint_then_resume_skips_decode_and_write(tmp_path: Path) -> None:
+def test_success_deletes_scratch_only_after_checkpoint_then_resume_skips_decode_and_write(
+    tmp_path: Path,
+) -> None:
     attempt, stream = _attempt(tmp_path)
     completed = _workflow().finalize_attempt(attempt)
 
     assert completed.scratch_deleted is True
     assert not stream.exists()
-    checkpoint = json.loads((attempt.directory / "final" / "scratch-deletion.json").read_text(encoding="utf-8"))
+    checkpoint = json.loads(
+        (attempt.directory / "final" / "scratch-deletion.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert checkpoint["source_sha256"] == _sha256(b"12345678")
     assert checkpoint["source_bytes"] == 8
 
@@ -770,16 +814,22 @@ def test_success_deletes_scratch_only_after_checkpoint_then_resume_skips_decode_
     assert resumed.scratch_deleted is True
 
 
-def test_resume_does_not_skip_when_a_committed_output_hash_no_longer_verifies(tmp_path: Path) -> None:
+def test_resume_does_not_skip_when_a_committed_output_hash_no_longer_verifies(
+    tmp_path: Path,
+) -> None:
     attempt, _stream = _attempt(tmp_path)
     completed = _workflow().finalize_attempt(attempt)
-    completed.output_paths["ir"].write_bytes(completed.output_paths["ir"].read_bytes() + b"tampered")
+    completed.output_paths["ir"].write_bytes(
+        completed.output_paths["ir"].read_bytes() + b"tampered"
+    )
 
     with pytest.raises(SinglePassIntegrityError, match="hash"):
         _workflow().finalize_attempt(attempt)
 
 
-def test_resume_rejects_semantically_tampered_manifest_even_when_outputs_are_unchanged(tmp_path: Path) -> None:
+def test_resume_rejects_semantically_tampered_manifest_even_when_outputs_are_unchanged(
+    tmp_path: Path,
+) -> None:
     attempt, _stream = _attempt(tmp_path)
     completed = _workflow().finalize_attempt(attempt)
     manifest = json.loads(completed.manifest_path.read_text(encoding="utf-8"))
@@ -804,3 +854,580 @@ def test_resume_rejects_legacy_manifest_missing_required_quality_evidence(
 
     with pytest.raises(SinglePassIntegrityError, match=missing.replace("_", " ")):
         _workflow().finalize_attempt(attempt)
+
+
+# --- streamed-artifact consumption by the default finalization -------------
+
+
+def _data_path(stream: Path) -> Path:
+    return stream.parent / (stream.name + STREAM_DATA_SUFFIX)
+
+
+def _receipt_path(stream: Path) -> Path:
+    return stream.parent / (stream.name + STREAM_RECEIPT_SUFFIX)
+
+
+def _write_stream_npy(stream: Path, array: np.ndarray) -> Path:
+    path = _data_path(stream)
+    np.save(path, array)
+    return path
+
+
+def _write_stream_receipt(
+    stream: Path,
+    array: np.ndarray,
+    *,
+    records: int = 2,
+    raw_sha256: str | None = None,
+    raw_bytes: int | None = None,
+    derived_sha256: str | None = None,
+    layout: dict[str, object] | None = None,
+) -> Path:
+    data_path = _data_path(stream)
+    raw = stream.read_bytes()
+    receipt = {
+        "kind": STREAM_RECEIPT_KIND,
+        "version": STREAM_RECEIPT_VERSION,
+        "status": STREAM_RECEIPT_STATUS,
+        "derived_filename": data_path.name,
+        "derived_sha256": (
+            derived_sha256
+            if derived_sha256 is not None
+            else hashlib.sha256(data_path.read_bytes()).hexdigest()
+        ),
+        "derived_bytes": data_path.stat().st_size,
+        "raw_sha256": (
+            raw_sha256 if raw_sha256 is not None else hashlib.sha256(raw).hexdigest()
+        ),
+        "raw_bytes": raw_bytes if raw_bytes is not None else len(raw),
+        "height": int(array.shape[0]),
+        "width": int(array.shape[1]),
+        "channels": int(array.shape[2]),
+        "dtype": "uint16",
+        "layout": (
+            layout
+            if layout is not None
+            else {
+                "padding_validated_records": records,
+                "rgb_samples_decoded": 4,
+                "ir_planes_transferred": 1,
+                "rgb_average": "round-half-up uint16 average",
+            }
+        ),
+    }
+    path = _receipt_path(stream)
+    path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def _publish_valid_stream(stream: Path, array: np.ndarray) -> None:
+    data_path = _write_stream_npy(stream, array)
+    receipt_path = _write_stream_receipt(stream, array)
+    raw = stream.read_bytes()
+    journal_path = stream.parent / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["streaming_decode"] = {
+        "status": "ok",
+        "receipt": receipt_path.name,
+        "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "receipt_bytes": receipt_path.stat().st_size,
+        "derived_filename": data_path.name,
+        "derived_sha256": hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        "derived_bytes": data_path.stat().st_size,
+        "bound_raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "bound_raw_bytes": len(raw),
+    }
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+
+class _OfflineSpy:
+    """Stands in for decode_full_records so a fallback is observable."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+        self.calls = 0
+
+    def __call__(self, _path: Path, *, width: object = None, height: object = None):
+        self.calls += 1
+        return self.array, {
+            "padding_validated_records": 2,
+            "rgb_samples_decoded": 4,
+            "ir_planes_transferred": 1,
+        }
+
+
+def _default_workflow() -> LS5000SinglePassWorkflow:
+    # No injected decoder: exercise the built-in streaming-aware default path.
+    return LS5000SinglePassWorkflow(
+        contract=_contract(),
+        smear_assessor=lambda _rgb, *, dpi: _smear_assessment(),
+    )
+
+
+def test_default_finalization_consumes_bound_streamed_artifact_and_skips_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    offline_marker = np.full((3, 2, 4), 9, dtype=np.uint16)
+    spy = _OfflineSpy(offline_marker)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 0, "offline decode must be skipped for a valid bound artifact"
+    rgb = tifffile.imread(completed.output_paths["rgb"])
+    np.testing.assert_array_equal(rgb, np.rot90(decoded, k=1)[..., :3])
+    manifest = json.loads(completed.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["decode_layout"]["streaming_receipt"] == _receipt_path(stream).name
+    # The raw oracle is preserved; finalization did not consume it as the image.
+    assert stream.is_file()
+
+
+def test_abandoned_worker_outcome_cannot_be_blessed_by_leftover_valid_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["streaming_decode"] = {
+        "status": "abandoned",
+        "receipt": None,
+        "reason": "cleanup-incomplete",
+    }
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert _receipt_path(stream).exists()
+    assert _data_path(stream).exists()
+
+
+def test_boolean_receipt_version_falls_back_even_when_journal_binding_is_updated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+
+    receipt_path = _receipt_path(stream)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["version"] = True
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["streaming_decode"]["receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    journal["streaming_decode"]["receipt_bytes"] = receipt_path.stat().st_size
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+
+
+def test_default_finalization_falls_back_to_offline_decode_without_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    np.testing.assert_array_equal(
+        tifffile.imread(completed.output_paths["rgb"]), np.rot90(decoded, k=1)[..., :3]
+    )
+
+
+def test_orphan_data_without_receipt_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _write_stream_npy(stream, decoded)  # data, but no receipt -> abandoned sidecar
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert completed.manifest_path.is_file()
+
+
+def test_corrupt_receipt_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _write_stream_npy(stream, decoded)
+    _receipt_path(stream).write_text("{this is not valid json", encoding="utf-8")
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert completed.manifest_path.is_file()
+
+
+def test_derived_artifact_corruption_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    data_path = _data_path(stream)
+    with data_path.open("r+b") as handle:  # flip a byte after the receipt hashed it
+        handle.seek(20)
+        original = handle.read(1)
+        handle.seek(20)
+        handle.write(bytes([original[0] ^ 0xFF]))
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert completed.manifest_path.is_file()
+
+
+def test_raw_digest_mismatch_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _write_stream_npy(stream, decoded)
+    _write_stream_receipt(
+        stream, decoded, raw_sha256="0" * 64
+    )  # stale/wrong raw binding
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert completed.manifest_path.is_file()
+
+
+def test_stale_receipt_cannot_bless_a_different_raw_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    _publish_valid_stream(stream, _decoded())  # receipt bound to b"12345678"
+    # The current raw oracle (and its journal binding) change to different
+    # same-length bytes; the receipt still points at the old stream.
+    new = b"87654321"
+    stream.write_bytes(new)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["output_sha256"] = hashlib.sha256(new).hexdigest()
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    spy = _OfflineSpy(_decoded())
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1, "a stale receipt must not bless a different raw stream"
+    assert completed.manifest_path.is_file()
+
+
+def test_receipt_claims_are_revalidated_not_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _write_stream_npy(stream, decoded)
+    _write_stream_receipt(
+        stream,
+        decoded,
+        layout={
+            "padding_validated_records": 999,  # a lie; the contract has 2 records
+            "rgb_samples_decoded": 4,
+            "ir_planes_transferred": 1,
+            "rgb_average": "round-half-up uint16 average",
+        },
+    )
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1, "finalization must re-check the layout proof, not trust it"
+
+
+def test_injected_decoder_ignores_streamed_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)  # a valid streamed artifact exists
+    marker = np.full((3, 2, 4), 7, dtype=np.uint16)
+    workflow = _workflow(
+        decoder=lambda _path: (
+            marker,
+            {
+                "padding_validated_records": 2,
+                "rgb_samples_decoded": 4,
+                "ir_planes_transferred": 1,
+            },
+        )
+    )
+
+    completed = workflow.finalize_attempt(attempt, delete_scratch=False)
+
+    # A caller-injected decoder keeps its exact semantics; the artifact is unused.
+    np.testing.assert_array_equal(
+        tifffile.imread(completed.output_paths["rgb"]), np.rot90(marker, k=1)[..., :3]
+    )
+    assert (
+        not _receipt_path(stream).exists()
+        or json.loads(_receipt_path(stream).read_text(encoding="utf-8"))["kind"]
+        == STREAM_RECEIPT_KIND
+    )
+
+
+def test_injected_decoder_cannot_spoof_streaming_cleanup_authority(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    data_path = _data_path(stream)
+    receipt_path = _receipt_path(stream)
+    spoofed_layout = {
+        "padding_validated_records": 2,
+        "rgb_samples_decoded": 4,
+        "ir_planes_transferred": 1,
+        "streaming_fast_path": True,
+        "streaming_receipt": receipt_path.name,
+        "streaming_receipt_sha256": hashlib.sha256(
+            receipt_path.read_bytes()
+        ).hexdigest(),
+        "streaming_receipt_bytes": receipt_path.stat().st_size,
+        "streaming_derived": data_path.name,
+        "streaming_derived_sha256": hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        "streaming_derived_bytes": data_path.stat().st_size,
+    }
+    workflow = _workflow(decoder=lambda _path: (decoded, spoofed_layout))
+
+    completed = workflow.finalize_attempt(attempt, delete_scratch=True)
+
+    assert completed.scratch_deleted
+    assert receipt_path.exists(), "custom decoder must not authorize receipt cleanup"
+    assert data_path.exists(), "custom decoder must not authorize data cleanup"
+    assert not any(
+        key.startswith("streaming_") for key in completed.manifest["decode_layout"]
+    )
+
+
+def test_no_partial_commit_when_streaming_and_offline_both_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    with _data_path(stream).open("r+b") as handle:  # corrupt so consumption falls back
+        handle.seek(20)
+        handle.write(b"\x00")
+
+    def broken(_path: Path, *, width: object = None, height: object = None):
+        raise ValueError("offline decode exploded")
+
+    monkeypatch.setattr(workflow_module, "decode_full_records", broken)
+
+    with pytest.raises(SinglePassIntegrityError, match="decode refused"):
+        _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    # Nothing was committed.
+    assert not (attempt.directory / "final" / "manifest.json").exists()
+    assert not list(attempt.directory.rglob("*.tif"))
+
+
+def test_streaming_consumption_keeps_post_decode_raw_mutation_guard(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    _publish_valid_stream(stream, _decoded())
+
+    real_hash = workflow_module._hash_file_stable
+    stream_hashes = {"count": 0}
+
+    def mutating_hash(path: Path):
+        if path == stream:
+            stream_hashes["count"] += 1
+            # Corrupt the raw oracle just before the post-decode re-hash (the
+            # second hash of the stream), exactly as a mutation would.
+            if stream_hashes["count"] == 2:
+                with path.open("ab") as handle:
+                    handle.write(b"X")
+        return real_hash(path)
+
+    workflow = LS5000SinglePassWorkflow(
+        contract=_contract(),
+        smear_assessor=lambda _rgb, *, dpi: _smear_assessment(),
+        stable_hasher=mutating_hash,
+    )
+    with pytest.raises(
+        SinglePassIntegrityError, match="changed while it was being decoded"
+    ):
+        workflow.finalize_attempt(attempt, delete_scratch=False)
+
+
+@pytest.mark.parametrize("target", ["receipt", "data"])
+def test_streaming_symlink_is_rejected_and_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    canonical = _receipt_path(stream) if target == "receipt" else _data_path(stream)
+    real = canonical.with_name(canonical.name + ".real")
+    canonical.rename(real)
+    canonical.symlink_to(real.name)
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+    assert canonical.is_symlink()
+
+
+def test_streamed_artifact_mutation_during_load_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _publish_valid_stream(stream, decoded)
+    data_path = _data_path(stream)
+    real_load = np.load
+    mutated = {"done": False}
+
+    def mutating_load(handle, *args: object, **kwargs: object):
+        array = real_load(handle, *args, **kwargs)
+        with data_path.open("r+b") as writable:
+            writable.seek(-1, 2)
+            last = writable.read(1)
+            writable.seek(-1, 2)
+            writable.write(bytes([last[0] ^ 1]))
+        mutated["done"] = True
+        return array
+
+    monkeypatch.setattr(workflow_module.np, "load", mutating_load)
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert mutated["done"]
+    assert spy.calls == 1
+
+
+@pytest.mark.parametrize("variant", ["wrong-shape", "fortran-order"])
+def test_npy_header_is_validated_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    if variant == "wrong-shape":
+        stored = decoded.reshape(-1)
+    else:
+        stored = np.asfortranarray(decoded)
+    _write_stream_npy(stream, stored)
+    # The untrusted receipt lies that the file has the canonical geometry.
+    _write_stream_receipt(stream, decoded)
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    _default_workflow().finalize_attempt(attempt, delete_scratch=False)
+
+    assert spy.calls == 1
+
+
+def test_successful_streamed_finalize_deletes_sidecar_before_raw(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    _publish_valid_stream(stream, _decoded())
+    data_path = _data_path(stream)
+    receipt_path = _receipt_path(stream)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=True)
+
+    assert completed.scratch_deleted
+    assert not receipt_path.exists()
+    assert not data_path.exists()
+    assert not stream.exists()
+
+
+def test_streamed_sidecar_cleanup_failure_retains_raw_and_resume_finishes(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    _publish_valid_stream(stream, _decoded())
+    data_path = _data_path(stream)
+    receipt_path = _receipt_path(stream)
+
+    def fail_data_cleanup(path: Path) -> None:
+        if path == data_path:
+            raise OSError("streamed data unlink refused")
+        path.unlink()
+
+    workflow = LS5000SinglePassWorkflow(
+        contract=_contract(),
+        smear_assessor=lambda _rgb, *, dpi: _smear_assessment(),
+        stream_deleter=fail_data_cleanup,
+    )
+    with pytest.raises(OSError, match="streamed data unlink refused"):
+        workflow.finalize_attempt(attempt, delete_scratch=True)
+
+    assert not receipt_path.exists(), "commit marker must be removed first"
+    assert data_path.exists()
+    assert stream.exists(), "raw oracle must survive incomplete sidecar cleanup"
+    assert (attempt.directory / "final" / "manifest.json").is_file()
+
+    resumed = _default_workflow().finalize_attempt(attempt)
+    assert resumed.resumed
+    assert resumed.scratch_deleted
+    assert not data_path.exists()
+    assert not stream.exists()
+
+
+def test_invalid_sidecar_is_never_deleted_as_trusted_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    decoded = _decoded()
+    _write_stream_npy(stream, decoded)
+    receipt_path = _receipt_path(stream)
+    receipt_path.write_text("not-json", encoding="utf-8")
+    data_path = _data_path(stream)
+    spy = _OfflineSpy(decoded)
+    monkeypatch.setattr(workflow_module, "decode_full_records", spy)
+
+    completed = _default_workflow().finalize_attempt(attempt, delete_scratch=True)
+
+    assert completed.scratch_deleted
+    assert spy.calls == 1
+    assert receipt_path.read_text(encoding="utf-8") == "not-json"
+    assert data_path.exists()

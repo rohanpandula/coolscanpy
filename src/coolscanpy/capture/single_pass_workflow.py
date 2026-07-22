@@ -1,8 +1,35 @@
 """Artifact-first finalization for completed LS-5000 single-pass captures.
 
-The USB worker owns acquisition.  This module starts only after that process
-has released the scanner and left a journal plus packed stream in a unique
-attempt directory.  It deliberately has no USB or SANE imports.
+The USB worker owns acquisition. This module starts only after one frame's
+capture data is durable and a journal plus packed stream exist in a unique
+attempt directory. In a batch, the worker may still retain the scanner
+reservation while it waits for the parent ACK. This module deliberately has
+no USB or SANE imports and never enters the frame's USB read loop.
+
+Streaming fast path and its trust boundary
+------------------------------------------
+
+The capture worker may leave, beside the raw packed stream, a privately
+streamed RGBI artifact (``*.stream-rgbi.npy``) plus a receipt
+(``*.stream-receipt.json``) produced by the fail-open streaming sidecar.  When
+the built-in default decode runs, finalization first tries to consume that
+artifact instead of re-decoding the raw oracle.
+
+The receipt is treated as an *untrusted hint*: it is never authority.  This
+module re-validates every claim independently before consuming -- the exact
+receipt schema, the raw SHA-256/byte binding against the already-computed
+stream identity, a fresh stable hash of the derived file, ``allow_pickle=False``
+loading, and exact shape/dtype/layout against the contract.  Any absent,
+abandoned, incomplete, colliding, malformed, or mismatched sidecar falls back
+to offline ``decode_full_records`` over the raw oracle, and the second raw hash
+after decode still catches a stream mutated mid-decode.  A caller-injected
+decoder is used as-is and never sees the fast path.
+
+This module is the offline-phase verifier, not scanner-facing code. It has no
+USB/SANE imports and is deliberately *not* part of the pinned capture-bundle
+identity (which binds scanner-facing capture code). Its correctness rests on
+runtime fail-closed re-validation against the raw oracle, tested directly,
+rather than on a static source hash.
 """
 
 from __future__ import annotations
@@ -13,6 +40,7 @@ import json
 import math
 import os
 import re
+import stat as stat_module
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -28,6 +56,16 @@ from coolscanpy.protocol.ls5000_single_pass.packed import (
     HEIGHT,
     WIDTH,
     decode_full_records,
+)
+from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import (
+    CANONICAL_RGB_AVERAGE,
+    STREAM_DATA_SUFFIX,
+    STREAM_RECEIPT_KEYS,
+    STREAM_RECEIPT_KIND,
+    STREAM_RECEIPT_LAYOUT_KEYS,
+    STREAM_RECEIPT_STATUS,
+    STREAM_RECEIPT_SUFFIX,
+    STREAM_RECEIPT_VERSION,
 )
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -63,6 +101,21 @@ WORKFLOW_KIND = "negpy.ls5000-single-pass-finalization"
 WORKFLOW_VERSION = 2
 EXPECTED_COLOR_IDS = frozenset({1, 2, 3, 9})
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_MAX_STREAM_RECEIPT_BYTES = 64 * 1024
+_MAX_NPY_HEADER_BYTES = 64 * 1024
+_STREAMING_OK_KEYS = frozenset(
+    {
+        "status",
+        "receipt",
+        "receipt_sha256",
+        "receipt_bytes",
+        "derived_filename",
+        "derived_sha256",
+        "derived_bytes",
+        "bound_raw_sha256",
+        "bound_raw_bytes",
+    }
+)
 
 
 class SinglePassWorkflowError(RuntimeError):
@@ -301,6 +354,89 @@ def _hash_file_stable(path: Path, *, chunk_bytes: int = 8 * 1024 * 1024) -> tupl
     return digest.hexdigest(), before.st_size
 
 
+def _open_regular_no_follow(path: Path) -> int | None:
+    """Open one existing regular file without following a symlink.
+
+    ``O_NOFOLLOW`` is used where available.  The lstat/fstat identity check is
+    retained for platforms that do not expose it and also rejects a pathname
+    swapped between the two calls.
+    """
+
+    try:
+        before = path.lstat()
+    except OSError:
+        return None
+    if stat_module.S_ISLNK(before.st_mode) or not stat_module.S_ISREG(before.st_mode):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat_module.S_ISREG(opened.st_mode) or _stable_identity(before) != _stable_identity(opened):
+            os.close(descriptor)
+            return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_regular_no_follow_stable(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, str, int] | None:
+    descriptor = _open_regular_no_follow(path)
+    if descriptor is None:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if before.st_size < 0 or before.st_size > max_bytes:
+                return None
+            payload = handle.read(max_bytes + 1)
+            after = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    if (
+        len(payload) != before.st_size
+        or len(payload) > max_bytes
+        or _stable_identity(before) != _stable_identity(after)
+    ):
+        return None
+    return payload, hashlib.sha256(payload).hexdigest(), before.st_size
+
+
+def _hash_open_file(handle: Any, *, chunk_bytes: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    handle.seek(0)
+    digest = hashlib.sha256()
+    size = 0
+    while block := handle.read(chunk_bytes):
+        digest.update(block)
+        size += len(block)
+    return digest.hexdigest(), size
+
+
+def _hash_regular_no_follow_stable(path: Path) -> tuple[str, int] | None:
+    descriptor = _open_regular_no_follow(path)
+    if descriptor is None:
+        return None
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest, size = _hash_open_file(handle)
+            after = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    if size != before.st_size or _stable_identity(before) != _stable_identity(after):
+        return None
+    return digest, size
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     parsed: dict[str, object] = {}
     for key, value in pairs:
@@ -479,6 +615,9 @@ class LS5000SinglePassWorkflow:
     ) -> None:
         self._contract = PackedCaptureContract() if contract is None else contract
         self._decoder = decoder if decoder is not None else self._decode_default
+        # Only the built-in default decode path may be satisfied by a bound
+        # streamed artifact; a caller-injected decoder keeps its exact semantics.
+        self._using_default_decoder = decoder is None
         self._writer = writer
         self._hash = stable_hasher
         self._write_manifest = manifest_writer
@@ -489,6 +628,283 @@ class LS5000SinglePassWorkflow:
 
     def _decode_default(self, path: Path) -> tuple[np.ndarray, Mapping[str, object]]:
         return decode_full_records(path, width=self._contract.width, height=self._contract.height)
+
+    def _load_stream_receipt(
+        self,
+        path: Path,
+    ) -> tuple[dict[str, Any], str, int] | None:
+        """Read one bounded, stable, non-symlink receipt with exact schema."""
+
+        read = _read_regular_no_follow_stable(
+            path,
+            max_bytes=_MAX_STREAM_RECEIPT_BYTES,
+        )
+        if read is None:
+            return None
+        payload, receipt_sha, receipt_bytes = read
+        try:
+            parsed = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
+        except (ValueError, UnicodeDecodeError, SinglePassWorkflowError):
+            return None
+        if type(parsed) is not dict or set(parsed) != STREAM_RECEIPT_KEYS:
+            return None
+        if parsed.get("kind") != STREAM_RECEIPT_KIND:
+            return None
+        if (
+            type(parsed.get("version")) is not int
+            or parsed.get("version") != STREAM_RECEIPT_VERSION
+        ):
+            return None
+        if parsed.get("status") != STREAM_RECEIPT_STATUS:
+            return None
+        if parsed.get("dtype") != "uint16":
+            return None
+        for key in ("derived_filename", "derived_sha256", "raw_sha256"):
+            value = parsed.get(key)
+            if type(value) is not str or not value:
+                return None
+        if not _is_sha256(parsed.get("derived_sha256")) or not _is_sha256(parsed.get("raw_sha256")):
+            return None
+        for key in ("derived_bytes", "raw_bytes", "height", "width", "channels"):
+            value = parsed.get(key)
+            if type(value) is not int or value <= 0:
+                return None
+        layout = parsed.get("layout")
+        if type(layout) is not dict or set(layout) != STREAM_RECEIPT_LAYOUT_KEYS:
+            return None
+        if type(layout.get("padding_validated_records")) is not int:
+            return None
+        if type(layout.get("rgb_samples_decoded")) is not int or layout.get("rgb_samples_decoded") != 4:
+            return None
+        if type(layout.get("ir_planes_transferred")) is not int or layout.get("ir_planes_transferred") != 1:
+            return None
+        if layout.get("rgb_average") != CANONICAL_RGB_AVERAGE:
+            return None
+        return cast(dict[str, Any], parsed), receipt_sha, receipt_bytes
+
+    def _load_streamed_array(
+        self,
+        path: Path,
+        *,
+        expected_sha256: str,
+        expected_bytes: int,
+        expected_shape: tuple[int, int, int],
+    ) -> np.ndarray | None:
+        """Hash, load, and re-hash a stable NPY through one no-follow fd."""
+
+        descriptor = _open_regular_no_follow(path)
+        if descriptor is None:
+            return None
+        payload_bytes = math.prod(expected_shape) * np.dtype(np.uint16).itemsize
+        try:
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if (
+                    before.st_size != expected_bytes
+                    or before.st_size <= payload_bytes
+                    or before.st_size > payload_bytes + _MAX_NPY_HEADER_BYTES
+                ):
+                    return None
+                first_sha, first_bytes = _hash_open_file(handle)
+                if first_bytes != expected_bytes or not hmac.compare_digest(
+                    first_sha,
+                    expected_sha256,
+                ):
+                    return None
+                handle.seek(0)
+                version = np.lib.format.read_magic(handle)
+                if version == (1, 0):
+                    header_shape, fortran_order, header_dtype = (
+                        np.lib.format.read_array_header_1_0(handle)
+                    )
+                elif version == (2, 0):
+                    header_shape, fortran_order, header_dtype = (
+                        np.lib.format.read_array_header_2_0(handle)
+                    )
+                else:
+                    return None
+                if (
+                    header_shape != expected_shape
+                    or fortran_order
+                    or np.dtype(header_dtype) != np.dtype(np.uint16)
+                ):
+                    return None
+                handle.seek(0)
+                loaded = np.load(handle, allow_pickle=False)
+                array = np.asarray(loaded)
+                after_load = os.fstat(handle.fileno())
+                second_sha, second_bytes = _hash_open_file(handle)
+                after_hash = os.fstat(handle.fileno())
+        except (OSError, ValueError, TypeError):
+            return None
+        if (
+            _stable_identity(before) != _stable_identity(after_load)
+            or _stable_identity(before) != _stable_identity(after_hash)
+            or first_bytes != second_bytes
+            or not hmac.compare_digest(first_sha, second_sha)
+        ):
+            return None
+        if array.shape != expected_shape or array.dtype != np.uint16:
+            return None
+        return array
+
+    def _try_consume_streamed_artifact(
+        self,
+        stream_path: Path,
+        stream_sha: str,
+        stream_bytes: int,
+        journal: Mapping[str, object],
+    ) -> tuple[np.ndarray, dict[str, object]] | None:
+        """Consume a bound streamed artifact, or ``None`` to fall back offline.
+
+        Never raises: any absent, abandoned, incomplete, colliding, malformed,
+        or mismatched sidecar yields ``None`` so offline decode of the raw
+        oracle remains the fail-closed fallback.  The receipt's claims are not
+        trusted -- the raw binding is revalidated against the already-computed
+        stream identity and the derived file is re-hashed and shape-checked.
+        """
+
+        try:
+            receipt_path = stream_path.parent / (stream_path.name + STREAM_RECEIPT_SUFFIX)
+            worker_result = journal.get("streaming_decode")
+            if type(worker_result) is not dict or set(worker_result) != _STREAMING_OK_KEYS:
+                return None
+            worker_result = cast(dict[str, object], worker_result)
+            if worker_result.get("status") != "ok":
+                return None
+            loaded_receipt = self._load_stream_receipt(receipt_path)
+            if loaded_receipt is None:
+                return None
+            receipt, receipt_sha, receipt_bytes = loaded_receipt
+            if not hmac.compare_digest(cast(str, receipt["raw_sha256"]), stream_sha):
+                return None
+            if receipt["raw_bytes"] != stream_bytes:
+                return None
+            derived_name = cast(str, receipt["derived_filename"])
+            expected_derived_name = stream_path.name + STREAM_DATA_SUFFIX
+            if derived_name != expected_derived_name:
+                return None
+            if (
+                worker_result.get("receipt") != receipt_path.name
+                or worker_result.get("receipt_sha256") != receipt_sha
+                or worker_result.get("receipt_bytes") != receipt_bytes
+                or worker_result.get("derived_filename") != derived_name
+                or worker_result.get("derived_sha256") != receipt["derived_sha256"]
+                or worker_result.get("derived_bytes") != receipt["derived_bytes"]
+                or worker_result.get("bound_raw_sha256") != stream_sha
+                or worker_result.get("bound_raw_bytes") != stream_bytes
+            ):
+                return None
+            derived_path = receipt_path.parent / derived_name
+            contract = self._contract
+            if (
+                receipt["height"] != contract.height
+                or receipt["width"] != contract.width
+                or receipt["channels"] != 4
+                or receipt["dtype"] != "uint16"
+            ):
+                return None
+            layout = cast(dict[str, Any], receipt["layout"])
+            if (
+                layout["padding_validated_records"] != contract.records
+                or type(layout["rgb_samples_decoded"]) is not int
+                or layout["rgb_samples_decoded"] != 4
+                or type(layout["ir_planes_transferred"]) is not int
+                or layout["ir_planes_transferred"] != 1
+                or layout["rgb_average"] != CANONICAL_RGB_AVERAGE
+            ):
+                return None
+            array = self._load_streamed_array(
+                derived_path,
+                expected_sha256=cast(str, receipt["derived_sha256"]),
+                expected_bytes=cast(int, receipt["derived_bytes"]),
+                expected_shape=(contract.height, contract.width, 4),
+            )
+            if array is None:
+                return None
+            return array, {
+                "padding_validated_records": layout["padding_validated_records"],
+                "rgb_samples_decoded": layout["rgb_samples_decoded"],
+                "ir_planes_transferred": layout["ir_planes_transferred"],
+                "rgb_average": layout["rgb_average"],
+                "streaming_fast_path": True,
+                "streaming_receipt": receipt_path.name,
+                "streaming_receipt_sha256": receipt_sha,
+                "streaming_receipt_bytes": receipt_bytes,
+                "streaming_derived": derived_path.name,
+                "streaming_derived_sha256": receipt["derived_sha256"],
+                "streaming_derived_bytes": receipt["derived_bytes"],
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _consumed_sidecar_evidence(
+        stream_path: Path,
+        layout: Mapping[str, object],
+    ) -> tuple[tuple[Path, str, int], tuple[Path, str, int]] | None:
+        """Return fixed-path cleanup evidence only for a consumed fast path."""
+
+        receipt_name = stream_path.name + STREAM_RECEIPT_SUFFIX
+        data_name = stream_path.name + STREAM_DATA_SUFFIX
+        if layout.get("streaming_fast_path") is not True:
+            return None
+        if layout.get("streaming_receipt") != receipt_name:
+            return None
+        if layout.get("streaming_derived") != data_name:
+            return None
+        receipt_sha = layout.get("streaming_receipt_sha256")
+        data_sha = layout.get("streaming_derived_sha256")
+        receipt_bytes = layout.get("streaming_receipt_bytes")
+        data_bytes = layout.get("streaming_derived_bytes")
+        if not _is_sha256(receipt_sha) or not _is_sha256(data_sha):
+            return None
+        if type(receipt_bytes) is not int or receipt_bytes <= 0:
+            return None
+        if type(data_bytes) is not int or data_bytes <= 0:
+            return None
+        return (
+            (stream_path.parent / receipt_name, cast(str, receipt_sha), receipt_bytes),
+            (stream_path.parent / data_name, cast(str, data_sha), data_bytes),
+        )
+
+    def _cleanup_consumed_sidecar(
+        self,
+        stream_path: Path,
+        layout: Mapping[str, object],
+    ) -> None:
+        """Delete a consumed sidecar marker-first, then data, with revalidation.
+
+        Missing canonical files are an already-completed cleanup checkpoint.
+        Any existing nonregular, symlinked, changed, or mismatched artifact is
+        left untouched and stops cleanup before the authoritative raw stream is
+        deleted.
+        """
+
+        evidence = self._consumed_sidecar_evidence(stream_path, layout)
+        if evidence is None:
+            return
+        for path, expected_sha, expected_bytes in evidence:
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise SinglePassIntegrityError(
+                    f"cannot inspect consumed streaming scratch {path.name}: {error}"
+                ) from error
+            actual = _hash_regular_no_follow_stable(path)
+            if actual is None:
+                raise SinglePassIntegrityError(
+                    f"consumed streaming scratch is not a stable regular file: {path.name}"
+                )
+            actual_sha, actual_bytes = actual
+            if actual_bytes != expected_bytes or not hmac.compare_digest(actual_sha, expected_sha):
+                raise SinglePassIntegrityError(
+                    f"consumed streaming scratch changed before cleanup: {path.name}"
+                )
+            self._delete_stream(path)
+            _fsync_directory(path.parent)
 
     def finalize_attempt(
         self,
@@ -519,8 +935,22 @@ class LS5000SinglePassWorkflow:
             stream_bytes=stream_bytes,
         )
 
+        streamed_consumed = False
         try:
-            decoded, raw_layout = self._decoder(attempt.stream_path)
+            if self._using_default_decoder:
+                streamed = self._try_consume_streamed_artifact(
+                    attempt.stream_path,
+                    stream_sha,
+                    stream_bytes,
+                    journal,
+                )
+                if streamed is not None:
+                    decoded, raw_layout = streamed
+                    streamed_consumed = True
+                else:
+                    decoded, raw_layout = self._decode_default(attempt.stream_path)
+            else:
+                decoded, raw_layout = self._decoder(attempt.stream_path)
         except Exception as error:
             if isinstance(error, SinglePassWorkflowError):
                 raise
@@ -530,6 +960,13 @@ class LS5000SinglePassWorkflow:
         if rgbi.shape != expected_shape or rgbi.dtype != np.uint16:
             raise SinglePassIntegrityError(f"decoder returned {rgbi.shape} {rgbi.dtype}, expected {expected_shape} uint16")
         layout = dict(raw_layout)
+        if not streamed_consumed:
+            # Streaming provenance keys are reserved for evidence minted by
+            # this workflow after its own fast-path validation. An injected
+            # decoder cannot spoof them into cleanup authority.
+            for key in tuple(layout):
+                if key.startswith("streaming_"):
+                    layout.pop(key)
         if layout.get("padding_validated_records") != self._contract.records:
             raise SinglePassIntegrityError("decoder did not validate padding in every full record")
         if layout.get("rgb_samples_decoded") != 4 or layout.get("ir_planes_transferred") != 1:
@@ -727,6 +1164,11 @@ class LS5000SinglePassWorkflow:
             last_sha, last_bytes = self._hash(attempt.stream_path)
             if last_bytes != stream_bytes or not hmac.compare_digest(last_sha, stream_sha):
                 raise SinglePassIntegrityError("capture stream changed before scratch cleanup")
+            # A consumed streaming receipt is a commit marker for its derived
+            # scratch. Remove it first, then the data. If either cleanup fails,
+            # retain the raw oracle so a later resume can finish safely.
+            if streamed_consumed:
+                self._cleanup_consumed_sidecar(attempt.stream_path, layout)
             # Deliberately last: every operation which can invalidate the
             # archive has completed and been re-read before scratch is removed.
             self._delete_stream(attempt.stream_path)
@@ -1253,6 +1695,15 @@ class LS5000SinglePassWorkflow:
         requested = cast(bool, cleanup["requested"])
         if requested:
             self._verify_cleanup_checkpoint(manifest_path.parent, cleanup.get("checkpoint"), stream_sha, stream_bytes)
+            decode_layout = manifest.get("decode_layout")
+            if type(decode_layout) is not dict:
+                raise SinglePassIntegrityError(
+                    "existing completion manifest has invalid decode layout"
+                )
+            self._cleanup_consumed_sidecar(
+                attempt.stream_path,
+                cast(dict[str, object], decode_layout),
+            )
 
         scratch_exists = attempt.stream_path.is_file()
         if scratch_exists:

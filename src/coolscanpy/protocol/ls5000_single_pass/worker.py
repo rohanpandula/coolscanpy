@@ -64,6 +64,7 @@ from .roll_index import (
     validate_live_0x8e_bytes,
 )
 from .window import WindowBlock, decode_window_block
+from .streaming_sidecar import FineStreamSession
 
 
 HERE = Path(__file__).resolve().parent
@@ -2501,6 +2502,104 @@ def _scan_lifecycle_after_transaction(
     return scan_active, ready_required
 
 
+def _open_fine_stream_session(
+    output_path: Path,
+    record_bytes: int,
+    read_count: int,
+) -> FineStreamSession | None:
+    """Open the advisory streaming decoder for a real fine stream, else ``None``.
+
+    Streaming engages only for the proven full-record geometry; abbreviated
+    streams (including the hardware-free regression fixtures) decode offline.
+    A kill switch (``COOLSCANPY_CAPTURE_STREAMING=0``) and any construction
+    error fail open to no streaming, so the durable raw capture and the USB
+    loop are never affected.  Both fine-read loops share this one helper.
+    """
+
+    if record_bytes != EXPECTED_FINE_REQUEST or read_count != EXPECTED_FINE_READS:
+        return None
+    if os.environ.get("COOLSCANPY_CAPTURE_STREAMING", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return None
+    try:
+        return FineStreamSession(output_path)
+    except Exception:  # noqa: BLE001 - streaming must never break capture setup
+        return None
+
+
+def _submit_fine_stream_record(
+    fine_stream: FineStreamSession | None, payload: bytes
+) -> FineStreamSession | None:
+    """Nonblocking per-record submission shared by both fine-read loops.
+
+    Returns the stream to keep using, or ``None`` to permanently stop streaming
+    for this frame.  A synchronous decoder exception is swallowed so it can
+    never abort or drain-stop the live scan; raw capture continues unchanged.
+    """
+
+    if fine_stream is None:
+        return None
+    try:
+        fine_stream.submit(payload)
+        if not getattr(fine_stream, "active", True):
+            fine_stream.abort("submission-disabled")
+            return None
+        return fine_stream
+    except Exception:  # noqa: BLE001 - a decoder fault must never abort a scan
+        try:
+            fine_stream.abort("submit-exception")
+        except Exception:  # noqa: BLE001 - abort is also strictly fail-open
+            pass
+        return None
+
+
+def _abort_fine_stream(
+    fine_stream: FineStreamSession | None,
+    *,
+    reason: str,
+) -> None:
+    """Best-effort terminal cleanup for a capture that will not complete."""
+
+    if fine_stream is None:
+        return
+    try:
+        fine_stream.abort(reason)
+    except Exception:  # noqa: BLE001 - cleanup must never mask capture failure
+        pass
+
+
+def _finish_fine_stream(
+    fine_stream: FineStreamSession | None, *, raw_sha256: str, raw_bytes: int
+) -> dict[str, object]:
+    """Bound the streaming decode and publish its advisory, fail-open.
+
+    Runs only after the data phase and the post-scan READY poll, off the USB
+    hot path.  Never raises; the durable raw stream and any committed artifact
+    are owned by offline finalization, never by this advisory.
+    """
+
+    if fine_stream is None:
+        return {"status": "disabled", "receipt": None}
+    try:
+        result = fine_stream.finish(raw_sha256=raw_sha256, raw_bytes=raw_bytes)
+        normalized = dict(result)
+        # The outcome is embedded in the durable worker journal. Refuse a
+        # malformed/non-JSON result here so sidecar reporting itself can never
+        # make the otherwise-complete capture journal fail to serialize.
+        json.dumps(normalized, allow_nan=False)
+        return normalized
+    except Exception as error:  # noqa: BLE001 - advisory publication must never raise
+        return {
+            "status": "abandoned",
+            "receipt": None,
+            "reason": f"finish-exception:{type(error).__name__}",
+        }
+
+
 def _run_live_continuation_frame(
     ep_out: Any,
     ep_in: Any,
@@ -2619,6 +2718,7 @@ def _run_live_continuation_frame(
     }
     _write_journal(journal_path, journal)
 
+    fine_stream: FineStreamSession | None = None
     meter_window_payloads: list[list[bytes]] = [
         [] for _group in METER_GET_WINDOW_GROUPS
     ]
@@ -2984,6 +3084,9 @@ def _run_live_continuation_frame(
             ]
             journal["status"] = "fine-capture"
             _write_journal(journal_path, journal)
+            fine_stream = _open_fine_stream_session(
+                output_path, target["request_len"], EXPECTED_FINE_READS
+            )
             for read_index in range(EXPECTED_FINE_READS):
                 timeout = 180_000 if read_index == 0 else 60_000
                 journal["current_command"] = {
@@ -3012,6 +3115,7 @@ def _run_live_continuation_frame(
                         f"short file write {written} of {len(result.payload)} bytes"
                     )
                 output_sha256.update(result.payload)
+                fine_stream = _submit_fine_stream_record(fine_stream, result.payload)
                 journal["completed_reads"] = read_index + 1
                 journal["completed_bytes"] += len(result.payload)
                 journal["stall_recoveries"] += result.stall_recoveries
@@ -3037,6 +3141,11 @@ def _run_live_continuation_frame(
         lifecycle.ready_required = False
         journal["post_scan_ready_polls"] = polls
         journal["stall_recoveries"] += stalls
+        journal["streaming_decode"] = _finish_fine_stream(
+            fine_stream,
+            raw_sha256=journal["output_sha256"],
+            raw_bytes=expected_bytes,
+        )
         journal["ack_nonce"] = secrets.token_hex(16)
         journal["frame_complete"] = True
         journal["recovery_required"] = None
@@ -3045,6 +3154,10 @@ def _run_live_continuation_frame(
         _write_journal(journal_path, journal)
         return journal
     except BaseException as error:
+        _abort_fine_stream(
+            fine_stream,
+            reason=f"capture-error:{type(error).__name__}",
+        )
         journal["status"] = (
             "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
         )
@@ -3274,6 +3387,7 @@ def run_live_capture(
     scan_active = False
     ready_required = False
     meter_output = None
+    fine_stream: FineStreamSession | None = None
     try:
         device, interface, ep_out, ep_in, usb_util = _connect_device()
         journal["status"] = "preamble"
@@ -3915,6 +4029,9 @@ def run_live_capture(
             if not meter_only and not preview_only:
                 journal["status"] = "fine-capture"
                 _write_journal(journal_path, journal)
+                fine_stream = _open_fine_stream_session(
+                    output_path, target["request_len"], read_count
+                )
                 for read_index in range(read_count):
                     timeout = 180_000 if read_index == 0 else 60_000
                     journal["current_command"] = {
@@ -3943,6 +4060,7 @@ def run_live_capture(
                             f"short file write {written} of {len(result.payload)} bytes"
                         )
                     output_sha256.update(result.payload)
+                    fine_stream = _submit_fine_stream_record(fine_stream, result.payload)
                     journal["completed_reads"] = read_index + 1
                     journal["completed_bytes"] += len(result.payload)
                     journal["stall_recoveries"] += result.stall_recoveries
@@ -3977,6 +4095,11 @@ def run_live_capture(
         ready_required = False
         journal["post_scan_ready_polls"] = polls
         journal["stall_recoveries"] += stalls
+        journal["streaming_decode"] = _finish_fine_stream(
+            fine_stream,
+            raw_sha256=journal["output_sha256"],
+            raw_bytes=expected_bytes,
+        )
         if batch_mode:
             assert batch_job is not None
             assert continuation_plan is not None
@@ -4114,6 +4237,11 @@ def run_live_capture(
             journal["finished_unix"] = time.time()
             _write_journal(journal_path, journal)
     except BaseException as error:
+        if not frame_journal_finalized:
+            _abort_fine_stream(
+                fine_stream,
+                reason=f"capture-error:{type(error).__name__}",
+            )
         cleanup_scan_active = scan_active
         cleanup_ready_required = ready_required
         cleanup_boundary = at_transaction_boundary

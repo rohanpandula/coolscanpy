@@ -35,7 +35,13 @@ from .meter import (
     propose_next_exposures,
     verify_final_convergence,
 )
-from .packed import decode_full_records, decode_records, infer_record_geometry
+from .packed import (
+    StreamingFrameDecoder,
+    decode_full_records,
+    decode_records,
+    infer_record_geometry,
+)
+from .streaming_sidecar import FailOpenStreamConsumer, FineStreamSession
 from .plan import (
     CANONICAL_PLAN_SHA256,
     CanonicalPlanError,
@@ -73,6 +79,8 @@ __all__ = [
     "CaptureRequest",
     "ContinuationTraceBlock",
     "DecodedMeterPass",
+    "FailOpenStreamConsumer",
+    "FineStreamSession",
     "IndexDecodeError",
     "IndexGeometry",
     "MeterObservation",
@@ -81,6 +89,7 @@ __all__ = [
     "PreparedCaptureBatch",
     "RollDetection",
     "SafetyRefusal",
+    "StreamingFrameDecoder",
     "TransportMapping",
     "canonical_plan_bytes",
     "canonical_continuation_plan_bytes",

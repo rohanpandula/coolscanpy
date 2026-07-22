@@ -20,9 +20,15 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 
 # These hashes bind the scanner-facing implementation and both wire resources.
 # Update them only after the corresponding hardware-free regression suite passes.
+# ``packed.py`` (the shared decode kernel and streaming decoder) and
+# ``streaming_sidecar.py`` (the fail-open capture hook) are pinned because the
+# capture worker imports them at runtime, so their bytes are part of the
+# scanner-facing capture identity.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "capture_process.py": "6fdc34056c077269cba963a643f103b6a0487ac011c7afca031d3ae44a4bbd5a",
-    "worker.py": "0e43c67a5e6f6897a5ef1153637f6232f7edec947a9b3cf5be8f728e85a9b165",
+    "worker.py": "30294ae72265b29f0f951f6d5b5dca36226e9b6861e6bad1e9c11670e22625bb",
+    "packed.py": "aae6707216d8ed50c12dc7859b78c7331150fd3cde074fb9bf9c60938dd3604f",
+    "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "c7d00c9c8796b7264a553848106a1fe075ab4a25315fbe5a05d05bc35515ca10",
     "roll_index.py": "5cec9535322847e34aa980ace0f91f589579486464c68be643bd9910ae90d252",
