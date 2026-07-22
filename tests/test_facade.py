@@ -1435,6 +1435,38 @@ class TestDeviceScanAndEject:
         finally:
             dev.close()
 
+    def test_caller_owned_attempts_root_survives_roll_close(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        evidence = tmp_path / "retained-attempts"
+        evidence.mkdir()
+        marker = evidence / "marker.txt"
+        marker.write_text("retain", encoding="utf-8")
+        dev = _open_device(fake_service_factory)
+        try:
+            roll = dev.roll(attempts_root=evidence)
+            assert roll._attempts_root == evidence
+            roll.close()
+            assert marker.read_text(encoding="utf-8") == "retain"
+        finally:
+            dev.close()
+
+    def test_default_attempts_root_is_removed_on_roll_close(
+        self,
+        fake_service_factory,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        try:
+            roll = dev.roll()
+            attempts = roll._attempts_root
+            assert attempts.is_dir()
+            roll.close()
+            assert not attempts.exists()
+        finally:
+            dev.close()
+
     def test_device_close_refuses_while_a_roll_is_open(
         self,
         fake_service_factory,
@@ -1456,6 +1488,28 @@ class TestDeviceScanAndEject:
 
 
 class TestRollPreview:
+    def test_caller_owned_attempts_root_retains_generated_preview_evidence(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_success_spawner([]),
+        )
+        try:
+            roll.preview()
+        finally:
+            roll.close()
+            dev.close()
+
+        evidence = tmp_path / "attempts"
+        assert list(evidence.rglob("capture-preview.bin"))
+        assert list(evidence.rglob("capture-008e.bin"))
+        assert list(evidence.rglob("journal.json"))
+
     def test_roll_close_has_a_bounded_wait_for_an_unresponsive_preview(
         self, fake_service_factory, tmp_path: Path, monkeypatch
     ) -> None:

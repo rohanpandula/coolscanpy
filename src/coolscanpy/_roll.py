@@ -322,6 +322,7 @@ class Roll:
         self._preview_thread_id: int | None = None
         self._callback_threads: set[int] = set()
         self._closed = False
+        self._owns_attempts_root = attempts_root is None
         self._attempts_root = (
             Path(attempts_root)
             if attempts_root is not None
@@ -412,7 +413,8 @@ class Roll:
             raise close_error
 
         try:
-            shutil.rmtree(self._attempts_root, ignore_errors=True)
+            if self._owns_attempts_root:
+                shutil.rmtree(self._attempts_root, ignore_errors=True)
             self._device._release_roll_lock()
         finally:
             with self._state_condition:

@@ -34,6 +34,7 @@ unaffected by its absence.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from coolscanpy.exceptions import DeviceBusy, DeviceNotFound, EjectFailed
@@ -478,8 +479,19 @@ class Device:
         if event is not None:
             event.set()
 
-    def roll(self, *, material: Material = Material.COLOR_NEGATIVE) -> "Roll":
-        """Open the 40-slot roll-feeder extension."""
+    def roll(
+        self,
+        *,
+        material: Material = Material.COLOR_NEGATIVE,
+        attempts_root: str | Path | None = None,
+    ) -> "Roll":
+        """Open the 40-slot roll-feeder extension.
+
+        ``attempts_root`` selects a caller-owned directory for per-attempt
+        preview, transport-table, journal, and capture evidence. Caller-owned
+        evidence survives :meth:`Roll.close`; omitting it keeps the temporary,
+        self-cleaning default.
+        """
 
         with self._state_lock:
             self._require_usable_locked()
@@ -491,7 +503,13 @@ class Device:
             try:
                 from coolscanpy._roll import Roll
 
-                return Roll(self, material)
+                return Roll(
+                    self,
+                    material,
+                    attempts_root=(
+                        None if attempts_root is None else Path(attempts_root)
+                    ),
+                )
             except BaseException:
                 self._roll_lock.release()
                 raise

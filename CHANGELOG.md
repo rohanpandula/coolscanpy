@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+`Device.roll()` now accepts an optional caller-owned `attempts_root`. Evidence
+written below that directory survives `Roll.close()`, including failed-preview
+rasters, live `0x8e` transport tables, and journals needed for offline
+diagnosis. Omitting the argument preserves the temporary self-cleaning
+behavior. This closes an evidence-loss path in which a synchronized refusal
+was recorded and then removed during otherwise successful cleanup.
+
 0.1.3's live-table-vs-fingerprint frame count check broke full-roll scanning.
 A batch run over slots 3 and 20 of a reviewed 36-exposure roll failed with
 a `RollMismatch` reporting a live table of 37 scanner-addressable records

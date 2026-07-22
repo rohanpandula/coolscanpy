@@ -166,6 +166,11 @@ sugar for scanning one slot. Calling `roll.safe_stop()` from another thread
 lets the frame in flight finish normally; the next one raises
 `SafeStopRequested` instead of starting.
 
+For live diagnostics or acceptance runs, pass an absolute caller-owned
+directory as `dev.roll(attempts_root=...)`. Preview rasters, transport tables,
+journals, and capture scratch written there survive `Roll.close()` for offline
+verification. Omitting it retains the self-cleaning temporary default.
+
 ## Hardware support
 
 Tested: Nikon Super Coolscan 5000 ED (LS-5000), firmware 1.03, with an SA-21
@@ -181,16 +186,16 @@ against other bodies are welcome, and an LS-50 test is particularly wanted:
 its transport and optics differ from the LS-5000, and none of those
 differences are covered here yet.
 
-Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
-scanning too. A preview traversal parks a short strip at the transport
-end-stop, so a batch run started right after a preview can raise
-`RefeedRequired`. Pull the strip out, reinsert it until the feeder grips,
-and run the batch again.
+Strips shorter than a full roll can park at the transport end-stop after a
+whole-strip traversal. A subsequent operation can therefore raise
+`RefeedRequired`. Do not retry that insertion or pull against the feeder's
+grip; first establish that the strip is fully out, then physically refeed it
+and open a fresh `Roll`.
 
-The converted SA-21 parks the strip a few minutes after feeding, and the
-transport will not wake from parked. Start a capture within about ninety
-seconds of feeding. A stall in the transport-index read means the feeder
-parked; refeed rather than retry.
+The converted SA-21 can park or eject a strip after an uncharacterized idle
+interval. Start the intended capture promptly after feeding. A transport-index
+stall or refusal is a stop condition: preserve the evidence, establish the
+physical media state, and do not retry the same insertion.
 
 ## Relationship to NegPy
 
