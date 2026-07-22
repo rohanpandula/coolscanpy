@@ -190,7 +190,9 @@ Strips shorter than a full roll can park at the transport end-stop after a
 whole-strip traversal. A subsequent operation can therefore raise
 `RefeedRequired`. Do not retry that insertion or pull against the feeder's
 grip; first establish that the strip is fully out, then physically refeed it
-and open a fresh `Roll`.
+and open a fresh `Roll`. If the live transport table has already entered its
+terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain visible for
+review but are deliberately not scanner-addressable on that insertion.
 
 The converted SA-21 can park or eject a strip after an uncharacterized idle
 interval. Start the intended capture promptly after feeding. A transport-index

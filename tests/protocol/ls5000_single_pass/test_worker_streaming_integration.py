@@ -116,7 +116,7 @@ def _records_and_mapping() -> tuple[tuple[TransportRecord, ...], TransportMappin
             start=1,
         )
     )
-    return records, TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    return records, TransportMapping(6_000, 168.0, 42.0, 0.0, 0.0, origins)
 
 
 class RecordingStreamSession:

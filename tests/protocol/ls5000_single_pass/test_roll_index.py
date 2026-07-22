@@ -444,6 +444,149 @@ def test_transport_envelope_and_anchor_residuals_fail_closed() -> None:
         roll.derive_transport_mapping(boundaries, len(rows), records)
 
 
+def test_terminal_high_bit_suffix_cannot_poison_short_strip_mapping() -> None:
+    records = [
+        roll.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(720)
+    ]
+    rows = [143, 286, 428, 571, 715]
+    lookup_rows = [146, 289, 430, 574, 718]
+    native_origins = [6_188, 12_250, 18_228, 24_332, 43_946]
+    for lookup_row, native_origin in zip(
+        lookup_rows,
+        native_origins,
+        strict=True,
+    ):
+        records[lookup_row] = roll.TransportRecord(
+            row=lookup_row,
+            code=6 * (lookup_row % 18),
+            selector=lookup_row // 18,
+            native_origin=native_origin,
+        )
+    for row in range(718, 720):
+        records[row] = roll.TransportRecord(
+            row=row,
+            code=0x8330,
+            selector=31,
+            native_origin=43_946,
+        )
+    boundaries = [
+        _boundary(
+            index,
+            row,
+            evidence_run=(row - 3, lookup_row),
+        )
+        for index, (row, lookup_row) in enumerate(zip(rows, lookup_rows, strict=True))
+    ]
+
+    mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    assert roll.terminal_transport_tail_start(records) == 718
+    assert mapping.native_units_per_preview_row == pytest.approx(42.36337707)
+    assert [origin.native_origin for origin in mapping.origins[:4]] == native_origins[
+        :4
+    ]
+    terminal = mapping.origins[4]
+    assert terminal.native_origin == 43_946
+    assert terminal.automatic is False
+    assert terminal.manual_review is True
+    assert "terminal-transport-tail" in terminal.review_reasons
+
+
+def test_terminal_suffix_requires_three_pre_tail_direct_anchors() -> None:
+    records = [
+        roll.TransportRecord(row=row, code=0, selector=0, native_origin=42 * row)
+        for row in range(310)
+    ]
+    records[-1] = roll.TransportRecord(
+        row=309,
+        code=0x8330,
+        selector=31,
+        native_origin=43_946,
+    )
+    rows = [20, 163, 305]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+
+    with pytest.raises(roll.IndexDecodeError, match="three direct physical gaps"):
+        roll.derive_transport_mapping(boundaries, len(rows), records)
+
+
+def test_inferred_boundary_wholly_inside_terminal_suffix_is_truncated() -> None:
+    records = [
+        roll.TransportRecord(row=row, code=0, selector=0, native_origin=42 * row)
+        for row in range(100)
+    ]
+    for row in range(80, 100):
+        records[row] = roll.TransportRecord(
+            row=row,
+            code=0x8330,
+            selector=31,
+            native_origin=43_946,
+        )
+    boundaries = [_boundary(index, row) for index, row in enumerate((10, 30, 50))]
+    boundaries.append(_boundary(3, 80, support="cadence-broad", evidence_run=(77, 83)))
+
+    mapping = roll.derive_transport_mapping(boundaries, len(boundaries), records)
+
+    assert roll.terminal_transport_tail_start(records) == 80
+    assert [origin.automatic for origin in mapping.origins[:3]] == [True, True, True]
+    inferred_tail = mapping.origins[3]
+    assert inferred_tail.method == "affine-guided-local-lookup"
+    assert inferred_tail.lookup_row >= 80
+    assert inferred_tail.automatic is False
+    assert "terminal-transport-tail" in inferred_tail.review_reasons
+
+
+def test_all_high_bit_transport_table_has_no_usable_pre_tail_anchors() -> None:
+    records = [
+        roll.TransportRecord(
+            row=row,
+            code=0x8330,
+            selector=31,
+            native_origin=43_946,
+        )
+        for row in range(100)
+    ]
+    boundaries = [_boundary(index, row) for index, row in enumerate((10, 30, 50))]
+
+    with pytest.raises(roll.IndexDecodeError, match="three direct physical gaps"):
+        roll.derive_transport_mapping(boundaries, len(boundaries), records)
+
+
+def test_one_record_terminal_suffix_preserves_prefix_and_truncates_tail() -> None:
+    records = [
+        roll.TransportRecord(row=row, code=0, selector=0, native_origin=42 * row)
+        for row in range(100)
+    ]
+    records[99] = roll.TransportRecord(
+        row=99,
+        code=0x8330,
+        selector=31,
+        native_origin=43_946,
+    )
+    boundaries = [_boundary(index, row) for index, row in enumerate((20, 40, 60))]
+    boundaries.append(_boundary(3, 95, evidence_run=(92, 99)))
+
+    mapping = roll.derive_transport_mapping(boundaries, len(boundaries), records)
+
+    assert roll.terminal_transport_tail_start(records) == 99
+    assert [origin.native_origin for origin in mapping.origins[:3]] == [
+        42 * 24,
+        42 * 44,
+        42 * 64,
+    ]
+    assert [origin.automatic for origin in mapping.origins[:3]] == [True, True, True]
+    tail = mapping.origins[3]
+    assert tail.lookup_row == 99
+    assert tail.automatic is False
+    assert "terminal-transport-tail" in tail.review_reasons
+
+
 @pytest.mark.skipif(
     LIVE_PREVIEW is None
     or LIVE_TABLE is None
@@ -481,6 +624,15 @@ def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None
         known,
         nominal_frame_rows=5_959 // geometry.pitch,
     )
+    records = roll.parse_live_transport_records_bytes(
+        table,
+        maximum_rows=geometry.height,
+    )
+    mapping = roll.derive_transport_mapping(
+        detection.boundaries,
+        len(detection.intervals),
+        records,
+    )
 
     complete = [
         interval
@@ -499,6 +651,17 @@ def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None
     assert detection.confidence == "high"
     assert detection.intervals[-1].coverage_fraction < 0.50
     assert detection.intervals[-1].manual_review
+    assert roll.terminal_transport_tail_start(records) == 792
+    assert mapping.native_units_per_preview_row == pytest.approx(42.333098275656035)
+    assert [origin.native_origin for origin in mapping.origins[1:6]] == [
+        6_188,
+        12_250,
+        18_228,
+        24_332,
+        30_394,
+    ]
+    assert mapping.origins[5].automatic
+    assert "terminal-transport-tail" in mapping.origins[6].review_reasons
 
 
 @pytest.mark.skipif(

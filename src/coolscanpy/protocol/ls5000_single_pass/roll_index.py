@@ -405,6 +405,24 @@ def parse_live_transport_records_bytes(
     return tuple(records)
 
 
+def terminal_transport_tail_start(
+    records: Sequence[TransportRecord],
+) -> int | None:
+    """Return the first row of Nikon's terminal high-bit transport suffix.
+
+    Live short-strip tables keep their ordinary coordinate ramp until the
+    trailing edge clears the drive, then end in a contiguous run of 0x81xx /
+    0x83xx records whose decoded origins jump several frames forward. High-bit
+    records observed earlier in a table are not classified: only the maximal
+    terminal suffix is excluded.
+    """
+
+    start = len(records)
+    while start > 0 and records[start - 1].code & 0x8000:
+        start -= 1
+    return start if start < len(records) else None
+
+
 def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
     """Validate stable parity framing plus a strictly repeated EOF suffix.
 
@@ -1175,6 +1193,7 @@ def derive_transport_mapping(
         raise IndexDecodeError("transport mapping has no live 0x8e records")
     frame_boundaries = list(boundaries[:frame_count])
 
+    tail_start = terminal_transport_tail_start(records)
     direct: list[tuple[GapBoundary, TransportRecord]] = []
     for boundary in frame_boundaries:
         if (
@@ -1190,13 +1209,23 @@ def derive_transport_mapping(
                 f"{boundary.index + 1} is outside the live 0x8e table"
             )
         direct.append((boundary, records[lookup_row]))
-    if len(direct) < 3:
+    fit_direct = [
+        item for item in direct if tail_start is None or item[1].row < tail_start
+    ]
+    if len(fit_direct) < 3:
         raise IndexDecodeError(
-            "transport mapping requires at least three direct physical gaps"
+            "transport mapping requires at least three direct physical gaps "
+            "before the terminal transport tail"
         )
 
-    x = np.asarray([item.output_row for item, _record in direct], dtype=np.float64)
-    y = np.asarray([record.native_origin for _item, record in direct], dtype=np.float64)
+    x = np.asarray(
+        [item.output_row for item, _record in fit_direct],
+        dtype=np.float64,
+    )
+    y = np.asarray(
+        [record.native_origin for _item, record in fit_direct],
+        dtype=np.float64,
+    )
     design = np.column_stack((np.ones(len(x)), x))
     intercept, scale = np.linalg.lstsq(design, y, rcond=None)[0]
     if not minimum_scale <= scale <= maximum_scale:
@@ -1216,6 +1245,7 @@ def derive_transport_mapping(
 
     direct_by_index = {item.index: record for item, record in direct}
     origins: list[NativeFrameOrigin] = []
+    terminal_boundary_index: int | None = None
     for frame, boundary in enumerate(frame_boundaries, start=1):
         prediction = float(intercept + scale * boundary.output_row)
         record = direct_by_index.get(boundary.index)
@@ -1243,6 +1273,15 @@ def derive_transport_mapping(
             method = "affine-guided-local-lookup"
             reasons = list(boundary.review_reasons)
             reasons.append("transport-origin-inferred")
+            automatic = False
+        if tail_start is not None and record.row >= tail_start:
+            if terminal_boundary_index is None:
+                terminal_boundary_index = boundary.index
+        if (
+            terminal_boundary_index is not None
+            and boundary.index >= terminal_boundary_index
+        ):
+            reasons.append("terminal-transport-tail")
             automatic = False
         residual = (prediction - record.native_origin) / scale
         origins.append(

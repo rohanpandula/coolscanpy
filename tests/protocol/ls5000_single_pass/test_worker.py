@@ -6,6 +6,7 @@ import hashlib
 import json
 import struct
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -835,7 +836,7 @@ def _short_strip_mapping(
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    return TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins), records
+    return TransportMapping(6_000, 168.0, 42.0, 0.0, 0.0, origins), records
 
 
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
@@ -865,6 +866,62 @@ def test_frame_table_accepts_a_short_strip_mapping_below_37_origins() -> None:
     assert len(payload) == 4 + 6 * 8
 
 
+def _with_terminal_sixth_origin(
+    mapping: TransportMapping,
+) -> TransportMapping:
+    terminal = replace(
+        mapping.origins[5],
+        code=0x8330,
+        selector=31,
+        native_origin=43_946,
+        automatic=False,
+        manual_review=True,
+        review_reasons=("terminal-transport-tail",),
+    )
+    return replace(mapping, origins=(*mapping.origins[:5], terminal))
+
+
+def test_frame_table_stops_before_terminal_transport_tail() -> None:
+    mapping, _records = _short_strip_mapping(6)
+
+    payload = build_live_frame_table_payload(_with_terminal_sixth_origin(mapping))
+
+    assert payload[2] == 5
+    assert len(payload) == 4 + 5 * 8
+
+
+def test_manual_approval_cannot_address_terminal_transport_tail() -> None:
+    mapping, records = _short_strip_mapping(6)
+
+    with pytest.raises(ProtocolError, match="terminal transport tail"):
+        apply_batch_boundary_offsets(
+            _with_terminal_sixth_origin(mapping),
+            records,
+            ((6, 0),),
+            approved_manual_slots=frozenset({6}),
+        )
+
+
+def test_boundary_offset_cannot_enter_terminal_transport_tail() -> None:
+    mapping, original_records = _short_strip_mapping(6)
+    records = list(original_records)
+    for row in range(800, len(records)):
+        records[row] = TransportRecord(
+            row=row,
+            code=0x8330,
+            selector=31,
+            native_origin=43_946,
+        )
+
+    with pytest.raises(ProtocolError, match="resolves into the terminal"):
+        apply_boundary_offset(
+            mapping,
+            records,
+            frame=5,
+            offset_rows=128,
+        )
+
+
 def test_frame_table_ignores_advisory_slots_after_the_fixed_37_records() -> None:
     extra = (230000, 304, 24)
     payload = build_live_frame_table_payload(_mapping((*LIVE8_TRANSPORT_FIELDS, extra)))
@@ -877,16 +934,7 @@ def test_frame_table_ignores_advisory_slots_after_the_fixed_37_records() -> None
 
 
 def test_boundary_offset_resolves_raw_identity_from_the_same_transport_table() -> None:
-    mapping = _mapping(LIVE8_TRANSPORT_FIELDS)
-    records = tuple(
-        TransportRecord(
-            row=row,
-            code=22 + 2 * (row % 4),
-            selector=row,
-            native_origin=756 * row + 7 * (22 + 2 * (row % 4)),
-        )
-        for row in range(6_000)
-    )
+    mapping, records = _short_strip_mapping(37)
 
     adjusted, selected = apply_boundary_offset(
         mapping,
@@ -906,6 +954,52 @@ def test_boundary_offset_resolves_raw_identity_from_the_same_transport_table() -
     assert selected.automatic is True
     assert adjusted.origins[:17] == mapping.origins[:17]
     assert adjusted.origins[18:] == mapping.origins[18:]
+
+
+@pytest.mark.parametrize("offset_rows", [-115, 28])
+def test_boundary_offset_rejects_interior_high_bit_origin_jump(
+    offset_rows: int,
+) -> None:
+    mapping, original_records = _short_strip_mapping(6)
+    records = list(original_records)
+    resolved_row = mapping.origins[5].lookup_row + offset_rows
+    records[resolved_row] = TransportRecord(
+        row=resolved_row,
+        code=0x8330,
+        selector=31,
+        native_origin=43_946,
+    )
+
+    with pytest.raises(ProtocolError, match="outside the affine mapping"):
+        apply_boundary_offset(
+            mapping,
+            records,
+            frame=6,
+            offset_rows=offset_rows,
+        )
+
+
+def test_boundary_offset_accepts_coordinate_valid_interior_high_bit_record() -> None:
+    mapping, original_records = _short_strip_mapping(6)
+    records = list(original_records)
+    resolved_row = 700
+    records[resolved_row] = TransportRecord(
+        row=resolved_row,
+        code=0x8058,
+        selector=12,
+        native_origin=29_400,
+    )
+
+    _adjusted, selected = apply_boundary_offset(
+        mapping,
+        records,
+        frame=6,
+        offset_rows=resolved_row - mapping.origins[5].lookup_row,
+    )
+
+    assert selected.lookup_row == resolved_row
+    assert selected.native_origin == 29_400
+    assert selected.affine_residual_rows == pytest.approx(0.0)
 
 
 def test_internal_window_decoder_reads_the_fields_the_worker_patches() -> None:
@@ -964,7 +1058,14 @@ def test_resolved_offset_is_encoded_into_the_selected_fixed_table_record() -> No
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
 
     adjusted, selected = apply_boundary_offset(
         mapping,
@@ -1007,7 +1108,14 @@ def test_batch_offsets_share_the_one_retained_table_and_later_frame_origins() ->
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
 
     combined, resolved = apply_batch_boundary_offsets(
         mapping,
@@ -1105,7 +1213,14 @@ def test_inferred_batch_origin_requires_its_receipt_bound_operator_approval() ->
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
 
     with pytest.raises(ProtocolError, match="requires manual review"):
         apply_batch_boundary_offsets(mapping, records, ((18, -11),))
@@ -1212,7 +1327,14 @@ def test_fresh_batch_index_refuses_a_different_roll_before_plan_binding(
         )
         for frame, row in enumerate(lookup_rows, start=1)
     )
-    mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
     reviewed = build_reviewed_roll_fingerprint(
         reviewed_rgb,
         frame_intervals=intervals,
@@ -1595,7 +1717,14 @@ def test_continuation_executor_runs_all_89_steps_with_fake_usb(
             start=1,
         )
     )
-    mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
     combined, _resolved = apply_batch_boundary_offsets(
         mapping,
         records,
@@ -1833,7 +1962,14 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
             start=1,
         )
     )
-    base_mapping = TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    base_mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
     combined, resolved = apply_batch_boundary_offsets(
         base_mapping,
         records,

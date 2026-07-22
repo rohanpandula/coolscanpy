@@ -73,6 +73,7 @@ from .roll_index import (
     derive_transport_mapping,
     detect_roll_frames,
     parse_live_transport_records_bytes,
+    terminal_transport_tail_start,
     transport_native_origin,
     validate_live_0x8e_bytes,
 )
@@ -1059,6 +1060,11 @@ def _derive_live_frame_selection(
     base_selected = mapping.origins[frame - 1]
     if base_selected.frame != frame:
         raise ProtocolError("transport mapping frame order is inconsistent")
+    if "terminal-transport-tail" in base_selected.review_reasons:
+        raise ProtocolError(
+            f"frame {frame} belongs to the terminal transport tail and is not "
+            "scanner-addressable"
+        )
     if (
         not base_selected.automatic or base_selected.manual_review
     ) and not manual_review_approved:
@@ -1501,16 +1507,39 @@ def apply_boundary_offset(
     base = mapping.origins[frame - 1]
     if base.frame != frame:
         raise ProtocolError("transport mapping frame order is inconsistent")
+    if "terminal-transport-tail" in base.review_reasons:
+        raise ProtocolError(
+            f"frame {frame} belongs to the terminal transport tail and is not "
+            "scanner-addressable"
+        )
     resolved_row = base.lookup_row + offset_rows
     if not 0 <= resolved_row < len(records):
         raise ProtocolError(
             f"frame {frame} boundary offset resolves outside the live 0x8e table"
+        )
+    tail_start = terminal_transport_tail_start(records)
+    if tail_start is not None and resolved_row >= tail_start:
+        raise ProtocolError(
+            f"frame {frame} boundary offset resolves into the terminal transport tail"
         )
     record = records[resolved_row]
     if record.row != resolved_row:
         raise ProtocolError("live 0x8e records are not indexed by preview row")
     if transport_native_origin(record.code, record.selector) != record.native_origin:
         raise ProtocolError("resolved 0x8e record does not reproduce its origin")
+    predicted_origin = (
+        mapping.native_intercept
+        + mapping.native_units_per_preview_row
+        * (base.boundary_output_row + offset_rows)
+    )
+    residual_rows = (
+        predicted_origin - record.native_origin
+    ) / mapping.native_units_per_preview_row
+    if abs(residual_rows) > 2.0:
+        raise ProtocolError(
+            f"frame {frame} boundary offset resolves to a transport origin "
+            f"{abs(residual_rows):.3f} rows outside the affine mapping"
+        )
     selected = replace(
         base,
         lookup_row=resolved_row,
@@ -1523,6 +1552,7 @@ def apply_boundary_offset(
             else f"{base.method}+operator-boundary-offset"
         ),
         automatic=base.automatic,
+        affine_residual_rows=float(residual_rows),
     )
     origins = list(mapping.origins)
     origins[frame - 1] = selected
@@ -1565,6 +1595,11 @@ def apply_batch_boundary_offsets(
         base = original.origins[frame - 1]
         if base.frame != frame:
             raise ProtocolError("transport mapping frame order is inconsistent")
+        if "terminal-transport-tail" in base.review_reasons:
+            raise ProtocolError(
+                f"frame {frame} belongs to the terminal transport tail and is "
+                "not scanner-addressable"
+            )
         if (
             not base.automatic or base.manual_review
         ) and frame not in approved_manual_slots:
@@ -1603,7 +1638,11 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
     # rejects with ILLEGAL REQUEST 05/26/00.  Keep the UI's slot numbering intact,
     # but stop the hardware table before the first candidate that the detector
     # proved lies outside the raster or has invalid physical spacing.
-    non_addressable_reasons = {"outside-index-raster", "spacing-outlier"}
+    non_addressable_reasons = {
+        "outside-index-raster",
+        "spacing-outlier",
+        "terminal-transport-tail",
+    }
     origins = []
     for origin in mapping.origins:
         if (

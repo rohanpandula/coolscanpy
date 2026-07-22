@@ -9,6 +9,14 @@ diagnosis. Omitting the argument preserves the temporary self-cleaning
 behavior. This closes an evidence-loss path in which a synchronized refusal
 was recorded and then removed during otherwise successful cleanup.
 
+Short-strip transport mapping now recognizes Nikon's contiguous terminal
+`0x81xx`/`0x83xx` table suffix after the film leaves the drive. Those records
+are excluded from the affine anchor fit and are unconditionally
+scanner-nonaddressable: manual approval and boundary offsets cannot put one
+back into `SEND(0x8f)`. The physical `40..45` scale and anchor-residual gates
+remain unchanged. This prevents a terminal slot from pulling an otherwise
+valid six-strip fit from about `42.33` to the observed false `61.34` scale.
+
 0.1.3's live-table-vs-fingerprint frame count check broke full-roll scanning.
 A batch run over slots 3 and 20 of a reviewed 36-exposure roll failed with
 a `RollMismatch` reporting a live table of 37 scanner-addressable records
