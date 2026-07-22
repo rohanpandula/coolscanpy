@@ -258,6 +258,8 @@ class RollDetection:
             "boundaries": [asdict(item) for item in self.boundaries],
             "intervals": [asdict(item) for item in self.intervals],
         }
+
+
 def parse_oracle_boundaries(payload: bytes) -> list[OracleBoundary]:
     """Parse Nikon Scan's same-roll SEND(0x8f) oracle table.
 
@@ -566,6 +568,8 @@ def decode_full_index_stream(
     return decode_full_index_bytes(
         Path(stream).read_bytes(), geometry, usable_rows=usable_rows
     )
+
+
 def _largest_true_run(mask: np.ndarray) -> tuple[int, int] | None:
     runs = _true_runs(mask)
     return max(runs, key=lambda item: item[1] - item[0], default=None)
@@ -916,10 +920,16 @@ def detect_roll_frames(
     # extent, capped by the feeder's 40-slot protocol limit.  A weak/blank
     # leading slot remains slot 1 with warnings instead of silently renumbering
     # every later frame.  The final slot may likewise be partial.
+    # ``_lattice_positions`` keeps a two-row margin while fitting because its
+    # local evidence window needs neighbours on both sides.  The extended
+    # lattice used here has already been fitted, so applying that margin again
+    # silently drops a complete first cell whose rounded boundary is row 0 or
+    # row 1.  Admit those fully in-raster starts.  A genuinely clipped leading
+    # cell still has a negative start and remains excluded fail-closed.
     lattice_starts = [
         index
         for index, row in enumerate(all_positions[:-1])
-        if 2 <= row < len(evidence)
+        if 0 <= row < len(evidence)
     ]
     if not lattice_starts:
         raise IndexDecodeError("roll detector found no in-raster lattice origin")

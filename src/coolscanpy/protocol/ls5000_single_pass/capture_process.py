@@ -52,6 +52,13 @@ from .continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
     canonical_continuation_plan_bytes,
 )
+from .density import (
+    DENSITY_SOURCE_WIRE_BYTES,
+    DensityCalibration,
+    NikonDensityEvidence,
+    NikonDensityFrameOwnershipReceipt,
+    build_nikon_density_evidence,
+)
 from .plan import (
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
@@ -65,9 +72,7 @@ METER_READ_COUNT = 15
 METER_CAPTURE_BYTES = 3_264_000
 POWER_CYCLE_RECOVERY = "power-cycle scanner before another attempt"
 CAPTURE_HELPER_FLAG = "--ls5000-capture-helper"
-PACKAGED_WORKER_MODULE = (
-    "coolscanpy.protocol.ls5000_single_pass.worker"
-)
+PACKAGED_WORKER_MODULE = "coolscanpy.protocol.ls5000_single_pass.worker"
 REVIEWED_ROLL_FINGERPRINT_VERSION = 2
 MANUAL_FRAME_APPROVAL_VERSION = 1
 MAX_VISUAL_MEDIAN_HAMMING = 24
@@ -88,6 +93,128 @@ def _lower_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _validated_density_calibration(
+    journal: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> DensityCalibration:
+    """Validate the worker's raw READ(0x8c) evidence and reservation binding."""
+
+    calibration = DensityCalibration.from_dict(journal.get("nikon_density_calibration"))
+    if journal.get("density_calibration_session_id") != calibration.session_id:
+        raise ValueError(
+            "density calibration record and journal reservation identity disagree"
+        )
+    if (
+        expected_session_id is not None
+        and calibration.session_id != expected_session_id
+    ):
+        raise ValueError("density calibration belongs to another reservation")
+    return calibration
+
+
+def _validated_density_evidence(
+    journal: dict[str, Any],
+    *,
+    output_path: Path,
+) -> NikonDensityEvidence:
+    """Rebuild one bounded session receipt from its hash-bound preview bytes."""
+
+    receipt = journal.get("nikon_density_evidence")
+    if type(receipt) is not dict:
+        raise ValueError("Nikon density evidence receipt is missing or malformed")
+    source_path = output_path.with_name(f"{output_path.stem}-preview.bin")
+    try:
+        stat = source_path.lstat()
+    except OSError as error:
+        raise ValueError("Nikon density source artifact is missing") from error
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("Nikon density source artifact is not a regular file")
+    if stat.st_size != DENSITY_SOURCE_WIRE_BYTES:
+        raise ValueError("Nikon density source artifact has the wrong byte length")
+    try:
+        source_payload = source_path.read_bytes()
+    except OSError as error:
+        raise ValueError("Nikon density source artifact could not be read") from error
+
+    calibration_binding = receipt.get("calibration_binding")
+    exposure_binding = receipt.get("exposure_binding")
+    source_binding = receipt.get("source_binding")
+    if not all(
+        type(value) is dict
+        for value in (calibration_binding, exposure_binding, source_binding)
+    ):
+        raise ValueError("Nikon density evidence bindings are malformed")
+    calibration = DensityCalibration.from_dict(calibration_binding.get("calibration"))
+    exposures = exposure_binding.get("density_f03_exposures_raw_10ns_rgb")
+    if type(exposures) is not list:
+        raise ValueError("Nikon density f03 exposures are malformed")
+    evidence = build_nikon_density_evidence(
+        source_payload,
+        calibration=calibration,
+        density_f03_exposures_raw_10ns=tuple(exposures),
+        session_id=source_binding.get("session_id"),
+        capture_attempt_id=source_binding.get("capture_attempt_id"),
+        scan_identity=source_binding.get("scan_identity"),
+    )
+    if evidence.to_dict() != receipt:
+        raise ValueError("Nikon density evidence does not reproduce its receipt")
+    return evidence
+
+
+def _validated_density_frame_ownership(
+    journal: dict[str, Any],
+    *,
+    output_path: Path,
+    expected_session_id: str,
+    expected_frame_index: int,
+    expected_frame_total: int,
+    expected_selected_slots: tuple[int, ...],
+    expected_selected_slot: int,
+    evidence: NikonDensityEvidence | None = None,
+) -> NikonDensityFrameOwnershipReceipt:
+    """Validate one frame's exact reservation-preview ownership receipt."""
+
+    receipt = NikonDensityFrameOwnershipReceipt.from_dict(
+        journal.get("nikon_density_frame_ownership")
+    )
+    expected_batch = {
+        "frame_index": expected_frame_index,
+        "frame_total": expected_frame_total,
+        "selected_slots": list(expected_selected_slots),
+        "session_id": expected_session_id,
+    }
+    if journal.get("batch_session") != expected_batch:
+        raise ValueError("density ownership batch journal identity is inconsistent")
+    selection = journal.get("live_frame_selection")
+    if type(selection) is not dict:
+        raise ValueError("density ownership live frame selection is missing")
+    roll_identity = selection.get("roll_identity")
+    if type(roll_identity) is not dict:
+        raise ValueError("density ownership roll identity is missing")
+    expected = {
+        "reservation_id": expected_session_id,
+        "batch_session_id": expected_session_id,
+        "preview_sha256": selection.get("preview_sha256"),
+        "transport_table_sha256": selection.get("table_sha256"),
+        "reviewed_fingerprint_sha256": roll_identity.get("reviewed_fingerprint_sha256"),
+        "fresh_fingerprint_sha256": roll_identity.get("fresh_fingerprint_sha256"),
+        "frame_capture_attempt_id": output_path.parent.name,
+        "frame_index": expected_frame_index,
+        "frame_total": expected_frame_total,
+        "selected_slots": expected_selected_slots,
+        "selected_slot": expected_selected_slot,
+    }
+    for field, value in expected.items():
+        if getattr(receipt, field) != value:
+            raise ValueError(f"density ownership {field} changed at capture boundary")
+    if journal.get("session_reservation_retained") is not True:
+        raise ValueError("density ownership reservation was not retained")
+    if evidence is not None:
+        receipt.validate_evidence(evidence)
+    return receipt
 
 
 def _canonical_json_sha256(payload: dict[str, Any]) -> str:
@@ -199,7 +326,9 @@ class ReviewedRollFingerprint:
             or any(type(value) is not int or value < 1 for value in self.preview_shape)
             or self.preview_shape[2] != 3
         ):
-            raise ValueError("reviewed roll preview shape must be a positive HxWx3 tuple")
+            raise ValueError(
+                "reviewed roll preview shape must be a positive HxWx3 tuple"
+            )
         count = len(self.frame_start_rows)
         if not 1 <= count <= 40:
             raise ValueError("reviewed roll fingerprint must describe 1..40 slots")
@@ -208,7 +337,9 @@ class ReviewedRollFingerprint:
             or len(self.frame_visual_hashes) != count
             or len(self.frame_visual_log_spans) != count
         ):
-            raise ValueError("reviewed roll fingerprint frame fields must have equal length")
+            raise ValueError(
+                "reviewed roll fingerprint frame fields must have equal length"
+            )
         if any(type(value) is not int or value < 0 for value in self.frame_start_rows):
             raise ValueError("reviewed roll frame starts must be nonnegative integers")
         if any(
@@ -216,8 +347,12 @@ class ReviewedRollFingerprint:
             for first, second in zip(self.frame_start_rows, self.frame_start_rows[1:])
         ):
             raise ValueError("reviewed roll frame starts must be strictly increasing")
-        if any(type(value) is not int or value < 0 for value in self.frame_native_origins):
-            raise ValueError("reviewed roll native origins must be nonnegative integers")
+        if any(
+            type(value) is not int or value < 0 for value in self.frame_native_origins
+        ):
+            raise ValueError(
+                "reviewed roll native origins must be nonnegative integers"
+            )
         if any(
             first >= second
             for first, second in zip(
@@ -227,7 +362,9 @@ class ReviewedRollFingerprint:
         ):
             raise ValueError("reviewed roll native origins must be strictly increasing")
         if any(not _lower_sha256(value) for value in self.frame_visual_hashes):
-            raise ValueError("reviewed roll visual hashes must be SHA-256-sized hex values")
+            raise ValueError(
+                "reviewed roll visual hashes must be SHA-256-sized hex values"
+            )
         if any(
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -281,8 +418,7 @@ class ReviewedRollFingerprint:
         visual = payload.get("frame_visual_hashes")
         spans = payload.get("frame_visual_log_spans")
         if not all(
-            isinstance(value, list)
-            for value in (shape, starts, origins, visual, spans)
+            isinstance(value, list) for value in (shape, starts, origins, visual, spans)
         ):
             raise ValueError("reviewed roll fingerprint arrays are malformed")
         value = cls(
@@ -324,12 +460,17 @@ class ManualFrameApproval:
             raise TypeError("manual frame approval boundary offset must be an integer")
         minimum_offset = 0 if self.slot == 1 else -144
         if not minimum_offset <= self.boundary_offset_rows <= 144:
-            raise ValueError("manual frame approval boundary offset is outside 97-dpi limits")
+            raise ValueError(
+                "manual frame approval boundary offset is outside 97-dpi limits"
+            )
         if not _lower_sha256(self.thumbnail_sha256):
             raise ValueError("manual frame approval thumbnail identity is invalid")
         if type(self.reviewed_lookup_row) is not int or self.reviewed_lookup_row < 0:
             raise ValueError("manual frame approval lookup row is invalid")
-        if type(self.reviewed_native_origin) is not int or self.reviewed_native_origin < 0:
+        if (
+            type(self.reviewed_native_origin) is not int
+            or self.reviewed_native_origin < 0
+        ):
             raise ValueError("manual frame approval native origin is invalid")
         if (
             not isinstance(self.review_reasons, tuple)
@@ -599,8 +740,7 @@ def compare_reviewed_roll_fingerprints(
             fresh.frame_visual_log_spans,
             strict=True,
         )
-        if expected_span >= MIN_VISUAL_LOG_SPAN
-        and observed_span >= MIN_VISUAL_LOG_SPAN
+        if expected_span >= MIN_VISUAL_LOG_SPAN and observed_span >= MIN_VISUAL_LOG_SPAN
     )
     discriminative_frames = len(visual)
     minimum_discriminative_frames = min(
@@ -625,11 +765,7 @@ def compare_reviewed_roll_fingerprints(
         )
     )
     visual_median = float(median(visual)) if visual else None
-    visual_p90 = (
-        visual[max(0, (9 * len(visual) + 9) // 10 - 1)]
-        if visual
-        else None
-    )
+    visual_p90 = visual[max(0, (9 * len(visual) + 9) // 10 - 1)] if visual else None
     start_median = float(median(starts))
     start_max = starts[-1]
     origin_median = float(median(origins))
@@ -639,8 +775,7 @@ def compare_reviewed_roll_fingerprints(
     elif visual_median is None or visual_p90 is None:
         reason = "visual-signature-indeterminate"
     elif (
-        visual_median > MAX_VISUAL_MEDIAN_HAMMING
-        or visual_p90 > MAX_VISUAL_P90_HAMMING
+        visual_median > MAX_VISUAL_MEDIAN_HAMMING or visual_p90 > MAX_VISUAL_P90_HAMMING
     ):
         reason = "visual-content-mismatch"
     elif (
@@ -684,7 +819,9 @@ def compare_selected_roll_fingerprint(
         fresh,
         ReviewedRollFingerprint,
     ):
-        raise TypeError("selected fingerprint comparison requires reviewed fingerprints")
+        raise TypeError(
+            "selected fingerprint comparison requires reviewed fingerprints"
+        )
     if type(slot) is not int or not 1 <= slot <= 40:
         raise ValueError("selected fingerprint slot must be in 1..40")
     if len(reviewed.frame_visual_hashes) != len(fresh.frame_visual_hashes):
@@ -730,6 +867,8 @@ class CaptureRequest:
     selected_slot: int | None = None
     boundary_offset_rows: int = 0
     manual_review_approval: ManualFrameApproval | None = None
+    expected_usb_bus: int | None = None
+    expected_usb_address: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, CaptureMode):
@@ -738,15 +877,37 @@ class CaptureRequest:
             self.boundary_offset_rows, int
         ):
             raise TypeError("boundary offset must be an integer row count")
+        topology = (self.expected_usb_bus, self.expected_usb_address)
+        if (topology[0] is None) != (topology[1] is None):
+            raise ValueError("expected USB bus and address are inseparable")
+        if topology[0] is not None:
+            if (
+                isinstance(topology[0], bool)
+                or not isinstance(topology[0], int)
+                or not 0 <= topology[0] <= 999
+            ):
+                raise ValueError("expected USB bus must be an integer in 0..999")
+            if (
+                isinstance(topology[1], bool)
+                or not isinstance(topology[1], int)
+                or not 1 <= topology[1] <= 127
+            ):
+                raise ValueError("expected USB address must be an integer in 1..127")
         if self.mode is CaptureMode.PREVIEW:
             if self.selected_slot is not None:
                 raise ValueError("preview-only requests do not select a scanner slot")
             if self.boundary_offset_rows != 0:
                 raise ValueError("preview boundary offset must be zero")
             if self.manual_review_approval is not None:
-                raise ValueError("preview requests cannot carry a manual review approval")
+                raise ValueError(
+                    "preview requests cannot carry a manual review approval"
+                )
             return
-        if isinstance(self.selected_slot, bool) or not isinstance(self.selected_slot, int) or not 1 <= self.selected_slot <= 40:
+        if (
+            isinstance(self.selected_slot, bool)
+            or not isinstance(self.selected_slot, int)
+            or not 1 <= self.selected_slot <= 40
+        ):
             raise ValueError("selected scanner slot must be an integer in 1..40")
         minimum_offset = 0 if self.selected_slot == 1 else -144
         if not minimum_offset <= self.boundary_offset_rows <= 144:
@@ -762,7 +923,9 @@ class CaptureRequest:
                 approval.slot != self.selected_slot
                 or approval.boundary_offset_rows != self.boundary_offset_rows
             ):
-                raise ValueError("manual review approval does not match the requested frame")
+                raise ValueError(
+                    "manual review approval does not match the requested frame"
+                )
 
 
 @dataclass(frozen=True)
@@ -771,6 +934,8 @@ class CaptureBatchRequest:
 
     frames: tuple[CaptureRequest, ...]
     reviewed_fingerprint: ReviewedRollFingerprint
+    expected_usb_bus: int
+    expected_usb_address: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -783,6 +948,18 @@ class CaptureBatchRequest:
             raise ValueError("batch sessions currently support full captures only")
         if not isinstance(self.reviewed_fingerprint, ReviewedRollFingerprint):
             raise TypeError("batch requires one reviewed roll fingerprint")
+        if (
+            isinstance(self.expected_usb_bus, bool)
+            or not isinstance(self.expected_usb_bus, int)
+            or not 0 <= self.expected_usb_bus <= 999
+        ):
+            raise ValueError("batch expected USB bus must be an integer in 0..999")
+        if (
+            isinstance(self.expected_usb_address, bool)
+            or not isinstance(self.expected_usb_address, int)
+            or not 1 <= self.expected_usb_address <= 127
+        ):
+            raise ValueError("batch expected USB address must be an integer in 1..127")
         for frame in self.frames:
             approval = frame.manual_review_approval
             if (
@@ -790,7 +967,9 @@ class CaptureBatchRequest:
                 and approval.reviewed_fingerprint_sha256
                 != self.reviewed_fingerprint.binding_sha256
             ):
-                raise ValueError("manual review approval belongs to another roll preview")
+                raise ValueError(
+                    "manual review approval belongs to another roll preview"
+                )
         slots = self.selected_slots
         if tuple(sorted(set(slots))) != slots:
             raise ValueError(
@@ -868,6 +1047,52 @@ class CaptureAttemptResult:
     def recovery_required(self) -> bool:
         return self.outcome is CaptureOutcome.RECOVERY_REQUIRED
 
+    @property
+    def density_calibration(self) -> DensityCalibration | None:
+        """Return the validated calibration carried by this accepted journal."""
+
+        if self.journal is None or "nikon_density_calibration" not in self.journal:
+            return None
+        return _validated_density_calibration(
+            self.journal,
+            expected_session_id=self.batch_session_id,
+        )
+
+    @property
+    def density_evidence(self) -> NikonDensityEvidence | None:
+        """Return the verified reservation-preview bundle when captured here."""
+
+        if self.journal is None or "nikon_density_evidence" not in self.journal:
+            return None
+        return _validated_density_evidence(
+            self.journal,
+            output_path=self.paths.output,
+        )
+
+    @property
+    def density_ownership(self) -> NikonDensityFrameOwnershipReceipt | None:
+        """Return exact frame ownership, or fail closed on any identity drift."""
+
+        if self.journal is None or "nikon_density_frame_ownership" not in self.journal:
+            return None
+        if (
+            self.batch_session_id is None
+            or self.batch_frame_index is None
+            or self.batch_frame_total is None
+            or self.request.selected_slot is None
+        ):
+            raise ValueError("density frame ownership has no accepted batch identity")
+        return _validated_density_frame_ownership(
+            self.journal,
+            output_path=self.paths.output,
+            expected_session_id=self.batch_session_id,
+            expected_frame_index=self.batch_frame_index,
+            expected_frame_total=self.batch_frame_total,
+            expected_selected_slots=self.batch_selected_slots,
+            expected_selected_slot=self.request.selected_slot,
+            evidence=self.density_evidence,
+        )
+
 
 @dataclass(frozen=True)
 class CaptureBatchResult:
@@ -882,6 +1107,53 @@ class CaptureBatchResult:
     session_journal: dict[str, Any]
     stdout: str
     stderr: str
+
+    @property
+    def density_evidence(self) -> NikonDensityEvidence | None:
+        """Return the one reservation-preview bundle for owned batch frames."""
+
+        found: list[NikonDensityEvidence] = []
+        for frame in self.frames:
+            item = frame.density_evidence
+            if item is not None:
+                found.append(item)
+        evidence = tuple(found)
+        if not evidence:
+            return None
+        first = evidence[0]
+        if any(item != first for item in evidence[1:]):
+            raise ValueError("batch frames disagree on Nikon density evidence")
+        receipt = self.session_journal.get("nikon_density_evidence")
+        if first.to_dict() != receipt:
+            raise ValueError("batch density evidence disagrees with session receipt")
+        return first
+
+    @property
+    def density_ownership(self) -> tuple[NikonDensityFrameOwnershipReceipt, ...]:
+        """Return all frame receipts after enforcing one shared preview identity."""
+
+        receipts: list[NikonDensityFrameOwnershipReceipt] = []
+        for frame in self.frames:
+            receipt = frame.density_ownership
+            if receipt is None:
+                raise ValueError("batch frame has no Nikon density ownership receipt")
+            receipts.append(receipt)
+        if not receipts:
+            return ()
+        first_transport_identity = receipts[0].transport_identity_sha256
+        first_preview_identity = receipts[0].preview_identity_sha256
+        if any(
+            receipt.transport_identity_sha256 != first_transport_identity
+            or receipt.preview_identity_sha256 != first_preview_identity
+            for receipt in receipts[1:]
+        ):
+            raise ValueError("batch frames disagree on Nikon density ownership")
+        evidence = self.density_evidence
+        if evidence is None:
+            raise ValueError("owned batch has no Nikon density preview evidence")
+        for receipt in receipts:
+            receipt.validate_evidence(evidence)
+        return tuple(receipts)
 
 
 class ProcessRunner(Protocol):
@@ -1100,7 +1372,9 @@ class CaptureProcessAdapter:
         if expected_bundle_sha256 is not None and not _is_sha256(
             expected_bundle_sha256
         ):
-            raise ValueError("expected capture bundle SHA-256 is not a lowercase digest")
+            raise ValueError(
+                "expected capture bundle SHA-256 is not a lowercase digest"
+            )
         self._expected_bundle_sha256 = expected_bundle_sha256
         self._manifest_payload = (
             None if manifest_payload is None else bytes(manifest_payload)
@@ -1197,12 +1471,13 @@ class CaptureProcessAdapter:
         session_id = paths.directory.name
         payload = self._batch_job_bytes(request, session_id=session_id)
         _write_exclusive(paths.job, payload)
-        argv = self._build_batch_argv(paths)
+        job_sha256 = hashlib.sha256(payload).hexdigest()
+        argv = self._build_batch_argv(paths, expected_job_sha256=job_sha256)
         return PreparedCaptureBatch(
             request=request,
             paths=paths,
             argv=argv,
-            job_sha256=hashlib.sha256(payload).hexdigest(),
+            job_sha256=job_sha256,
             session_id=session_id,
         )
 
@@ -1249,9 +1524,10 @@ class CaptureProcessAdapter:
         process: RunningBatchProcess | None = None
         returncode: int | None = None
         try:
-            with paths.stdout.open("xb") as stdout_handle, paths.stderr.open(
-                "xb"
-            ) as stderr_handle:
+            with (
+                paths.stdout.open("xb") as stdout_handle,
+                paths.stderr.open("xb") as stderr_handle,
+            ):
                 # Linearize the final stop check with process creation.  If a
                 # stop wins this lock no child launches; if Popen wins, that
                 # stop applies at the first durable frame boundary.
@@ -1277,15 +1553,37 @@ class CaptureProcessAdapter:
                             frame_request,
                             frame_index=frame_index,
                         )
-                        try:
-                            action = frame_handler(frame_result)
-                            if not isinstance(action, BatchAckAction):
-                                raise TypeError(
-                                    "frame_handler must return BatchAckAction"
-                                )
-                        except BaseException as error:
-                            handler_error = error
+                        ownership_error: BaseException | None = None
+                        if handled:
+                            try:
+                                first_ownership = handled[0].density_ownership
+                                current_ownership = frame_result.density_ownership
+                                if (
+                                    first_ownership is None
+                                    or current_ownership is None
+                                    or current_ownership.transport_identity_sha256
+                                    != first_ownership.transport_identity_sha256
+                                    or current_ownership.preview_identity_sha256
+                                    != first_ownership.preview_identity_sha256
+                                ):
+                                    raise CaptureProcessError(
+                                        "batch frame density preview/transport identity changed"
+                                    )
+                            except BaseException as error:
+                                ownership_error = error
+                        if ownership_error is not None:
+                            handler_error = ownership_error
                             action = BatchAckAction.STOP
+                        else:
+                            try:
+                                action = frame_handler(frame_result)
+                                if not isinstance(action, BatchAckAction):
+                                    raise TypeError(
+                                        "frame_handler must return BatchAckAction"
+                                    )
+                            except BaseException as error:
+                                handler_error = error
+                                action = BatchAckAction.STOP
                         handled.append(frame_result)
                         # Linearize Stop against publishing CONTINUE.  A stop
                         # that wins this lock changes the current boundary to
@@ -1345,8 +1643,7 @@ class CaptureProcessAdapter:
         except BaseException as error:
             cause = error if monitor_error is None else monitor_error
             raise CaptureBatchProcessError(
-                "batch child finished without a trustworthy release receipt: "
-                f"{error}",
+                f"batch child finished without a trustworthy release receipt: {error}",
                 outcome=CaptureOutcome.RECOVERY_REQUIRED,
                 paths=paths,
                 frames=handled,
@@ -1358,9 +1655,7 @@ class CaptureProcessAdapter:
             if session_journal.get("recovery_required") == "none"
             else CaptureOutcome.RECOVERY_REQUIRED
         )
-        outcome = (
-            CaptureOutcome.COMPLETE if returncode == 0 else receipt_outcome
-        )
+        outcome = CaptureOutcome.COMPLETE if returncode == 0 else receipt_outcome
         try:
             stdout = paths.stdout.read_text(encoding="utf-8", errors="replace")
             stderr = paths.stderr.read_text(encoding="utf-8", errors="replace")
@@ -1431,7 +1726,9 @@ class CaptureProcessAdapter:
             raise TypeError("request must be a CaptureRequest")
         with self._attempt_lock:
             if self._stop_requested.is_set():
-                raise CaptureStopped("capture stopped between attempts; no worker was launched")
+                raise CaptureStopped(
+                    "capture stopped between attempts; no worker was launched"
+                )
             paths = self._prepare_attempt_paths(request)
             self._verify_worker()
             self._materialize_pinned_plan(paths.plan)
@@ -1444,7 +1741,9 @@ class CaptureProcessAdapter:
             try:
                 completed = self._runner(argv, cwd=paths.directory)
             except OSError as error:
-                raise CaptureProcessError(f"could not launch capture worker: {error}") from error
+                raise CaptureProcessError(
+                    f"could not launch capture worker: {error}"
+                ) from error
 
             stdout = completed.stdout or ""
             stderr = completed.stderr or ""
@@ -1461,9 +1760,13 @@ class CaptureProcessAdapter:
 
     def _prepare_attempt_paths(self, request: CaptureRequest) -> AttemptPaths:
         self._attempts_root.mkdir(parents=True, exist_ok=True)
-        slot_suffix = "" if request.selected_slot is None else f"-slot{request.selected_slot:02d}"
+        slot_suffix = (
+            "" if request.selected_slot is None else f"-slot{request.selected_slot:02d}"
+        )
         prefix = f"{request.mode.value}{slot_suffix}-"
-        directory = Path(tempfile.mkdtemp(prefix=prefix, dir=self._attempts_root)).resolve()
+        directory = Path(
+            tempfile.mkdtemp(prefix=prefix, dir=self._attempts_root)
+        ).resolve()
         return AttemptPaths(
             directory=directory,
             output=directory / "capture.bin",
@@ -1488,9 +1791,7 @@ class CaptureProcessAdapter:
             directory=directory,
             job=directory / "batch-job.json",
             first_plan=directory / CANONICAL_PLAN_FILENAME,
-            continuation_plan=(
-                directory / CANONICAL_CONTINUATION_PLAN_FILENAME
-            ),
+            continuation_plan=(directory / CANONICAL_CONTINUATION_PLAN_FILENAME),
             manifest=directory / CANONICAL_MANIFEST_FILENAME,
             session_journal=directory / "session-journal.json",
             stdout=directory / "stdout.txt",
@@ -1514,18 +1815,26 @@ class CaptureProcessAdapter:
         if not self._verify_worker_source:
             return
         if not self._worker_path.is_file():
-            raise CaptureIntegrityError(f"capture worker is not a regular file: {self._worker_path}")
+            raise CaptureIntegrityError(
+                f"capture worker is not a regular file: {self._worker_path}"
+            )
         actual = _sha256_file(self._worker_path)
         if actual != self._expected_worker_sha256:
-            raise CaptureIntegrityError(f"capture worker SHA-256 mismatch: expected {self._expected_worker_sha256}, got {actual}")
+            raise CaptureIntegrityError(
+                f"capture worker SHA-256 mismatch: expected {self._expected_worker_sha256}, got {actual}"
+            )
 
     def _materialize_pinned_plan(self, destination: Path) -> None:
         try:
             payload = canonical_plan_bytes()
         except (OSError, ValueError) as error:
-            raise CaptureIntegrityError(f"bundled capture plan failed validation: {error}") from error
+            raise CaptureIntegrityError(
+                f"bundled capture plan failed validation: {error}"
+            ) from error
         if hashlib.sha256(payload).hexdigest() != CANONICAL_PLAN_SHA256:
-            raise CaptureIntegrityError("bundled capture plan SHA-256 changed after validation")
+            raise CaptureIntegrityError(
+                "bundled capture plan SHA-256 changed after validation"
+            )
         _write_exclusive(destination, payload)
         actual = _sha256_file(destination)
         if actual != CANONICAL_PLAN_SHA256:
@@ -1558,14 +1867,20 @@ class CaptureProcessAdapter:
             )
             manifest = json.loads(payload)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise CaptureIntegrityError(f"capture manifest could not be read: {error}") from error
+            raise CaptureIntegrityError(
+                f"capture manifest could not be read: {error}"
+            ) from error
         if not isinstance(manifest, dict):
             raise CaptureIntegrityError("capture manifest must be a JSON object")
         if manifest.get("plan_sha256") != CANONICAL_PLAN_SHA256:
-            raise CaptureIntegrityError("capture manifest is not bound to the packaged canonical plan")
+            raise CaptureIntegrityError(
+                "capture manifest is not bound to the packaged canonical plan"
+            )
         _write_exclusive(destination, payload)
 
-    def _build_argv(self, request: CaptureRequest, paths: AttemptPaths) -> tuple[str, ...]:
+    def _build_argv(
+        self, request: CaptureRequest, paths: AttemptPaths
+    ) -> tuple[str, ...]:
         argv = [
             *self._launcher,
             "--plan",
@@ -1594,8 +1909,18 @@ class CaptureProcessAdapter:
                     "--confirm-full-capture",
                 )
             )
+        if request.expected_usb_bus is not None:
+            assert request.expected_usb_address is not None
+            argv.extend(("--expected-usb-bus", str(request.expected_usb_bus)))
+            argv.extend(("--expected-usb-address", str(request.expected_usb_address)))
+        if self._expected_bundle_sha256 is not None:
+            argv.extend(
+                ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
+            )
         if "--expected-frame-count" in argv:
-            raise AssertionError("exposure-count hints must never cross the capture boundary")
+            raise AssertionError(
+                "exposure-count hints must never cross the capture boundary"
+            )
         return tuple(argv)
 
     def _batch_job_bytes(
@@ -1623,23 +1948,32 @@ class CaptureProcessAdapter:
             "apply_all_boundary_offsets_before_first_frame": True,
             "capture_plan_sha256": CANONICAL_PLAN_SHA256,
             "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "expected_usb_address": request.expected_usb_address,
+            "expected_usb_bus": request.expected_usb_bus,
             "frames": frames,
             "parent_ack_required_after_every_frame": True,
             "release_once_after_last_frame": True,
             "reviewed_roll_fingerprint": request.reviewed_fingerprint.to_payload(),
-            "schema_version": 2,
+            "schema_version": 3,
             "session_id": session_id,
             "session_contract": "one-process-one-reservation",
         }
-        return (
-            json.dumps(job, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("utf-8")
+        return (json.dumps(job, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
 
-    def _build_batch_argv(self, paths: BatchSessionPaths) -> tuple[str, ...]:
-        return (
+    def _build_batch_argv(
+        self,
+        paths: BatchSessionPaths,
+        *,
+        expected_job_sha256: str,
+    ) -> tuple[str, ...]:
+        argv = [
             *self._launcher,
             "--batch-job",
             str(paths.job),
+            "--expected-batch-job-sha256",
+            expected_job_sha256,
             "--plan",
             str(paths.first_plan),
             "--continuation-plan",
@@ -1649,7 +1983,12 @@ class CaptureProcessAdapter:
             "--session-journal",
             str(paths.session_journal),
             "--live",
-        )
+        ]
+        if self._expected_bundle_sha256 is not None:
+            argv.extend(
+                ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
+            )
+        return tuple(argv)
 
     def _batch_frame_paths(
         self,
@@ -1685,7 +2024,10 @@ class CaptureProcessAdapter:
                     payload = json.loads(paths.journal.read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     payload = None
-                if isinstance(payload, dict) and payload.get("status") == "frame-complete":
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("status") == "frame-complete"
+                ):
                     try:
                         return self._validate_batch_frame_result(
                             prepared,
@@ -1791,6 +2133,8 @@ class CaptureProcessAdapter:
             "reviewed_roll_fingerprint_sha256": (
                 prepared.request.reviewed_fingerprint.binding_sha256
             ),
+            "expected_usb_bus": prepared.request.expected_usb_bus,
+            "expected_usb_address": prepared.request.expected_usb_address,
         }
         if self._expected_bundle_sha256 is not None:
             invariants["capture_bundle_sha256"] = self._expected_bundle_sha256
@@ -1800,8 +2144,20 @@ class CaptureProcessAdapter:
                     f"batch frame {frame_index} journal {key}="
                     f"{payload.get(key)!r}, expected {expected!r}"
                 )
+        try:
+            _validated_density_calibration(
+                payload,
+                expected_session_id=prepared.session_id,
+            )
+        except ValueError as error:
+            raise CaptureProcessError(
+                f"batch frame {frame_index} density calibration is invalid: {error}"
+            ) from error
         selection = payload.get("live_frame_selection")
-        if not isinstance(selection, dict) or selection.get("frame") != request.selected_slot:
+        if (
+            not isinstance(selection, dict)
+            or selection.get("frame") != request.selected_slot
+        ):
             raise CaptureProcessError(
                 f"batch frame {frame_index} live frame selection is malformed"
             )
@@ -1855,19 +2211,16 @@ class CaptureProcessAdapter:
             or comparison["frame_start_median_delta_rows"]
             > MAX_FRAME_START_MEDIAN_DELTA_ROWS
             or type(comparison.get("frame_start_max_delta_rows")) is not int
-            or comparison["frame_start_max_delta_rows"]
-            > MAX_FRAME_START_DELTA_ROWS
+            or comparison["frame_start_max_delta_rows"] > MAX_FRAME_START_DELTA_ROWS
             or not isinstance(
                 comparison.get("native_origin_median_delta"),
                 (int, float),
             )
-            or comparison["native_origin_median_delta"]
-            > MAX_NATIVE_ORIGIN_MEDIAN_DELTA
+            or comparison["native_origin_median_delta"] > MAX_NATIVE_ORIGIN_MEDIAN_DELTA
             or type(comparison.get("native_origin_max_delta")) is not int
             or comparison["native_origin_max_delta"] > MAX_NATIVE_ORIGIN_DELTA
             or type(comparison.get("preview_height_delta_rows")) is not int
-            or comparison["preview_height_delta_rows"]
-            > MAX_PREVIEW_HEIGHT_DELTA_ROWS
+            or comparison["preview_height_delta_rows"] > MAX_PREVIEW_HEIGHT_DELTA_ROWS
         ):
             raise CaptureProcessError(
                 f"batch frame {frame_index} roll fingerprint comparison did not match"
@@ -1897,8 +2250,7 @@ class CaptureProcessAdapter:
             )
             or selected_comparison["fresh_visual_log_span"]
             < selected_comparison["minimum_visual_log_span"]
-            or selected_comparison["minimum_visual_log_span"]
-            != MIN_VISUAL_LOG_SPAN
+            or selected_comparison["minimum_visual_log_span"] != MIN_VISUAL_LOG_SPAN
             or selected_comparison["reviewed_visual_log_span"]
             < selected_comparison["minimum_visual_log_span"]
         ):
@@ -1913,7 +2265,11 @@ class CaptureProcessAdapter:
         if (
             not isinstance(nonce, str)
             or not 1 <= len(nonce) <= 128
-            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in nonce)
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                for character in nonce
+            )
         ):
             raise CaptureProcessError(
                 f"batch frame {frame_index} has no valid parent ACK nonce"
@@ -1926,6 +2282,26 @@ class CaptureProcessAdapter:
             raise CaptureProcessError(
                 f"batch frame {frame_index} output is missing or incomplete"
             )
+        try:
+            density_evidence = (
+                _validated_density_evidence(payload, output_path=paths.output)
+                if frame_index == 1
+                else None
+            )
+            _validated_density_frame_ownership(
+                payload,
+                output_path=paths.output,
+                expected_session_id=prepared.session_id,
+                expected_frame_index=frame_index,
+                expected_frame_total=len(selected_slots),
+                expected_selected_slots=selected_slots,
+                expected_selected_slot=request.selected_slot,
+                evidence=density_evidence,
+            )
+        except ValueError as error:
+            raise CaptureProcessError(
+                f"batch frame {frame_index} density ownership is invalid: {error}"
+            ) from error
         return CaptureAttemptResult(
             outcome=CaptureOutcome.COMPLETE,
             request=request,
@@ -2052,6 +2428,7 @@ class CaptureProcessAdapter:
             expected_completed.append(stopped_unhandled_slot)
         invariants: dict[str, object] = {
             "session_id": prepared.session_id,
+            "density_calibration_session_id": prepared.session_id,
             "selected_slots": list(prepared.request.selected_slots),
             "batch_job_sha256": prepared.job_sha256,
             "capture_engine_sha256": self._expected_worker_sha256,
@@ -2071,6 +2448,8 @@ class CaptureProcessAdapter:
             "reviewed_roll_fingerprint_sha256": (
                 prepared.request.reviewed_fingerprint.binding_sha256
             ),
+            "expected_usb_bus": prepared.request.expected_usb_bus,
+            "expected_usb_address": prepared.request.expected_usb_address,
         }
         for key, expected in invariants.items():
             if payload.get(key) != expected:
@@ -2098,6 +2477,29 @@ class CaptureProcessAdapter:
         unit_released = payload.get("unit_released")
         reservation_acquired = payload.get("reservation_acquired")
         recovery = payload.get("recovery_required")
+        actual_usb_bus = payload.get("actual_usb_bus")
+        actual_usb_address = payload.get("actual_usb_address")
+        if "actual_usb_bus" not in payload or "actual_usb_address" not in payload:
+            raise CaptureProcessError(
+                "batch session journal has no actual USB topology receipt"
+            )
+        if (actual_usb_bus is None) != (actual_usb_address is None):
+            raise CaptureProcessError(
+                "batch session journal actual USB topology is incomplete"
+            )
+        if actual_usb_bus is not None and (
+            isinstance(actual_usb_bus, bool)
+            or not isinstance(actual_usb_bus, int)
+            or isinstance(actual_usb_address, bool)
+            or not isinstance(actual_usb_address, int)
+            or actual_usb_bus != prepared.request.expected_usb_bus
+            or actual_usb_address != prepared.request.expected_usb_address
+        ):
+            raise CaptureProcessError(
+                "batch session journal actual_usb_bus="
+                f"{actual_usb_bus!r}, actual_usb_address={actual_usb_address!r} "
+                "does not match the expected USB topology"
+            )
         if recovery not in ("none", POWER_CYCLE_RECOVERY):
             raise CaptureProcessError(
                 f"batch session journal has unknown recovery state {recovery!r}"
@@ -2106,11 +2508,24 @@ class CaptureProcessAdapter:
             raise CaptureProcessError(
                 "batch session journal has no reservation-acquired receipt"
             )
+        if reservation_acquired and actual_usb_bus is None:
+            raise CaptureProcessError(
+                "reserved batch session has no exact actual USB topology"
+            )
         if returncode == 0:
+            try:
+                _validated_density_calibration(
+                    payload,
+                    expected_session_id=prepared.session_id,
+                )
+            except ValueError as error:
+                raise CaptureProcessError(
+                    f"batch session density calibration is invalid: {error}"
+                ) from error
             if status != expected_status or completed != expected_completed:
                 raise CaptureProcessError(
                     "completed batch session has the wrong status or frame prefix"
-            )
+                )
             if (
                 reservation_acquired is not True
                 or release_attempts != 1
@@ -2125,26 +2540,17 @@ class CaptureProcessAdapter:
                 raise CaptureProcessError(
                     f"failed batch session has unexpected status {status!r}"
                 )
-            if (
-                isinstance(release_attempts, bool)
-                or release_attempts not in (0, 1)
-            ):
+            if isinstance(release_attempts, bool) or release_attempts not in (0, 1):
                 raise CaptureProcessError(
                     "failed batch session has an invalid release-attempt count"
                 )
             if reservation_acquired is False:
-                if (
-                    completed
-                    or release_attempts != 0
-                    or unit_released is not False
-                ):
+                if completed or release_attempts != 0 or unit_released is not False:
                     raise CaptureProcessError(
                         "failed pre-reservation batch receipt is inconsistent"
                     )
                 return payload
-            if unit_released is True and (
-                release_attempts != 1 or recovery != "none"
-            ):
+            if unit_released is True and (release_attempts != 1 or recovery != "none"):
                 raise CaptureProcessError(
                     "failed batch release receipt is internally inconsistent"
                 )
@@ -2230,6 +2636,8 @@ class CaptureProcessAdapter:
             "capture_mode": mode,
             "requested_frame": request.selected_slot,
             "expected_frame_count": None,
+            "expected_usb_bus": request.expected_usb_bus,
+            "expected_usb_address": request.expected_usb_address,
             "expected_reads": expected_reads,
             "expected_bytes": expected_bytes,
             "requested_boundary_offset_rows": request.boundary_offset_rows,
@@ -2238,33 +2646,85 @@ class CaptureProcessAdapter:
             invariants["capture_bundle_sha256"] = self._expected_bundle_sha256
         for key, expected in invariants.items():
             if payload.get(key) != expected:
-                raise ValueError(f"worker journal {key}={payload.get(key)!r}, expected {expected!r}")
+                raise ValueError(
+                    f"worker journal {key}={payload.get(key)!r}, expected {expected!r}"
+                )
 
         status = payload.get("status")
         recovery = payload.get("recovery_required")
+        actual_usb_bus = payload.get("actual_usb_bus")
+        actual_usb_address = payload.get("actual_usb_address")
+        if (actual_usb_bus is None) != (actual_usb_address is None):
+            raise ValueError(
+                "worker journal actual USB bus/address evidence is incomplete"
+            )
+        if actual_usb_bus is not None:
+            if (
+                isinstance(actual_usb_bus, bool)
+                or not isinstance(actual_usb_bus, int)
+                or not 0 <= actual_usb_bus <= 999
+                or isinstance(actual_usb_address, bool)
+                or not isinstance(actual_usb_address, int)
+                or not 1 <= actual_usb_address <= 127
+            ):
+                raise ValueError("worker journal actual USB topology is malformed")
+            if request.expected_usb_bus is not None and (
+                actual_usb_bus != request.expected_usb_bus
+                or actual_usb_address != request.expected_usb_address
+            ):
+                raise ValueError(
+                    "worker journal actual USB topology does not match the "
+                    "requested device"
+                )
+        if request.expected_usb_bus is not None and actual_usb_bus is None:
+            raise ValueError(
+                "topology-bound preview has no actual USB topology receipt"
+            )
         if returncode == 0:
+            _validated_density_calibration(payload)
             if status != "complete":
                 raise ValueError(f"worker exited zero with journal status {status!r}")
             if recovery not in (None, "none"):
                 raise ValueError(f"completed worker requested recovery: {recovery!r}")
-            if payload.get("completed_reads") != expected_reads or payload.get("completed_bytes") != expected_bytes:
-                raise ValueError("completed worker journal has incomplete read or byte counts")
+            if (
+                payload.get("completed_reads") != expected_reads
+                or payload.get("completed_bytes") != expected_bytes
+            ):
+                raise ValueError(
+                    "completed worker journal has incomplete read or byte counts"
+                )
             if payload.get("disk_bytes") != expected_bytes:
-                raise ValueError("completed worker journal has the wrong on-disk byte count")
+                raise ValueError(
+                    "completed worker journal has the wrong on-disk byte count"
+                )
             if payload.get("unit_released") is not True:
                 raise ValueError("completed worker did not record unit release")
             if not _is_sha256(payload.get("output_sha256")):
-                raise ValueError("completed worker output SHA-256 is missing or malformed")
-            if not paths.output.is_file() or paths.output.stat().st_size != expected_bytes:
-                raise ValueError("completed worker output file is missing or has the wrong size")
+                raise ValueError(
+                    "completed worker output SHA-256 is missing or malformed"
+                )
+            if (
+                not paths.output.is_file()
+                or paths.output.stat().st_size != expected_bytes
+            ):
+                raise ValueError(
+                    "completed worker output file is missing or has the wrong size"
+                )
             if request.mode is not CaptureMode.PREVIEW:
-                if payload.get("applied_boundary_offset_rows") != request.boundary_offset_rows:
+                if (
+                    payload.get("applied_boundary_offset_rows")
+                    != request.boundary_offset_rows
+                ):
                     raise ValueError(
                         "worker journal applied_boundary_offset_rows does not "
                         "match the requested boundary offset"
                     )
                 resolved_row = payload.get("resolved_lookup_row")
-                if isinstance(resolved_row, bool) or not isinstance(resolved_row, int) or resolved_row < 0:
+                if (
+                    isinstance(resolved_row, bool)
+                    or not isinstance(resolved_row, int)
+                    or resolved_row < 0
+                ):
                     raise ValueError("worker journal has no valid resolved_lookup_row")
                 resolved_origin = payload.get("resolved_native_origin")
                 if (
@@ -2272,12 +2732,18 @@ class CaptureProcessAdapter:
                     or not isinstance(resolved_origin, int)
                     or resolved_origin < 0
                 ):
-                    raise ValueError("worker journal has no valid resolved_native_origin")
+                    raise ValueError(
+                        "worker journal has no valid resolved_native_origin"
+                    )
         else:
             if status not in ("failed", "interrupted"):
-                raise ValueError(f"failed worker has unexpected journal status {status!r}")
+                raise ValueError(
+                    f"failed worker has unexpected journal status {status!r}"
+                )
             if recovery not in ("none", POWER_CYCLE_RECOVERY):
-                raise ValueError(f"failed worker has unknown recovery state {recovery!r}")
+                raise ValueError(
+                    f"failed worker has unknown recovery state {recovery!r}"
+                )
         return payload
 
 

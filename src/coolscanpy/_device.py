@@ -20,9 +20,9 @@ which actually need the SANE-backed transport pay for it (see the
 ``[scanner]`` extra in ``pyproject.toml``).
 
 Enumeration itself never requires python-sane to be installed: ``get_devices()``
-tries the SANE route first, and only when python-sane is not importable falls
-back to direct USB enumeration (``pyusb``, already a runtime dependency,
-matching the LS-5000's fixed vendor/product id) -- see
+tries the SANE route first, and falls back to direct USB enumeration whenever
+SANE is unavailable, fails to enumerate, or finds no Coolscan unit (``pyusb``,
+already a runtime dependency, matching the LS-5000's fixed vendor/product id) -- see
 ``_usb_fallback_device_infos``. That fallback device carries reduced,
 conservative capabilities, since there is no SANE session to negotiate the
 rest against. SANE-only operations (``Device.scan()``, ``Device.eject()``)
@@ -39,7 +39,14 @@ from typing import TYPE_CHECKING, Callable
 from coolscanpy.exceptions import DeviceBusy, DeviceNotFound, EjectFailed
 from coolscanpy.session.backend import ScannerCapabilities, ScannerDevice
 from coolscanpy.session.params import ScanParams
-from coolscanpy.types import Capabilities, DeviceInfo, Material, Option, OptionType, OptionUnit
+from coolscanpy.types import (
+    Capabilities,
+    DeviceInfo,
+    Material,
+    Option,
+    OptionType,
+    OptionUnit,
+)
 
 if TYPE_CHECKING:
     from coolscanpy._roll import Roll
@@ -47,7 +54,13 @@ if TYPE_CHECKING:
 
 _COOLSCAN3_PREFIX = "coolscan3:"
 
-_OPTION_NAMES: tuple[str, ...] = ("resolution", "depth", "samples", "autofocus", "auto_exposure")
+_OPTION_NAMES: tuple[str, ...] = (
+    "resolution",
+    "depth",
+    "samples",
+    "autofocus",
+    "auto_exposure",
+)
 
 # The Nikon Coolscan LS-5000's fixed USB identity. The roll engine's capture
 # subprocess (protocol.ls5000_single_pass.worker) locates the physical unit
@@ -168,11 +181,16 @@ def _usb_fallback_device_infos() -> list[DeviceInfo]:
 
     import usb.core
 
+    from coolscanpy.protocol.ls5000_single_pass.usb_backend import (
+        get_libusb_backend,
+    )
+
     capabilities = _usb_fallback_capabilities()
     found = usb.core.find(
         find_all=True,
         idVendor=_LS5000_USB_VENDOR_ID,
         idProduct=_LS5000_USB_PRODUCT_ID,
+        backend=get_libusb_backend(),
     )
     return [
         DeviceInfo(
@@ -193,18 +211,36 @@ def get_devices(local_only: bool = False) -> list[DeviceInfo]:
     accepted for signature-compatibility with ``sane.get_devices()`` and is
     currently always true (no network transport exists for this package).
 
-    Tries the SANE route first. When python-sane is not importable, falls
-    back to direct USB enumeration instead of raising -- see
+    Tries the SANE route first. When SANE is unavailable, its enumeration
+    fails, or it finds no Coolscan, falls back to direct USB enumeration -- see
     :func:`_usb_fallback_device_infos`.
     """
 
     del local_only
+    sane_error: Exception | None = None
     try:
         service = _service_factory()
         devices = service.list_devices()
-    except ImportError:
+    except Exception as error:
+        sane_error = error
+        devices = []
+    infos = [
+        _device_info_from(device)
+        for device in devices
+        if _is_coolscan_device_id(device.id)
+    ]
+    if infos:
+        return infos
+    try:
         return _usb_fallback_device_infos()
-    return [_device_info_from(device) for device in devices if _is_coolscan_device_id(device.id)]
+    except Exception as usb_error:
+        if sane_error is None:
+            raise
+        raise RuntimeError(
+            "neither SANE nor direct USB could enumerate a Coolscan LS-5000 "
+            f"(SANE: {type(sane_error).__name__}: {sane_error}; "
+            f"USB: {type(usb_error).__name__}: {usb_error})"
+        ) from usb_error
 
 
 def open(devname: str) -> "Device":
@@ -228,7 +264,9 @@ def open(devname: str) -> "Device":
     else:
         matches = [candidate for candidate in infos if candidate.id == devname]
         if not matches:
-            raise DeviceNotFound(f"no attached Coolscan LS-5000 unit matches {devname!r}")
+            raise DeviceNotFound(
+                f"no attached Coolscan LS-5000 unit matches {devname!r}"
+            )
         info = matches[0]
 
     _register_open_device(info.id)
@@ -252,13 +290,17 @@ class Device:
         self._service = service
         self._lock = threading.Lock()
         self._roll_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._cancel_event: threading.Event | None = None
         self._closed = False
+        self._faulted_reason: str | None = None
 
         caps = info.capabilities
         self.resolution = max(caps.supported_dpi) if caps.supported_dpi else 4000
-        self.depth = 16 if 16 in caps.supported_depths else (
-            max(caps.supported_depths) if caps.supported_depths else 16
+        self.depth = (
+            16
+            if 16 in caps.supported_depths
+            else (max(caps.supported_depths) if caps.supported_depths else 16)
         )
         self.samples = 1
         self.autofocus = True
@@ -272,14 +314,30 @@ class Device:
     def _validate_option(self, name: str, value: object) -> None:
         caps = self._info.capabilities
         if name == "resolution":
-            if isinstance(value, bool) or not isinstance(value, int) or value not in caps.supported_dpi:
-                raise ValueError(f"resolution {value!r} is not in supported_dpi {caps.supported_dpi}")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value not in caps.supported_dpi
+            ):
+                raise ValueError(
+                    f"resolution {value!r} is not in supported_dpi {caps.supported_dpi}"
+                )
         elif name == "depth":
-            if isinstance(value, bool) or not isinstance(value, int) or value not in caps.supported_depths:
-                raise ValueError(f"depth {value!r} is not in supported_depths {caps.supported_depths}")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value not in caps.supported_depths
+            ):
+                raise ValueError(
+                    f"depth {value!r} is not in supported_depths {caps.supported_depths}"
+                )
         elif name == "samples":
             allowed = (1, 4) if caps.multi_sample else (1,)
-            if isinstance(value, bool) or not isinstance(value, int) or value not in allowed:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value not in allowed
+            ):
                 raise ValueError(f"samples {value!r} is not in {allowed}")
         elif name == "autofocus":
             if not isinstance(value, bool):
@@ -370,12 +428,11 @@ class Device:
         roll bookkeeping, never produces a Receipt, never returns IR.
         """
 
-        self._require_open()
-        if not self._lock.acquire(blocking=False):
-            raise DeviceBusy(f"device {self._info.id} is already scanning")
+        self._acquire_io_lock("scan")
         try:
             cancel_event = threading.Event()
-            self._cancel_event = cancel_event
+            with self._state_lock:
+                self._cancel_event = cancel_event
             params = ScanParams(
                 dpi=self.resolution,
                 depth=self.depth,
@@ -391,61 +448,130 @@ class Device:
                 cancel_event,
             )
             return result.rgb
+        except BaseException as error:
+            self._mark_fault_if_cleanup_error(error)
+            raise
         finally:
-            self._cancel_event = None
-            self._lock.release()
+            with self._state_lock:
+                self._cancel_event = None
+            self._release_io_lock()
+
+    def _acquire_io_lock(self, operation: str) -> None:
+        """Claim this device's one in-process hardware-I/O lane."""
+
+        with self._state_lock:
+            self._require_usable_locked()
+            if not self._lock.acquire(blocking=False):
+                raise DeviceBusy(
+                    f"device {self._info.id} is busy; cannot start {operation}"
+                )
+
+    def _release_io_lock(self) -> None:
+        self._lock.release()
 
     def cancel(self) -> None:
         """Mirrors ``sane.SaneDev.cancel()``. Call from a different thread
         than the one blocked in :meth:`scan`."""
 
-        event = self._cancel_event
+        with self._state_lock:
+            event = self._cancel_event
         if event is not None:
             event.set()
 
     def roll(self, *, material: Material = Material.COLOR_NEGATIVE) -> "Roll":
         """Open the 40-slot roll-feeder extension."""
 
-        self._require_open()
-        caps = self._info.capabilities
-        if caps.adapter_frame_capacity is None and not caps.adapter_frame_control:
-            raise ValueError("no roll adapter is attached/detected on this device")
-        if not self._roll_lock.acquire(blocking=False):
-            raise DeviceBusy(f"a Roll is already open on device {self._info.id}")
-        try:
-            from coolscanpy._roll import Roll
+        with self._state_lock:
+            self._require_usable_locked()
+            caps = self._info.capabilities
+            if caps.adapter_frame_capacity is None and not caps.adapter_frame_control:
+                raise ValueError("no roll adapter is attached/detected on this device")
+            if not self._roll_lock.acquire(blocking=False):
+                raise DeviceBusy(f"a Roll is already open on device {self._info.id}")
+            try:
+                from coolscanpy._roll import Roll
 
-            return Roll(self, material)
-        except BaseException:
-            self._roll_lock.release()
-            raise
+                return Roll(self, material)
+            except BaseException:
+                self._roll_lock.release()
+                raise
 
     def _release_roll_lock(self) -> None:
-        try:
-            self._roll_lock.release()
-        except RuntimeError:
-            pass
+        with self._state_lock:
+            if self._roll_lock.locked():
+                self._roll_lock.release()
 
     def eject(self) -> bool:
         """Capability-gated vendor eject/unload."""
 
-        self._require_open()
+        self._acquire_io_lock("eject")
         try:
-            return bool(self._service.eject(self._info.id))
-        except RuntimeError as error:
-            raise EjectFailed(str(error)) from error
+            try:
+                return bool(self._service.eject(self._info.id))
+            except RuntimeError as error:
+                self._mark_fault_if_cleanup_error(error)
+                raise EjectFailed(str(error)) from error
+        finally:
+            self._release_io_lock()
 
     def close(self) -> None:
         """Idempotent. Releases any transport claim this Device holds."""
 
-        if self._closed:
-            return
-        self._closed = True
-        _unregister_open_device(self._info.id)
+        with self._state_lock:
+            if self._closed:
+                return
+            if self._roll_lock.locked():
+                raise DeviceBusy("close the Roll before closing its Device")
+            if not self._lock.acquire(blocking=False):
+                raise DeviceBusy(
+                    f"device {self._info.id} is busy; cannot start device close"
+                )
+            self._closed = True
+            _unregister_open_device(self._info.id)
+        try:
+            pass
+        finally:
+            self._release_io_lock()
 
     def _require_open(self) -> None:
+        with self._state_lock:
+            self._require_usable_locked()
+
+    def _require_usable_locked(self) -> None:
         if self._closed:
             raise RuntimeError("this Device has been closed")
+        if self._faulted_reason is not None:
+            raise DeviceBusy(
+                f"device {self._info.id} is faulted after a SANE cleanup failure; "
+                "close and reopen it before more scanner I/O "
+                f"({self._faulted_reason})"
+            )
+
+    def _mark_faulted(self, reason: str) -> None:
+        with self._state_lock:
+            if not self._closed:
+                self._faulted_reason = reason
+
+    def _mark_fault_if_cleanup_error(self, error: BaseException) -> None:
+        """Make an uncertain SANE owner terminal without eager SANE imports."""
+
+        try:
+            from coolscanpy.transport.sane import SaneCleanupError
+        except ImportError:
+            return
+        pending: list[BaseException] = [error]
+        seen: set[int] = set()
+        while pending:
+            candidate = pending.pop()
+            if id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if isinstance(candidate, SaneCleanupError):
+                self._mark_faulted(str(candidate))
+                return
+            for linked in (candidate.__cause__, candidate.__context__):
+                if isinstance(linked, BaseException):
+                    pending.append(linked)
 
     def __enter__(self) -> "Device":
         return self

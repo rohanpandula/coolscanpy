@@ -17,8 +17,23 @@ from coolscanpy.protocol.ls5000_single_pass import roll_index as roll
 _WIRE_DIR_ENV = "COOLSCANPY_SINGLE_PASS_WIRE_DIR"
 _wire_dir = os.environ.get(_WIRE_DIR_ENV)
 CAMPAIGN_WIRE = Path(_wire_dir) if _wire_dir else None
-GOLD36_PREVIEW = CAMPAIGN_WIRE / "rgbi4-gold36-frame18-meter2-preview.bin" if CAMPAIGN_WIRE else None
-GOLD36_TABLE = CAMPAIGN_WIRE / "rgbi4-gold36-frame18-meter2-008e.bin" if CAMPAIGN_WIRE else None
+GOLD36_PREVIEW = (
+    CAMPAIGN_WIRE / "rgbi4-gold36-frame18-meter2-preview.bin" if CAMPAIGN_WIRE else None
+)
+GOLD36_TABLE = (
+    CAMPAIGN_WIRE / "rgbi4-gold36-frame18-meter2-008e.bin" if CAMPAIGN_WIRE else None
+)
+
+# Optional never-committed live-attempt regression.  Point this at a banked
+# preview attempt containing the worker's capture-preview.bin and
+# capture-008e.bin artifacts.
+_LIVE_PREVIEW_DIR_ENV = "COOLSCANPY_LIVE_PREVIEW_ATTEMPT_DIR"
+_live_preview_dir = os.environ.get(_LIVE_PREVIEW_DIR_ENV)
+LIVE_PREVIEW_ATTEMPT = Path(_live_preview_dir) if _live_preview_dir else None
+LIVE_PREVIEW = (
+    LIVE_PREVIEW_ATTEMPT / "capture-preview.bin" if LIVE_PREVIEW_ATTEMPT else None
+)
+LIVE_TABLE = LIVE_PREVIEW_ATTEMPT / "capture-008e.bin" if LIVE_PREVIEW_ATTEMPT else None
 
 
 def _encode_index(rgb16: np.ndarray) -> bytes:
@@ -109,9 +124,9 @@ def test_complete_index_bytes_decode_every_rgb_row_and_validate_sync() -> None:
 def test_complete_index_accepts_the_stable_observed_odd_housekeeping_variant() -> None:
     rgb = np.arange(20 * 96 * 3, dtype=np.uint16).reshape(20, 96, 3)
     rows = np.frombuffer(_encode_index(rgb), dtype=">u2").copy().reshape(20, -1)
-    variant = (
-        np.arange(roll.INDEX_TRAILER_WORDS, dtype=np.uint16) * 6 + 8
-    ).astype(np.uint16)
+    variant = (np.arange(roll.INDEX_TRAILER_WORDS, dtype=np.uint16) * 6 + 8).astype(
+        np.uint16
+    )
     rows[1::2, roll.INDEX_RGB_WORDS_PER_ROW :] = variant
     stream = rows.astype(">u2", copy=False).tobytes()
     geometry = roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, len(stream))
@@ -126,12 +141,30 @@ def test_complete_index_accepts_the_stable_observed_odd_housekeeping_variant() -
 @pytest.mark.parametrize(
     ("geometry", "message"),
     [
-        (roll.IndexGeometry(97, 4000, 41, 3946, 20, 95, 20, 2048, 20 * 1024), "width must be 96"),
-        (roll.IndexGeometry(97, 4000, 41, 3946, 20, 96.0, 20, 2048, 20 * 1024), "width must be 96"),
-        (roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 1024, 20 * 1024), "block size must be 2048"),
-        (roll.IndexGeometry(97, 4000, 41, 3946, 19, 96, 19, 2048, 19 * 1024), "positive even row count"),
-        (roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, 18 * 1024), "allocation mismatch"),
-        (roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, float(20 * 1024)), "integer byte count"),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 20, 95, 20, 2048, 20 * 1024),
+            "width must be 96",
+        ),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 20, 96.0, 20, 2048, 20 * 1024),
+            "width must be 96",
+        ),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 1024, 20 * 1024),
+            "block size must be 2048",
+        ),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 19, 96, 19, 2048, 19 * 1024),
+            "positive even row count",
+        ),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, 18 * 1024),
+            "allocation mismatch",
+        ),
+        (
+            roll.IndexGeometry(97, 4000, 41, 3946, 20, 96, 20, 2048, float(20 * 1024)),
+            "integer byte count",
+        ),
     ],
 )
 def test_exported_index_decoder_refuses_malformed_geometry(
@@ -175,19 +208,62 @@ def test_variable_leader_and_trailer_are_visible_without_guessing_roll_count(
     )
 
 
+def test_complete_row_zero_leading_cell_is_not_silently_renumbered() -> None:
+    rgb, _boundaries = _synthetic_roll(6, leader=0, tail=3)
+
+    detection = _detect(rgb)
+
+    complete = [
+        interval
+        for interval in detection.intervals
+        if interval.coverage_fraction == 1.0 and interval.count_supported
+    ]
+    assert [interval.frame for interval in complete] == [1, 2, 3, 4, 5, 6]
+    assert complete[0].start_row <= 1
+    assert complete[-1].end_row == pytest.approx(858, abs=1)
+    # Preserve the existing advisory tail: it remains visible and fail-closed
+    # instead of being mistaken for a seventh complete exposure.
+    assert detection.intervals[-1].coverage_fraction < 0.50
+    assert detection.intervals[-1].manual_review
+
+
+def test_clipped_leading_cell_remains_excluded_fail_closed() -> None:
+    complete_rgb, _boundaries = _synthetic_roll(6, leader=0, tail=24)
+    clipped_rgb = complete_rgb[1:]
+
+    detection = _detect(clipped_rgb)
+
+    # Cropping even one row moves the fitted leading boundary outside the
+    # captured raster.  The near-complete leading cell must not be promoted
+    # ahead of the first wholly scanner-addressable lattice start.
+    assert detection.frame_starts[0] > 100
+    complete = [
+        interval
+        for interval in detection.intervals
+        if interval.coverage_fraction == 1.0 and interval.count_supported
+    ]
+    assert len(complete) == 5
+
+
 def test_channel_gain_changes_do_not_move_detected_boundaries() -> None:
     rgb, _boundaries = _synthetic_roll(24, leader=41, tail=67)
     baseline = _detect(rgb)
-    gained = np.clip(rgb.astype(np.float64) * np.asarray((0.70, 1.15, 1.30)), 0, 65_535).astype(np.uint16)
+    gained = np.clip(
+        rgb.astype(np.float64) * np.asarray((0.70, 1.15, 1.30)), 0, 65_535
+    ).astype(np.uint16)
     adjusted = _detect(gained)
-    assert [item.output_row for item in adjusted.boundaries] == [item.output_row for item in baseline.boundaries]
+    assert [item.output_row for item in adjusted.boundaries] == [
+        item.output_row for item in baseline.boundaries
+    ]
 
 
 def test_one_true_interior_blank_cell_is_flagged_without_renumbering() -> None:
     rgb, boundaries = _synthetic_roll(24, leader=17, tail=21)
     baseline = _detect(rgb)
     blank_frame = 12
-    rgb[boundaries[blank_frame - 1] : boundaries[blank_frame], 2:92] = np.asarray((34_200, 25_500, 17_800), dtype=np.uint16)
+    rgb[boundaries[blank_frame - 1] : boundaries[blank_frame], 2:92] = np.asarray(
+        (34_200, 25_500, 17_800), dtype=np.uint16
+    )
 
     detection = _detect(rgb)
 
@@ -260,7 +336,10 @@ def test_expected_count_is_informational_when_terminal_is_missing() -> None:
     assert detection.expected_frame_count_matches is False
     assert detection.boundaries[-1].manual_review
     assert 24 in detection.manual_review_frames
-    assert detection.diagnostics()["count_confirmation"] == "candidate-slots-user-selection"
+    assert (
+        detection.diagnostics()["count_confirmation"]
+        == "candidate-slots-user-selection"
+    )
     for wrong_count in (23, 25):
         warned = _detect(altered, expected_frame_count=wrong_count)
         assert warned.frame_starts == detection.frame_starts
@@ -292,7 +371,9 @@ def test_missing_internal_boundary_is_flagged_without_renumbering() -> None:
     rgb, boundaries = _synthetic_roll(24, leader=17, tail=21)
     altered = _erase_terminal_gap(rgb, boundaries)
     internal = boundaries[8]
-    altered[internal - 3 : internal + 3, 2:92] = altered[internal + 8 : internal + 14, 2:92]
+    altered[internal - 3 : internal + 3, 2:92] = altered[
+        internal + 8 : internal + 14, 2:92
+    ]
 
     detection = _detect(altered, expected_frame_count=24)
     assert len(detection.intervals) == 25
@@ -332,10 +413,14 @@ def _boundary(
 
 
 def test_same_traversal_transport_table_maps_dynamic_frame_origins() -> None:
-    records = roll.parse_live_transport_records_bytes(_live_extent(900), maximum_rows=900)
+    records = roll.parse_live_transport_records_bytes(
+        _live_extent(900), maximum_rows=900
+    )
     rows = [20, 163, 306, 449, 592]
     boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
-    boundaries[2] = _boundary(2, rows[2], support="cadence-broad", evidence_run=(286, 326))
+    boundaries[2] = _boundary(
+        2, rows[2], support="cadence-broad", evidence_run=(286, 326)
+    )
 
     mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
 
@@ -349,12 +434,71 @@ def test_same_traversal_transport_table_maps_dynamic_frame_origins() -> None:
 def test_transport_envelope_and_anchor_residuals_fail_closed() -> None:
     with pytest.raises(roll.IndexDecodeError, match="0x8e"):
         roll.parse_live_transport_records_bytes(_live_extent(50)[:-1], maximum_rows=50)
-    records = roll.parse_live_transport_records_bytes(_live_extent(1_200), maximum_rows=1_200)
+    records = roll.parse_live_transport_records_bytes(
+        _live_extent(1_200), maximum_rows=1_200
+    )
     rows = [20, 163, 306, 449, 592, 735]
     boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
     boundaries[3] = _boundary(3, rows[3], evidence_run=(rows[3] - 3, rows[3] + 24))
     with pytest.raises(roll.IndexDecodeError, match="transport anchor residual"):
         roll.derive_transport_mapping(boundaries, len(rows), records)
+
+
+@pytest.mark.skipif(
+    LIVE_PREVIEW is None
+    or LIVE_TABLE is None
+    or not LIVE_PREVIEW.is_file()
+    or not LIVE_TABLE.is_file(),
+    reason=(
+        "banked live preview attempt is unavailable; set "
+        f"{_LIVE_PREVIEW_DIR_ENV} to its artifact directory"
+    ),
+)
+def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None:
+    geometry = roll.IndexGeometry(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=250_278,
+        width=96,
+        height=6_104,
+        block_bytes=2_048,
+        expected_stream_bytes=6_250_496,
+    )
+    table, usable_rows = roll.validate_live_0x8e_bytes(
+        LIVE_TABLE.read_bytes(),
+        geometry.height,
+    )
+    rgb, known, _report = roll.decode_full_index_bytes(
+        LIVE_PREVIEW.read_bytes(),
+        geometry,
+        usable_rows=usable_rows,
+    )
+
+    detection = roll.detect_roll_frames(
+        rgb,
+        known,
+        nominal_frame_rows=5_959 // geometry.pitch,
+    )
+
+    complete = [
+        interval
+        for interval in detection.intervals
+        if interval.coverage_fraction == 1.0 and interval.count_supported
+    ]
+    assert [interval.frame for interval in complete] == [1, 2, 3, 4, 5, 6]
+    assert [(interval.start_row, interval.end_row) for interval in complete] == [
+        (0, 143),
+        (143, 286),
+        (286, 428),
+        (428, 571),
+        (571, 715),
+        (715, 857),
+    ]
+    assert detection.confidence == "high"
+    assert detection.intervals[-1].coverage_fraction < 0.50
+    assert detection.intervals[-1].manual_review
 
 
 @pytest.mark.skipif(
@@ -378,7 +522,9 @@ def test_persisted_gold36_expected_count_and_frame18_origin() -> None:
         block_bytes=2_048,
         expected_stream_bytes=6_250_496,
     )
-    table, usable_rows = roll.validate_live_0x8e_bytes(GOLD36_TABLE.read_bytes(), geometry.height)
+    table, usable_rows = roll.validate_live_0x8e_bytes(
+        GOLD36_TABLE.read_bytes(), geometry.height
+    )
     rgb, known, _report = roll.decode_full_index_bytes(
         GOLD36_PREVIEW.read_bytes(),
         geometry,

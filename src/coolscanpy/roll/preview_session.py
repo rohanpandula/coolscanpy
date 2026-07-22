@@ -28,6 +28,9 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     ReviewedRollFingerprint,
     build_reviewed_roll_fingerprint,
 )
+from coolscanpy.protocol.ls5000_single_pass.density import (
+    NikonDensityExposureBinding,
+)
 from coolscanpy.protocol.ls5000_single_pass.plan import (
     CANONICAL_PLAN_SHA256,
 )
@@ -63,7 +66,9 @@ def _immutable_array(value: np.ndarray) -> np.ndarray:
     """Copy an array onto an immutable bytes buffer."""
 
     contiguous = np.ascontiguousarray(value)
-    return np.frombuffer(contiguous.tobytes(), dtype=contiguous.dtype).reshape(contiguous.shape)
+    return np.frombuffer(contiguous.tobytes(), dtype=contiguous.dtype).reshape(
+        contiguous.shape
+    )
 
 
 class RollSessionError(RuntimeError):
@@ -133,6 +138,7 @@ class ValidatedRollPreview:
     preview_artifact: ArtifactIdentity
     table_artifact: ArtifactIdentity
     journal_artifact: ArtifactIdentity
+    usb_topology: tuple[int, int]
     geometry: IndexGeometry
     usable_rows: int
     rgb: np.ndarray = field(repr=False, compare=False)
@@ -140,6 +146,14 @@ class ValidatedRollPreview:
     decode_report: Mapping[str, object] = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        bus, address = self.usb_topology
+        if (
+            type(bus) is not int
+            or not 0 <= bus <= 999
+            or type(address) is not int
+            or not 1 <= address <= 127
+        ):
+            raise ValueError("validated roll preview USB topology is invalid")
         if self.rgb.dtype != np.uint16 or self.rgb.ndim != 3 or self.rgb.shape[2] != 3:
             raise ValueError("validated roll preview must be an HxWx3 uint16 raster")
         object.__setattr__(self, "rgb", _immutable_array(self.rgb))
@@ -170,7 +184,11 @@ class RollPreviewSlot:
         if any(type(item) is not str or not item for item in warnings):
             raise ValueError("slot warnings must be nonempty strings")
         object.__setattr__(self, "warnings", warnings)
-        if self.thumbnail.dtype != np.uint16 or self.thumbnail.ndim != 3 or self.thumbnail.shape[2] != 3:
+        if (
+            self.thumbnail.dtype != np.uint16
+            or self.thumbnail.ndim != 3
+            or self.thumbnail.shape[2] != 3
+        ):
             raise ValueError("slot thumbnail must be an HxWx3 uint16 array")
         object.__setattr__(self, "thumbnail", _immutable_array(self.thumbnail))
 
@@ -245,10 +263,10 @@ class RollPreviewSession:
         slot_id: int,
         boundary_offset_rows: int = 0,
     ) -> ManualFrameApproval:
-        """Create an immutable receipt for one visually reviewed manual origin."""
+        """Create an immutable receipt for one visually reviewed slot."""
 
         slot = self._slot(slot_id)
-        if slot.base_origin.automatic or not slot.base_origin.manual_review:
+        if not slot.manual_review:
             raise ValueError(f"slot {slot_id} does not require manual review")
         thumbnail = reload_thumbnail(
             self.preview,
@@ -381,7 +399,11 @@ def _validate_selected_slots(values: Iterable[int], slot_count: int) -> tuple[in
 
 
 def _is_sha256(value: object) -> bool:
-    return type(value) is str and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -401,7 +423,9 @@ def _read_file_stable(path: Path) -> bytes:
         payload = path.read_bytes()
         after = path.lstat()
     except OSError as error:
-        raise RollSessionIntegrityError(f"could not read artifact {path}: {error}") from error
+        raise RollSessionIntegrityError(
+            f"could not read artifact {path}: {error}"
+        ) from error
 
     def identity(item: Any) -> tuple[int, int, int, int]:
         return item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns
@@ -419,7 +443,9 @@ def _load_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
             object_pairs_hook=_reject_duplicate_keys,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise RollSessionIntegrityError(f"invalid JSON artifact {path}: {error}") from error
+        raise RollSessionIntegrityError(
+            f"invalid JSON artifact {path}: {error}"
+        ) from error
     if type(value) is not dict:
         raise RollSessionIntegrityError(f"JSON artifact is not an object: {path}")
     return cast(dict[str, Any], value), payload
@@ -434,9 +460,13 @@ def _artifact_path(root: Path, value: object, label: str) -> Path:
     try:
         resolved = raw.resolve(strict=True)
     except OSError as error:
-        raise RollSessionIntegrityError(f"{label} artifact path is unavailable: {error}") from error
+        raise RollSessionIntegrityError(
+            f"{label} artifact path is unavailable: {error}"
+        ) from error
     if resolved != raw or not resolved.is_relative_to(root):
-        raise RollSessionIntegrityError(f"{label} artifact path escapes or aliases the attempt directory")
+        raise RollSessionIntegrityError(
+            f"{label} artifact path escapes or aliases the attempt directory"
+        )
     return resolved
 
 
@@ -449,7 +479,35 @@ def _require_mapping(parent: Mapping[str, Any], key: str) -> dict[str, Any]:
 
 def _require_exact(parent: Mapping[str, Any], key: str, expected: object) -> None:
     if parent.get(key) != expected:
-        raise RollSessionIntegrityError(f"preview journal {key}={parent.get(key)!r}, expected {expected!r}")
+        raise RollSessionIntegrityError(
+            f"preview journal {key}={parent.get(key)!r}, expected {expected!r}"
+        )
+
+
+def _validated_usb_topology(journal: Mapping[str, Any]) -> tuple[int, int]:
+    expected = (
+        journal.get("expected_usb_bus"),
+        journal.get("expected_usb_address"),
+    )
+    actual = (
+        journal.get("actual_usb_bus"),
+        journal.get("actual_usb_address"),
+    )
+    for label, (bus, address) in (("expected", expected), ("actual", actual)):
+        if (
+            type(bus) is not int
+            or not 0 <= bus <= 999
+            or type(address) is not int
+            or not 1 <= address <= 127
+        ):
+            raise RollSessionIntegrityError(
+                f"preview journal {label} USB topology is invalid"
+            )
+    if actual != expected:
+        raise RollSessionIntegrityError(
+            "preview journal actual USB topology differs from the expected device"
+        )
+    return cast(tuple[int, int], actual)
 
 
 def _validate_preview_result(
@@ -462,6 +520,7 @@ def _validate_preview_result(
     bytes,
     ArtifactIdentity,
     int,
+    tuple[int, int],
 ]:
     if not isinstance(attempt, CaptureAttemptResult):
         raise TypeError("attempt must be a CaptureAttemptResult")
@@ -474,18 +533,24 @@ def _validate_preview_result(
         or attempt.journal is None
         or attempt.journal_error is not None
     ):
-        raise RollSessionIntegrityError("roll session requires one COMPLETE preview-only capture attempt")
+        raise RollSessionIntegrityError(
+            "roll session requires one COMPLETE preview-only capture attempt"
+        )
     try:
         root = attempt.paths.directory.resolve(strict=True)
     except OSError as error:
-        raise RollSessionIntegrityError(f"preview attempt directory is unavailable: {error}") from error
+        raise RollSessionIntegrityError(
+            f"preview attempt directory is unavailable: {error}"
+        ) from error
     raw_journal_path = attempt.paths.journal
     if not raw_journal_path.is_absolute() or raw_journal_path.is_symlink():
         raise RollSessionIntegrityError("preview journal path is an alias")
     journal_path = _artifact_path(root, str(raw_journal_path), "journal")
     journal, journal_bytes = _load_json_object(journal_path)
     if journal != attempt.journal:
-        raise RollSessionIntegrityError("persisted preview journal differs from the validated attempt result")
+        raise RollSessionIntegrityError(
+            "persisted preview journal differs from the validated attempt result"
+        )
     for key, expected in (
         ("status", "complete"),
         ("capture_mode", "preview-only"),
@@ -503,20 +568,31 @@ def _validate_preview_result(
     ):
         _require_exact(journal, key, expected)
     if journal.get("scanner_identity") != "Nikon LS-5000 ED 1.03":
-        raise RollSessionIntegrityError("preview journal is not from the proven LS-5000 firmware")
+        raise RollSessionIntegrityError(
+            "preview journal is not from the proven LS-5000 firmware"
+        )
     if not _is_sha256(journal.get("capture_engine_sha256")):
-        raise RollSessionIntegrityError("preview journal capture-engine hash is missing")
+        raise RollSessionIntegrityError(
+            "preview journal capture-engine hash is missing"
+        )
+    usb_topology = _validated_usb_topology(journal)
 
     output_path = _artifact_path(root, journal.get("output"), "output")
     if output_path != attempt.paths.output.resolve():
-        raise RollSessionIntegrityError("preview journal output path differs from the attempt")
+        raise RollSessionIntegrityError(
+            "preview journal output path differs from the attempt"
+        )
     output = _read_file_stable(output_path)
     if output or journal.get("output_sha256") != hashlib.sha256(output).hexdigest():
-        raise RollSessionIntegrityError("preview-only output file is not the recorded empty artifact")
+        raise RollSessionIntegrityError(
+            "preview-only output file is not the recorded empty artifact"
+        )
 
     artifacts = _require_mapping(journal, "live_index_artifacts")
     if set(artifacts) != {"mapping", "preview", "table"}:
-        raise RollSessionIntegrityError("preview journal has an unexpected live-index artifact set")
+        raise RollSessionIntegrityError(
+            "preview journal has an unexpected live-index artifact set"
+        )
     preview_path = _artifact_path(root, artifacts.get("preview"), "preview")
     table_path = _artifact_path(root, artifacts.get("table"), "table")
     mapping_path = _artifact_path(root, artifacts.get("mapping"), "mapping")
@@ -526,7 +602,9 @@ def _validate_preview_result(
     evidence = _require_mapping(journal, "live_index_evidence")
     journal_receipt = _require_mapping(journal, "preview_only_receipt")
     if receipt != journal_receipt:
-        raise RollSessionIntegrityError("persisted preview receipt differs from the journal")
+        raise RollSessionIntegrityError(
+            "persisted preview receipt differs from the journal"
+        )
     preview_sha256 = hashlib.sha256(preview).hexdigest()
     table_sha256 = hashlib.sha256(table).hexdigest()
     expected_receipt = {
@@ -540,7 +618,9 @@ def _validate_preview_result(
         "frame_detection": "deferred-offline",
     }
     if receipt != expected_receipt:
-        raise RollSessionIntegrityError("preview receipt does not bind the saved artifacts")
+        raise RollSessionIntegrityError(
+            "preview receipt does not bind the saved artifacts"
+        )
     if evidence != {
         "status": "persisted-before-frame-detection",
         "preview_bytes": len(preview),
@@ -548,7 +628,9 @@ def _validate_preview_result(
         "table_bytes": len(table),
         "table_sha256": table_sha256,
     }:
-        raise RollSessionIntegrityError("preview journal evidence does not bind the saved artifacts")
+        raise RollSessionIntegrityError(
+            "preview journal evidence does not bind the saved artifacts"
+        )
     slot_capacity = journal_receipt.get("slot_capacity_hint")
     startup = _require_mapping(journal, "live_startup_0x8f")
     if (
@@ -567,36 +649,87 @@ def _validate_preview_result(
         preview,
         ArtifactIdentity(table_path, len(table), table_sha256),
         table,
-        ArtifactIdentity(journal_path, len(journal_bytes), hashlib.sha256(journal_bytes).hexdigest()),
+        ArtifactIdentity(
+            journal_path, len(journal_bytes), hashlib.sha256(journal_bytes).hexdigest()
+        ),
         slot_capacity,
+        usb_topology,
     )
 
 
 def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeometry:
     windows = journal.get("preview_windows")
     if type(windows) is not list or len(windows) != 3:
-        raise RollSessionIntegrityError("preview journal must contain exactly three RGB windows")
+        raise RollSessionIntegrityError(
+            "preview journal must contain exactly three RGB windows"
+        )
     normalized: list[dict[str, Any]] = []
     for value in windows:
         if type(value) is not dict:
             raise RollSessionIntegrityError("preview window is not an object")
         window = cast(dict[str, Any], value)
-        if set(window) != {"color_id", "resolution", "origin", "size", "bit_depth"}:
+        if set(window) != {
+            "color_id",
+            "resolution",
+            "origin",
+            "size",
+            "bit_depth",
+            "density_f03_exposure_raw_10ns",
+        }:
             raise RollSessionIntegrityError("preview window has an unexpected schema")
+        exposure = window["density_f03_exposure_raw_10ns"]
+        if type(exposure) is not int or not 1 <= exposure <= 0xFFFFFFFF:
+            raise RollSessionIntegrityError(
+                "preview window density f03 exposure must be a nonzero uint32"
+            )
         normalized.append(window)
     if [item["color_id"] for item in normalized] != [1, 2, 3]:
         raise RollSessionIntegrityError("preview windows are not ordered RGB")
+    try:
+        density_evidence = _require_mapping(journal, "nikon_density_evidence")
+        exposure_binding = NikonDensityExposureBinding.from_dict(
+            density_evidence.get("exposure_binding")
+        )
+    except (RollSessionIntegrityError, ValueError) as error:
+        raise RollSessionIntegrityError(
+            f"preview density exposure evidence is malformed: {error}"
+        ) from error
+    if exposure_binding.session_id != journal.get("density_calibration_session_id"):
+        raise RollSessionIntegrityError(
+            "preview density exposure evidence belongs to another reservation"
+        )
+    window_exposures = tuple(
+        item["density_f03_exposure_raw_10ns"] for item in normalized
+    )
+    if window_exposures != exposure_binding.density_f03_exposures_raw_10ns:
+        raise RollSessionIntegrityError(
+            "preview window density f03 exposures disagree with their evidence"
+        )
     first = normalized[0]
+    geometry_fields = ("resolution", "origin", "size", "bit_depth")
     for item in normalized[1:]:
-        if {key: item[key] for key in item if key != "color_id"} != {key: first[key] for key in first if key != "color_id"}:
-            raise RollSessionIntegrityError("preview RGB windows have inconsistent geometry")
-    if first["resolution"] != [97, 97] or first["origin"] != [0, 0] or first["size"] != [3_946, 250_278] or first["bit_depth"] != 16:
-        raise RollSessionIntegrityError("preview window is not the proven LS-5000 roll index")
+        if tuple(item[key] for key in geometry_fields) != tuple(
+            first[key] for key in geometry_fields
+        ):
+            raise RollSessionIntegrityError(
+                "preview RGB windows have inconsistent geometry"
+            )
+    if (
+        first["resolution"] != [97, 97]
+        or first["origin"] != [0, 0]
+        or first["size"] != [3_946, 250_278]
+        or first["bit_depth"] != 16
+    ):
+        raise RollSessionIntegrityError(
+            "preview window is not the proven LS-5000 roll index"
+        )
     requested_resolution = 97
     pitch = LS5000_NATIVE_RESOLUTION // requested_resolution
     row_bytes = INDEX_ROW_WORDS * 2
     if preview_bytes % INDEX_BLOCK_BYTES or preview_bytes % row_bytes:
-        raise RollSessionIntegrityError("preview byte length is not a complete block allocation")
+        raise RollSessionIntegrityError(
+            "preview byte length is not a complete block allocation"
+        )
     height = preview_bytes // row_bytes
     native_width, native_height = cast(list[int], first["size"])
     geometry = IndexGeometry(
@@ -610,8 +743,14 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
         block_bytes=INDEX_BLOCK_BYTES,
         expected_stream_bytes=preview_bytes,
     )
-    if geometry.width != 96 or geometry.height != geometry.native_height // geometry.pitch or geometry.height % 2:
-        raise RollSessionIntegrityError("preview geometry does not match the LS-5000 RGB96 allocation")
+    if (
+        geometry.width != 96
+        or geometry.height != geometry.native_height // geometry.pitch
+        or geometry.height % 2
+    ):
+        raise RollSessionIntegrityError(
+            "preview geometry does not match the LS-5000 RGB96 allocation"
+        )
     return geometry
 
 
@@ -639,10 +778,17 @@ def _resolved_transport_record(
     resolved_row = slot.base_origin.lookup_row + boundary_offset_rows
     records = preview.transport_records
     if not 0 <= resolved_row < len(records):
-        raise RollSessionError(f"slot {slot.slot_id} boundary offset resolves outside the saved 0x8e table")
+        raise RollSessionError(
+            f"slot {slot.slot_id} boundary offset resolves outside the saved 0x8e table"
+        )
     record = records[resolved_row]
-    if record.row != resolved_row or transport_native_origin(record.code, record.selector) != record.native_origin:
-        raise RollSessionIntegrityError(f"slot {slot.slot_id} resolved transport record has an invalid identity")
+    if (
+        record.row != resolved_row
+        or transport_native_origin(record.code, record.selector) != record.native_origin
+    ):
+        raise RollSessionIntegrityError(
+            f"slot {slot.slot_id} resolved transport record has an invalid identity"
+        )
     return record
 
 
@@ -668,7 +814,9 @@ def reload_thumbnail(
     start = slot.start_boundary_row + row_delta
     end = slot.end_boundary_row + row_delta
     if start < 0 or end > len(preview.rgb):
-        raise RollSessionError(f"slot {slot.slot_id} boundary offset lies outside the saved preview")
+        raise RollSessionError(
+            f"slot {slot.slot_id} boundary offset lies outside the saved preview"
+        )
     return _thumbnail(preview.rgb, start, end)
 
 
@@ -682,7 +830,10 @@ def _slot_warnings(
     if detection.content_end_candidates:
         first_end = min(detection.content_end_candidates)
         last_end = max(detection.content_end_candidates)
-        if len(detection.content_end_candidates) > 1 and first_end <= slot_id <= last_end:
+        if (
+            len(detection.content_end_candidates) > 1
+            and first_end <= slot_id <= last_end
+        ):
             warnings.append("ambiguous-content-tail-boundary")
         if slot_id > last_end:
             warnings.append("beyond-advisory-content-end")
@@ -708,6 +859,7 @@ def build_roll_preview_session(
         table_bytes,
         journal_artifact,
         capacity,
+        usb_topology,
     ) = _validate_preview_result(attempt)
     geometry = _derive_geometry(journal, len(preview_bytes))
     validated_table, usable_rows = validate_live_0x8e_bytes(
@@ -743,6 +895,7 @@ def build_roll_preview_session(
         preview_artifact=preview_artifact,
         table_artifact=table_artifact,
         journal_artifact=journal_artifact,
+        usb_topology=usb_topology,
         geometry=geometry,
         usable_rows=usable_rows,
         rgb=rgb,
@@ -763,7 +916,9 @@ def build_roll_preview_session(
                 base_origin=origin,
                 thumbnail=_thumbnail(rgb, interval.start_row, interval.end_row),
                 warnings=warnings,
-                manual_review=bool(interval.manual_review or origin.manual_review or warnings),
+                manual_review=bool(
+                    interval.manual_review or origin.manual_review or warnings
+                ),
             )
         )
     selected = _validate_selected_slots(selected_slots, len(slots))
@@ -786,7 +941,9 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
     try:
         value = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
     except (json.JSONDecodeError, ValueError) as error:
-        raise RollSessionIntegrityError(f"invalid roll session JSON: {error}") from error
+        raise RollSessionIntegrityError(
+            f"invalid roll session JSON: {error}"
+        ) from error
     if type(value) is not dict:
         raise RollSessionIntegrityError("roll session JSON must be an object")
     state = cast(dict[str, Any], value)
@@ -804,7 +961,10 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
     if set(state) != expected_keys or state.get("version") != SESSION_VERSION:
         raise RollSessionIntegrityError("roll session JSON has an unsupported schema")
     journal_identity = state.get("journal")
-    if type(journal_identity) is not dict or set(journal_identity) != {"path", "sha256"}:
+    if type(journal_identity) is not dict or set(journal_identity) != {
+        "path",
+        "sha256",
+    }:
         raise RollSessionIntegrityError("roll session journal identity is malformed")
     identity = cast(dict[str, Any], journal_identity)
     if type(identity.get("path")) is not str or not _is_sha256(identity.get("sha256")):
@@ -815,12 +975,18 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
     try:
         resolved_journal = journal_path.resolve(strict=True)
     except OSError as error:
-        raise RollSessionIntegrityError(f"roll session journal is unavailable: {error}") from error
+        raise RollSessionIntegrityError(
+            f"roll session journal is unavailable: {error}"
+        ) from error
     if resolved_journal != journal_path:
-        raise RollSessionIntegrityError("roll session journal path aliases another path")
+        raise RollSessionIntegrityError(
+            "roll session journal path aliases another path"
+        )
     journal, journal_bytes = _load_json_object(journal_path)
     if hashlib.sha256(journal_bytes).hexdigest() != identity["sha256"]:
-        raise RollSessionIntegrityError("roll session journal changed since it was saved")
+        raise RollSessionIntegrityError(
+            "roll session journal changed since it was saved"
+        )
     root = journal_path.parent
     output_value = journal.get("output")
     if type(output_value) is not str:
@@ -849,11 +1015,15 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
     try:
         material = ScanMaterial(material_value)
     except (TypeError, ValueError) as error:
-        raise RollSessionIntegrityError("roll session material is unsupported") from error
+        raise RollSessionIntegrityError(
+            "roll session material is unsupported"
+        ) from error
     selected_value = state.get("selected_slots")
     offsets_value = state.get("boundary_offsets")
     if type(selected_value) is not list or type(offsets_value) is not list:
-        raise RollSessionIntegrityError("roll session selections or offsets are malformed")
+        raise RollSessionIntegrityError(
+            "roll session selections or offsets are malformed"
+        )
     expected_frame_count = state.get("expected_frame_count")
     try:
         session = build_roll_preview_session(
@@ -863,22 +1033,30 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
             expected_frame_count=cast(int | None, expected_frame_count),
         )
     except (TypeError, ValueError) as error:
-        raise RollSessionIntegrityError(f"roll session state is invalid: {error}") from error
+        raise RollSessionIntegrityError(
+            f"roll session state is invalid: {error}"
+        ) from error
     if (
         state.get("slot_count") != len(session.slots)
         or state.get("preview_sha256") != session.preview.preview_artifact.sha256
         or state.get("table_sha256") != session.preview.table_artifact.sha256
         or len(offsets_value) != len(session.slots)
     ):
-        raise RollSessionIntegrityError("roll session source identities or slot geometry changed")
+        raise RollSessionIntegrityError(
+            "roll session source identities or slot geometry changed"
+        )
     for slot_id, offset in enumerate(offsets_value, start=1):
         if type(offset) is not int:
-            raise RollSessionIntegrityError("roll session boundary offset is not an integer")
+            raise RollSessionIntegrityError(
+                "roll session boundary offset is not an integer"
+            )
         if offset:
             try:
                 session = session.with_boundary_offset(slot_id, offset)
             except (TypeError, ValueError) as error:
-                raise RollSessionIntegrityError(f"roll session boundary offset is invalid: {error}") from error
+                raise RollSessionIntegrityError(
+                    f"roll session boundary offset is invalid: {error}"
+                ) from error
     return session
 
 

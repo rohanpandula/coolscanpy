@@ -26,6 +26,7 @@ import pytest
 
 from coolscanpy.protocol.ls5000_single_pass import (
     bundle as capture_bundle,
+    density,
     meter,
     packed,
     roll_index,
@@ -75,7 +76,7 @@ def test_plan_integrity_check_refuses_even_one_changed_byte() -> None:
 
 
 def test_core_modules_have_no_usb_or_campaign_tree_imports() -> None:
-    for module in (meter, packed, roll_index):
+    for module in (density, meter, packed, roll_index):
         source = inspect.getsource(module)
         assert "single-pass-wire" not in source
         assert "negfit/data/wire" not in source
@@ -143,10 +144,14 @@ def test_pyproject_declares_data_for_distribution() -> None:
         "*.json",
         "*.jsonl",
     ]
-    assert (REPO / "src" / "coolscanpy" / "protocol" / "ls5000_single_pass" / "data").is_dir()
+    assert (
+        REPO / "src" / "coolscanpy" / "protocol" / "ls5000_single_pass" / "data"
+    ).is_dir()
 
 
-def test_built_wheel_contains_and_imports_the_ls5000_single_pass_core(tmp_path: Path) -> None:
+def test_built_wheel_contains_and_imports_the_ls5000_single_pass_core(
+    tmp_path: Path,
+) -> None:
     wheel_dir = tmp_path / "wheel"
     wheel_dir.mkdir()
 
@@ -174,6 +179,7 @@ def test_built_wheel_contains_and_imports_the_ls5000_single_pass_core(tmp_path: 
         "coolscanpy/capture/single_pass_workflow.py",
         "coolscanpy/roll/controls.py",
         "coolscanpy/protocol/ls5000_single_pass/packed.py",
+        "coolscanpy/protocol/ls5000_single_pass/density.py",
         "coolscanpy/protocol/ls5000_single_pass/meter.py",
         "coolscanpy/protocol/ls5000_single_pass/roll_index.py",
         "coolscanpy/protocol/ls5000_single_pass/plan.py",

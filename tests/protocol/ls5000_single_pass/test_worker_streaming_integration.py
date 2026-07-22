@@ -65,6 +65,27 @@ def _reviewed_fingerprint() -> ReviewedRollFingerprint:
     )
 
 
+def _density_calibration(session_id: str) -> worker_module.DensityCalibration:
+    reads = [
+        worker_module.decode_density_calibration_read(
+            bytes.fromhex(f"28008c000{color}0300000a80"),
+            bytes.fromhex(payload),
+        )
+        for color, payload in enumerate(
+            (
+                "8c20000000040000df1a",
+                "8c20000000040000bba4",
+                "8c200000000400007fab",
+            ),
+            start=1,
+        )
+    ]
+    return worker_module.assemble_density_calibration(
+        reads,
+        session_id=session_id,
+    )
+
+
 def _records_and_mapping() -> tuple[tuple[TransportRecord, ...], TransportMapping]:
     records = tuple(
         TransportRecord(
@@ -222,6 +243,8 @@ def _drive_continuation(
         root,
         (first, second),
         _reviewed_fingerprint(),
+        1,
+        2,
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
@@ -261,6 +284,14 @@ def _drive_continuation(
     monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
     monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
     monkeypatch.setattr(worker_module, "_open_fine_stream_session", open_session)
+    density_evidence = SimpleNamespace(
+        source_binding=SimpleNamespace(session_id=batch.session_id)
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
 
     journal = worker_module._run_live_continuation_frame(
         "out",
@@ -275,6 +306,10 @@ def _drive_continuation(
         batch_job=batch,
         frame_index=2,
         lifecycle=worker_module.SessionLifecycle(),
+        density_calibration=_density_calibration(batch.session_id),
+        density_evidence=density_evidence,
+        actual_usb_bus=1,
+        actual_usb_address=2,
     )
     return journal, second
 
@@ -457,6 +492,8 @@ def _drive_two_frame_batch(
         root,
         (first, second),
         _reviewed_fingerprint(),
+        1,
+        2,
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
@@ -598,6 +635,7 @@ def _drive_two_frame_batch(
             "width": 3_946,
             "height": 250_278,
             "bit_depth": 16,
+            "exposure_raw_10ns": 70_000 + color,
         }
         for color in (1, 2, 3)
     ]
@@ -614,6 +652,20 @@ def _drive_two_frame_batch(
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_a: preview_windows
     )
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        lambda *_args, **kwargs: SimpleNamespace(
+            source_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
     monkeypatch.setattr(worker_module, "_derive_live_batch_selections", derive_batch)
     monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
     monkeypatch.setattr(
@@ -626,7 +678,13 @@ def _drive_two_frame_batch(
     monkeypatch.setattr(
         worker_module,
         "_connect_device",
-        lambda: (object(), interface, ep_out, ep_in, USBUtil),
+        lambda **_kwargs: (
+            SimpleNamespace(bus=1, address=2),
+            interface,
+            ep_out,
+            ep_in,
+            USBUtil,
+        ),
     )
     monkeypatch.setattr(worker_module, "_open_fine_stream_session", open_session)
 
