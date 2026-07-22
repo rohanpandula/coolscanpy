@@ -9,6 +9,12 @@ The full live response contains four distinct RGB samples and one transferred
 IR plane.  RGB is averaged round-half-up; IR is emitted unchanged.  Prefix
 captures contain only the first RGB sample plus IR and remain supported for
 wire/reference validation.
+
+`StreamingFrameDecoder` adds an incremental path over the same 207,872-byte
+full records: it accepts arbitrarily fragmented chunks, stages at most one
+record, and produces output byte-identical to `decode_full_records` for the
+same stream, so a live capture can be decoded as it arrives while the durable
+raw stream remains the offline oracle.
 """
 
 from __future__ import annotations
@@ -46,6 +52,14 @@ FULL_PADDING_BYTE_RANGES = (
     (158_968, 159_744),
     (207_096, 207_872),
 )
+
+# Word-grained views of the byte offsets above, shared by the batch and the
+# streaming decode kernels so both produce byte-identical output.
+FULL_RGB_SAMPLE_WORD_OFFSETS = tuple(
+    tuple(offset // 2 for offset in sample_offsets)
+    for sample_offsets in FULL_RGB_SAMPLE_BYTE_OFFSETS
+)
+FULL_IR_WORD_OFFSET = FULL_IR_BYTE_OFFSET // 2
 
 
 def infer_record_geometry(path: Path, records: int = EXPECTED_RECORDS) -> int:
@@ -122,6 +136,32 @@ def validate_full_record_layout(words: np.ndarray) -> dict[str, object]:
     }
 
 
+def _decode_record_block(block: np.ndarray, *, width: int = WIDTH) -> np.ndarray:
+    """Average four RGB samples and carry the one IR plane for ``N`` records.
+
+    ``block`` is ``(N, FULL_RECORD_WORDS)`` big-endian words.  Returns
+    ``N * ROWS_PER_RECORD`` output rows of shape ``(width, CHANNELS)`` already
+    reversed to the driver's native film orientation.  This is the single
+    record kernel shared by the batch ``decode_full_records`` path and the
+    streaming ``StreamingFrameDecoder`` so that both stay byte-identical.  The
+    caller owns padding validation and clamping of the trailing surplus row.
+    """
+
+    count = block.shape[0]
+    rgb_sum = np.zeros((count, RGB_CHANNELS, UNIT_WORDS), dtype=np.uint64)
+    for sample_offsets in FULL_RGB_SAMPLE_WORD_OFFSETS:
+        for channel, offset in enumerate(sample_offsets):
+            rgb_sum[:, channel] += block[:, offset : offset + UNIT_WORDS]
+    rgb_avg = ((rgb_sum + 2) // 4).astype(np.uint16)
+    rgb_rows = rgb_avg.reshape(count, RGB_CHANNELS, width, ROWS_PER_RECORD).transpose(0, 3, 2, 1)
+    ir_rows = block[:, FULL_IR_WORD_OFFSET : FULL_IR_WORD_OFFSET + UNIT_WORDS].reshape(count, width, ROWS_PER_RECORD).transpose(0, 2, 1)
+
+    chunk = np.empty((count, ROWS_PER_RECORD, width, CHANNELS), dtype=np.uint16)
+    chunk[..., :RGB_CHANNELS] = rgb_rows
+    chunk[..., 3] = ir_rows
+    return chunk.reshape(-1, width, CHANNELS)[:, ::-1, :]
+
+
 def decode_full_records(
     path: Path,
     *,
@@ -151,28 +191,13 @@ def decode_full_records(
         layout_report = validate_full_record_layout(words)
 
     rgbi = np.empty((height, width, CHANNELS), dtype=np.uint16)
-    rgb_offsets_words = tuple(tuple(offset // 2 for offset in sample_offsets) for sample_offsets in FULL_RGB_SAMPLE_BYTE_OFFSETS)
-    ir_offset_words = FULL_IR_BYTE_OFFSET // 2
 
     for first in range(0, records, chunk_records):
         last = min(records, first + chunk_records)
-        block = words[first:last]
-        count = last - first
-        rgb_sum = np.zeros((count, RGB_CHANNELS, UNIT_WORDS), dtype=np.uint64)
-        for sample_offsets in rgb_offsets_words:
-            for channel, offset in enumerate(sample_offsets):
-                rgb_sum[:, channel] += block[:, offset : offset + UNIT_WORDS]
-        rgb_avg = ((rgb_sum + 2) // 4).astype(np.uint16)
-        rgb_rows = rgb_avg.reshape(count, RGB_CHANNELS, width, ROWS_PER_RECORD).transpose(0, 3, 2, 1)
-        ir_rows = block[:, ir_offset_words : ir_offset_words + UNIT_WORDS].reshape(count, width, ROWS_PER_RECORD).transpose(0, 2, 1)
-
-        chunk = np.empty((count, ROWS_PER_RECORD, width, CHANNELS), dtype=np.uint16)
-        chunk[..., :RGB_CHANNELS] = rgb_rows
-        chunk[..., 3] = ir_rows
-        flat_rows = chunk.reshape(-1, width, CHANNELS)
+        flat_rows = _decode_record_block(words[first:last], width=width)
         output_first = first * ROWS_PER_RECORD
         output_last = min(height, output_first + flat_rows.shape[0])
-        rgbi[output_first:output_last] = flat_rows[: output_last - output_first, ::-1, :]
+        rgbi[output_first:output_last] = flat_rows[: output_last - output_first]
 
     layout_report.update(
         {
@@ -208,3 +233,153 @@ def decode_records(
             "prefix_capture": True,
         },
     )
+
+
+class StreamingFrameDecoder:
+    """Streaming LS-5000 full-record decoder fed arbitrarily fragmented bytes.
+
+    Feed `push` payloads in arrival order -- any size, including one byte at a
+    time or whole records -- then call `finish`.  It routes every completed
+    207,872-byte record through the same `_decode_record_block` kernel and the
+    same fail-closed `validate_full_record_layout` padding check as the batch
+    `decode_full_records`, so its output is byte-identical to an offline decode
+    of the same stream.
+
+    It retains at most one record of raw staging, enforces an exact stream
+    length, and reveals its private output buffer only after a complete,
+    padding-valid `finish`.  It is a pure consumer: no file, USB, or threading
+    side effects.  Buffering is bounded by design -- raw staging never exceeds
+    one record -- but the decoded frame itself is full-size, as it must be to
+    match the batch decoder and downstream quality control.
+    """
+
+    def __init__(
+        self,
+        *,
+        height: int = HEIGHT,
+        width: int = WIDTH,
+        validate_padding: bool = True,
+        out: np.ndarray | None = None,
+    ) -> None:
+        if width != WIDTH:
+            raise ValueError(f"streaming decode requires width {WIDTH}, got {width}")
+        if type(height) is not int or height <= 0:
+            raise ValueError("height must be a positive integer")
+        records = (height + 1) // 2
+        self._height = height
+        self._width = width
+        self._records = records
+        self._validate_padding = validate_padding
+        self._expected_bytes = records * FULL_RECORD_BYTES
+        self._staging = bytearray(FULL_RECORD_BYTES)
+        self._filled = 0
+        self._received = 0
+        self._record_index = 0
+        self._max_staged = 0
+        if out is not None:
+            out_array = np.asarray(out)
+            if (
+                out_array.shape != (height, width, CHANNELS)
+                or out_array.dtype != np.uint16
+            ):
+                raise ValueError(
+                    f"out must be a writable ({height}, {width}, {CHANNELS}) uint16 array"
+                )
+            self._rgbi: np.ndarray | None = out_array
+        else:
+            self._rgbi = None
+        self._finished = False
+
+    @property
+    def expected_bytes(self) -> int:
+        return self._expected_bytes
+
+    @property
+    def received(self) -> int:
+        return self._received
+
+    @property
+    def records(self) -> int:
+        return self._records
+
+    @property
+    def max_staged_bytes(self) -> int:
+        """Peak raw staging occupancy; never exceeds one full record."""
+
+        return self._max_staged
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def push(self, chunk: bytes | bytearray | memoryview) -> None:
+        """Feed the next fragment; rejects any overrun of the exact length."""
+
+        if self._finished:
+            raise ValueError("push after finish")
+        data = memoryview(chunk)
+        length = data.nbytes
+        if length == 0:
+            return
+        if self._received + length > self._expected_bytes:
+            raise ValueError(
+                f"stream overruns the exact {self._expected_bytes}-byte length"
+            )
+        self._received += length
+        offset = 0
+        while offset < length:
+            take = min(FULL_RECORD_BYTES - self._filled, length - offset)
+            self._staging[self._filled : self._filled + take] = data[offset : offset + take]
+            self._filled += take
+            offset += take
+            if self._filled > self._max_staged:
+                self._max_staged = self._filled
+            if self._filled == FULL_RECORD_BYTES:
+                self._emit_record()
+                self._filled = 0
+
+    def _emit_record(self) -> None:
+        if self._rgbi is None:
+            self._rgbi = np.empty((self._height, self._width, CHANNELS), dtype=np.uint16)
+        record_words = np.frombuffer(self._staging, dtype=">u2").reshape(1, FULL_RECORD_WORDS)
+        if self._validate_padding:
+            validate_full_record_layout(record_words)
+        flat_rows = _decode_record_block(record_words, width=self._width)
+        output_first = self._record_index * ROWS_PER_RECORD
+        output_last = min(self._height, output_first + flat_rows.shape[0])
+        self._rgbi[output_first:output_last] = flat_rows[: output_last - output_first]
+        self._record_index += 1
+
+    def finish(self) -> tuple[np.ndarray, dict[str, object]]:
+        """Complete the frame and reveal the private output buffer.
+
+        Raises (revealing nothing) unless the stream is exactly the expected
+        length, ends on a record boundary, and every record decoded.
+        """
+
+        if self._finished:
+            raise ValueError("finish already called")
+        if self._received != self._expected_bytes:
+            raise ValueError(
+                f"stream has {self._received} bytes, expected {self._expected_bytes}"
+            )
+        if self._filled != 0:
+            raise ValueError("stream ended on a partial record")
+        if self._record_index != self._records:
+            raise ValueError(
+                f"decoded {self._record_index} records, expected {self._records}"
+            )
+        if self._rgbi is None:
+            raise ValueError(" streamed decode produced no output buffer")
+        self._finished = True
+        # Exactly the canonical decode proof, with no extra keys: a consumer
+        # (the capture sidecar) refuses to publish unless this proof is exact,
+        # so evidence can never be invented by filling in defaults.
+        layout: dict[str, object] = {
+            "rgb_samples_decoded": 4,
+            "rgb_average": "round-half-up uint16 average",
+            "ir_planes_transferred": 1,
+        }
+        if self._validate_padding:
+            layout["padding_validated_records"] = int(self._record_index)
+        return self._rgbi, layout

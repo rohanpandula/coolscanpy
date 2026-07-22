@@ -25,6 +25,71 @@ refuses a genuinely different or reordered roll on its own, and the
 per-slot addressing checks that already run downstream refuse any
 requested slot the live table cannot address regardless of this count.
 
+Adds a streaming decoder and a fail-open capture sidecar so a fine scan can be
+decoded as it arrives, and lets offline finalization consume that streamed
+artifact instead of re-decoding the raw oracle.
+
+`packed.py` gains `StreamingFrameDecoder`, an incremental decoder for the same
+207,872-byte full records. It accepts arbitrarily fragmented chunks (down to
+one byte at a time), stages at most one record, and routes every record through
+the exact kernel `decode_full_records` now shares (`_decode_record_block`) and
+the same fail-closed padding check, so its output is byte-identical to an
+offline decode. It enforces an exact stream length and reveals its private
+buffer only after a complete, padding-valid finish. `decode_full_records` was
+refactored onto the shared kernel with no behavior change.
+
+`streaming_sidecar.py` adds two layers. `FailOpenStreamConsumer` is a generic,
+decoder-agnostic producer/consumer: submission is nonblocking and bounded by a
+small queue, the consumer thread starts lazily, and a queue-full, a consumer
+exception, or a failed finish permanently disables the stream and is reported,
+never raised. `FineStreamSession` is the LS-5000 adapter: it streams the decode
+directly into a private `.npy` memmap (no second full-frame allocation or copy)
+and, only after an exact padding-valid finish, durably publishes the data
+artifact plus a strict receipt -- fsynced, never overwritten (a collision is a
+refusal, not a claimed success), receipt last, with scratch cleaned up on every
+safe failure path. If the deadline expires while a decoder is still writing,
+cleanup is deferred to a daemon janitor until that thread terminates; a
+permanently wedged thread may retain its clearly private temp for the worker
+process lifetime rather than risk closing a live memory map. The whole
+seal-and-collect wait is one short bounded deadline
+(default 5 s, materially below the old 60 s) so a wedged consumer cannot hold a
+retained batch reservation; submission stays `put_nowait`.
+
+The capture worker feeds both the first-frame and the continuation-frame
+fine-read loops through one shared hook (`_open_fine_stream_session` /
+`_submit_fine_stream_record` / `_finish_fine_stream`). The hook engages only for
+the proven full-record geometry, is gated by `COOLSCANPY_CAPTURE_STREAMING=0`,
+and fails open: a synchronous decoder exception, queue backpressure, or a wedged
+consumer never aborts, drains, or blocks the live scan -- raw capture continues
+unchanged. Capture errors explicitly abort any uncommitted sidecar, while a
+submission exception aborts it before the worker drops its reference. The
+durable frame journal records the terminal streaming outcome, and finalization
+will not trust leftover receipt/data files unless that exact successful outcome
+is bound into the journal. Because the worker now imports this code, `packed.py` and
+`streaming_sidecar.py` join the pinned capture-bundle identity alongside the
+re-pinned `worker.py`.
+
+`LS5000SinglePassWorkflow` finalization: with no injected decoder, it first
+tries to consume a bound streamed artifact and otherwise falls back to offline
+decode. The receipt is treated as an untrusted hint -- finalization re-validates
+the schema, the raw SHA/byte binding against the already-computed stream
+identity, a fresh hash of the derived file, `allow_pickle=False` loading, and
+exact no-follow receipt/data identities plus NPY header, shape, dtype, and
+layout before consuming. The derived file is hashed, loaded, and re-hashed
+through one stable descriptor. Any absent, abandoned, incomplete,
+colliding, malformed, or mismatched sidecar falls back; the second raw hash
+after decode still catches a mid-decode stream mutation; and a caller-injected
+decoder keeps its exact semantics and never sees the fast path. The finalization
+module stays out of the capture-bundle identity (it is the offline verifier, not
+scanner-facing code); its correctness rests on this runtime re-validation.
+After committed outputs and manifest reverify, a consumed sidecar is removed
+marker-first and data-second before the raw oracle; cleanup failure retains the
+raw stream so resume can finish safely.
+
+Public API: `StreamingFrameDecoder`, `FailOpenStreamConsumer`, and
+`FineStreamSession` are exported from
+`coolscanpy.protocol.ls5000_single_pass`.
+
 ## 0.1.3
 
 A live hardware session scanning a 6-frame strip found two bugs in the
