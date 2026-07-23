@@ -462,6 +462,60 @@ def test_transport_envelope_and_anchor_residuals_fail_closed() -> None:
         roll.derive_transport_mapping(boundaries, len(rows), records)
 
 
+def test_transport_anchor_fit_accepts_bounded_live_endpoint_quantization() -> None:
+    records = [
+        roll.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(1_500)
+    ]
+    rows = [8 + index * 143 for index in range(10)]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+    first_lookup_row = boundaries[0].evidence_run[1]
+    first = records[first_lookup_row]
+    records[first_lookup_row] = roll.TransportRecord(
+        row=first.row,
+        code=first.code,
+        selector=first.selector,
+        native_origin=first.native_origin + 98,
+    )
+
+    mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    assert mapping.anchor_mae_rows == pytest.approx(0.0)
+    assert mapping.anchor_max_error_rows == pytest.approx(0.0)
+    assert mapping.origins[0].native_origin == first.native_origin + 98
+    assert mapping.origins[0].affine_residual_rows == pytest.approx(-98 / 42)
+
+
+def test_transport_anchor_fit_still_rejects_bounded_mean_with_large_endpoint_error() -> None:
+    records = [
+        roll.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(1_500)
+    ]
+    rows = [8 + index * 143 for index in range(10)]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+    first_lookup_row = boundaries[0].evidence_run[1]
+    first = records[first_lookup_row]
+    records[first_lookup_row] = roll.TransportRecord(
+        row=first.row,
+        code=first.code,
+        selector=first.selector,
+        native_origin=first.native_origin + 130,
+    )
+
+    with pytest.raises(roll.IndexDecodeError, match="leading transport anchor"):
+        roll.derive_transport_mapping(boundaries, len(rows), records)
+
+
 def test_terminal_high_bit_suffix_cannot_poison_short_strip_mapping() -> None:
     records = [
         roll.TransportRecord(

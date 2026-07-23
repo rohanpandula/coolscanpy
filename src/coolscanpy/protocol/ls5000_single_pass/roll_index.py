@@ -1221,6 +1221,7 @@ def derive_transport_mapping(
     maximum_scale: float = 45.0,
     maximum_anchor_mae_rows: float = 1.0,
     maximum_anchor_error_rows: float = 2.0,
+    maximum_leading_anchor_error_rows: float = 3.0,
 ) -> TransportMapping:
     """Map physical preview gaps through the same capture's 0x8e lookup.
 
@@ -1253,9 +1254,23 @@ def derive_transport_mapping(
                 f"{boundary.index + 1} is outside the live 0x8e table"
             )
         direct.append((boundary, records[lookup_row]))
-    fit_direct = [
+    fit_candidates = [
         item for item in direct if tail_start is None or item[1].row < tail_start
     ]
+    # The leading clear-film run may be clipped by the preview raster edge.
+    # Keep its exact same-traversal 0x8e origin, but do not let that one-sided
+    # run tilt the affine model used to resolve genuinely inferred gaps.  It
+    # remains separately bounded below, while the interior anchors retain the
+    # stricter global residual contract.
+    leading_anchor = next(
+        (item for item in fit_candidates if item[0].index == 0),
+        None,
+    )
+    fit_direct = (
+        [item for item in fit_candidates if item[0].index != 0]
+        if leading_anchor is not None and len(fit_candidates) > 4
+        else fit_candidates
+    )
     if len(fit_direct) < 3:
         raise IndexDecodeError(
             "transport mapping requires at least three direct physical gaps "
@@ -1286,6 +1301,16 @@ def derive_transport_mapping(
             f"preview traversal (MAE {anchor_mae:.3f} rows, max "
             f"{anchor_max:.3f} rows)"
         )
+    if leading_anchor is not None and leading_anchor not in fit_direct:
+        boundary, record = leading_anchor
+        leading_error = abs(
+            (intercept + scale * boundary.output_row - record.native_origin) / scale
+        )
+        if leading_error > maximum_leading_anchor_error_rows:
+            raise IndexDecodeError(
+                "leading transport anchor is inconsistent with the interior "
+                f"preview traversal ({leading_error:.3f} rows)"
+            )
 
     direct_by_index = {item.index: record for item, record in direct}
     origins: list[NativeFrameOrigin] = []
