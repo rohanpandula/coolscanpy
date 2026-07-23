@@ -28,11 +28,23 @@ from .bundle import (
     CAPTURE_BUNDLE_COMPONENT_SHA256,
     CAPTURE_BUNDLE_SHA256,
     CAPTURE_WORKER_SHA256,
+    CaptureBundleIntegrityError,
+    canonical_manifest_bytes,
+    verify_capture_bundle,
 )
 from .continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
     derive_equivalent_continuation_blocks,
     verify_canonical_continuation_plan,
+)
+from .density import (
+    DensityCalibration,
+    DensityCalibrationRead,
+    NikonDensityEvidence,
+    assemble_density_calibration,
+    build_nikon_density_evidence,
+    build_nikon_density_frame_ownership,
+    decode_density_calibration_read,
 )
 from .capture_process import (
     ManualFrameApproval,
@@ -50,8 +62,12 @@ from .meter import (
     propose_next_exposures,
     verify_final_convergence,
 )
+from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes, load_canonical_plan
 from .roll_index import (
     IndexGeometry,
+    LEADING_ANCHOR_REVIEW_REASON,
+    MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS,
+    MAXIMUM_LEADING_ANCHOR_ERROR_ROWS,
     NativeFrameOrigin,
     RollDetection,
     TransportRecord,
@@ -60,6 +76,8 @@ from .roll_index import (
     derive_transport_mapping,
     detect_roll_frames,
     parse_live_transport_records_bytes,
+    scanner_addressable_interval_count,
+    terminal_transport_tail_start,
     transport_native_origin,
     validate_live_0x8e_bytes,
 )
@@ -85,7 +103,27 @@ CANONICAL_BUSY_STATUS = bytes.fromhex("0002040100000000")
 STARTUP_UNIT_ATTENTION_SENSES = {"062800", "062900", "063f03"}
 FINE_GET_WINDOW_SEQUENCES = (603, 604, 605, 606)
 PREVIEW_SET_WINDOW_SEQUENCES = (88, 89, 90)
+PREVIEW_GET_WINDOW_SEQUENCES = (115, 116, 117)
 PREVIEW_READ_SEQUENCES = tuple(range(118, 166))
+DENSITY_CALIBRATION_SEQUENCES = (81, 82, 83)
+# Nikon Scan does not treat these final all-ready TUR runs as ordinary
+# wait-until-ready loops.  It sends every confirmation before programming the
+# 97 dpi whole-roll windows: two confirmations, the three density reads above,
+# then four more confirmations.  Collapsing either run when the unit is already
+# ready removes an observed scanner-side settle boundary and can make the first
+# SET_WINDOW fail with 05/26/00.
+PREVIEW_READY_CONFIRMATION_GROUPS = (
+    (79, 80),
+    (84, 85, 86, 87),
+)
+# Completion-to-next-CDB gaps measured from the same Nikon Scan oracle as the
+# immutable preview SET_WINDOW payloads.  These are not ordinary busy-poll
+# intervals: they are host-side settle boundaries between all-ready
+# confirmations, so preserve both the calls and their observed timing.
+PREVIEW_READY_CONFIRMATION_DELAYS_SECONDS = {
+    (79, 80): (1.367343,),
+    (84, 85, 86, 87): (0.0, 0.006530, 0.124961),
+}
 FRAME_TABLE_SEND_SEQUENCE = 174
 FRAME_TABLE_SEND_RECORDS = 37
 FRAME_TABLE_SEND_BYTES = 4 + FRAME_TABLE_SEND_RECORDS * 8
@@ -128,9 +166,33 @@ DRAINED_SCAN_READ_SEQUENCES = (
 FINE_NATIVE_WIDTH = 3_946
 FINE_NATIVE_HEIGHT = 5_959
 EXPECTED_PREVIEW_BYTES = 6_250_496
+PREVIEW_READ_MAX_BYTES = 131_072
 VARIABLE_FRAME_TABLE_SEQUENCE = 64
 VARIABLE_FRAME_TABLE_CDB = "28008f00000300014a80"
 VARIABLE_FRAME_TABLE_MAX_BYTES = 330
+VARIABLE_FRAME_TABLE_SHORT_STATUS = bytes.fromhex("022b4b0000000000")
+FIXED_PREVIEW_FRAME_TABLE_RECORDS = 40
+SHORT_FULL_ROLL_FRAME_TABLE_RECORDS = 37
+
+
+def _meter_layout_receipt() -> dict[str, object]:
+    """Return the one pinned meter layout used by every batch frame."""
+
+    return {
+        "passes": 3,
+        "rows_per_pass": 425,
+        "columns": 281,
+        "decoded_raster_channel_order": ["R", "G", "B", "IR"],
+        "wire_window_color_order": list(WIRE_METER_COLORS),
+        "wire_color_to_controller_channel": {
+            str(color): channel
+            for color, channel in WIRE_COLOR_TO_CONTROLLER_CHANNEL.items()
+        },
+        "sample_byte_order": "big-endian-u16",
+        "row_core_bytes": 2_248,
+        "row_stride_bytes": 2_560,
+        "row_tail_bytes": 312,
+    }
 
 
 class ProtocolError(RuntimeError):
@@ -160,6 +222,39 @@ class StartupFrameTable(TypedDict):
     count: int
     header: str
     sha256: str
+
+
+@dataclass(frozen=True)
+class PreviewTraversalBinding:
+    """One startup-table-bound whole-roll preview command contract."""
+
+    geometry: IndexGeometry
+    active_read_sequences: tuple[int, ...]
+    skipped_read_sequences: tuple[int, ...]
+    startup_records: int
+    mode: str
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "startup_records": self.startup_records,
+            "native_height": self.geometry.native_height,
+            "decoded_height": self.geometry.height,
+            "expected_stream_bytes": self.geometry.expected_stream_bytes,
+            "read_count": len(self.active_read_sequences),
+            "active_read_sequence_range": [
+                self.active_read_sequences[0],
+                self.active_read_sequences[-1],
+            ],
+            "skipped_read_sequence_range": (
+                None
+                if not self.skipped_read_sequences
+                else [
+                    self.skipped_read_sequences[0],
+                    self.skipped_read_sequences[-1],
+                ]
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -271,6 +366,8 @@ class LiveBatchJob:
     root: Path
     frames: tuple[BatchFrameSpec, ...]
     reviewed_fingerprint: ReviewedRollFingerprint
+    expected_usb_bus: int
+    expected_usb_address: int
     plan_sha256: str
     continuation_plan_sha256: str
     job_sha256: str
@@ -605,6 +702,48 @@ def _load_validated_plan(
     return plan, manifest, plan_sha256
 
 
+def _verify_live_capture_bundle(
+    *,
+    plan_path: Path,
+    manifest_path: Path,
+    plan_sha256: str,
+    expected_bundle_sha256: str | None,
+) -> None:
+    """Revalidate the parent-pinned bundle immediately before any USB action."""
+
+    expected = CAPTURE_BUNDLE_SHA256
+    if expected_bundle_sha256 is not None:
+        if len(expected_bundle_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_bundle_sha256
+        ):
+            raise ProtocolError(
+                "expected capture bundle SHA-256 is not a lowercase digest"
+            )
+        expected = expected_bundle_sha256
+    if expected != CAPTURE_BUNDLE_SHA256:
+        raise ProtocolError("parent capture bundle identity is not canonical")
+    try:
+        actual = verify_capture_bundle(
+            require_python_sources=not bool(getattr(sys, "frozen", False))
+        )
+        supplied_plan = plan_path.read_bytes()
+        supplied_manifest = manifest_path.read_bytes()
+        canonical_plan = canonical_plan_bytes()
+        canonical_manifest = canonical_manifest_bytes()
+    except (CaptureBundleIntegrityError, OSError, ValueError) as error:
+        raise ProtocolError(
+            f"live capture bundle verification failed: {error}"
+        ) from error
+    if actual != expected:
+        raise ProtocolError("capture bundle identity changed after parent verification")
+    if plan_sha256 != CANONICAL_PLAN_SHA256 or supplied_plan != canonical_plan:
+        raise ProtocolError("live capture plan is not the packaged canonical plan")
+    if supplied_manifest != canonical_manifest:
+        raise ProtocolError(
+            "live capture manifest is not the packaged canonical manifest"
+        )
+
+
 def _entry(plan: list[dict], sequence: int) -> dict:
     try:
         entry = plan[sequence - 1]
@@ -689,9 +828,7 @@ def _require_semantic_match(
     step_index: int,
 ) -> None:
     if len(actual) != len(expected):
-        raise ProtocolError(
-            f"continuation step {step_index} field count changed"
-        )
+        raise ProtocolError(f"continuation step {step_index} field count changed")
     for field_index, (observed, required) in enumerate(zip(actual, expected)):
         if required in ("$Y", "$FOCUS", "$EXPOSURE"):
             if isinstance(observed, bool) or not isinstance(observed, int):
@@ -736,15 +873,11 @@ def compile_continuation_steps(
         start=1,
     ):
         if not isinstance(raw_step, list) or not raw_step:
-            raise ProtocolError(
-                f"continuation semantic step {step_index} is malformed"
-            )
+            raise ProtocolError(f"continuation semantic step {step_index} is malformed")
         required_step = cast(list[object], raw_step)
         code = raw_step[0]
         if not isinstance(code, str):
-            raise ProtocolError(
-                f"continuation semantic step {step_index} has no code"
-            )
+            raise ProtocolError(f"continuation semantic step {step_index} has no code")
         entry = entries[0]
         if code == "R":
             if any(item.get("name") != "TEST_UNIT_READY" for item in entries):
@@ -758,9 +891,7 @@ def compile_continuation_steps(
             actual = ["R"]
         elif code == "A":
             if entry.get("name") != "VENDOR_E0:AUTOFOCUS_EXEC":
-                raise ProtocolError(
-                    f"continuation step {step_index} is not autofocus"
-                )
+                raise ProtocolError(f"continuation step {step_index} is not autofocus")
             payload = bytes.fromhex(entry.get("data_out", ""))
             if len(payload) != 9 or payload[0] != 0:
                 raise ProtocolError("continuation autofocus payload is malformed")
@@ -802,9 +933,7 @@ def compile_continuation_steps(
             window_origins.add(window_origin)
         elif code == "N":
             if entry.get("name") != "SCAN":
-                raise ProtocolError(
-                    f"continuation step {step_index} is not SCAN"
-                )
+                raise ProtocolError(f"continuation step {step_index} is not SCAN")
             actual = ["N", entry.get("expected_sense"), entry.get("data_out")]
         elif code == "V":
             if not str(entry.get("cdb", "")).startswith("280087"):
@@ -818,9 +947,7 @@ def compile_continuation_steps(
             ]
         elif code == "M":
             if entry.get("name") != "READ":
-                raise ProtocolError(
-                    f"continuation step {step_index} is not meter READ"
-                )
+                raise ProtocolError(f"continuation step {step_index} is not meter READ")
             actual = ["M", entry.get("cdb")]
         else:
             raise ProtocolError(
@@ -833,14 +960,13 @@ def compile_continuation_steps(
         raise ProtocolError("continuation dynamic frame origin is inconsistent")
     native_origin = next(iter(window_origins))
     if autofocus_y != native_origin + FINE_NATIVE_HEIGHT // 2:
-        raise ProtocolError(
-            "continuation autofocus is not centered on the bound frame"
-        )
+        raise ProtocolError("continuation autofocus is not centered on the bound frame")
     forbidden = {"RESERVE_UNIT", "RELEASE_UNIT", "VENDOR_E0:EJECT"}
     for step in compiled:
         for entry in step.entries:
             if entry.get("name") in forbidden or (
-                entry.get("name") == "SEND" and entry.get("cdb", "").startswith("2a008f")
+                entry.get("name") == "SEND"
+                and entry.get("cdb", "").startswith("2a008f")
             ):
                 raise ProtocolError(
                     "continuation contains a forbidden session-level command"
@@ -849,7 +975,7 @@ def compile_continuation_steps(
 
 
 def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
-    """Derive the guarded preview raster geometry from the canonical plan."""
+    """Derive the guarded preview raster geometry from the bound plan."""
 
     windows = []
     all_resolutions = []
@@ -892,7 +1018,11 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
         or first["upper_left_x"] != 0
         or first["upper_left_y"] != 0
         or first["width"] != FINE_NATIVE_WIDTH
-        or first["height"] != 250_278
+        or first["height"]
+        not in {
+            (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
+            (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
+        }
         or first["bit_depth"] != 16
     ):
         raise ProtocolError("preview SET_WINDOW geometry is not the proven roll index")
@@ -905,17 +1035,38 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
     pitch = native_resolution // first["resy"]
     width = first["width"] // pitch
     height = first["height"] // pitch
-    expected_stream_bytes = sum(
+    read_requests = [
         _entry(plan, sequence).get("request_len", 0)
         for sequence in PREVIEW_READ_SEQUENCES
+    ]
+    first_skipped = next(
+        (index for index, request in enumerate(read_requests) if request == 0),
+        len(read_requests),
+    )
+    if any(request != 0 for request in read_requests[first_skipped:]):
+        raise ProtocolError("preview READ allocation has a non-contiguous suffix")
+    active_requests = read_requests[:first_skipped]
+    if (
+        not active_requests
+        or any(request != PREVIEW_READ_MAX_BYTES for request in active_requests[:-1])
+        or not 1 <= active_requests[-1] <= PREVIEW_READ_MAX_BYTES
+    ):
+        raise ProtocolError(
+            "preview READ allocation is not a bounded contiguous prefix"
+        )
+    expected_stream_bytes = sum(active_requests)
+    canonical_height = (
+        first["height"] == (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
     )
     if (
         pitch != 41
         or width != 96
-        or height != 6_104
-        or expected_stream_bytes != EXPECTED_PREVIEW_BYTES
         or height % 2
         or (height // 2) * 2_048 != expected_stream_bytes
+        or (
+            canonical_height
+            and (height != 6_104 or expected_stream_bytes != EXPECTED_PREVIEW_BYTES)
+        )
     ):
         raise ProtocolError(
             "preview stream geometry does not match its READ allocation"
@@ -965,9 +1116,11 @@ def _derive_live_frame_selection(
     records = parse_live_transport_records_bytes(
         validated_table, maximum_rows=geometry.height
     )
+    scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
+    scanner_intervals = detection.intervals[:scanner_frame_count]
     mapping = derive_transport_mapping(
         detection.boundaries,
-        len(detection.intervals),
+        scanner_frame_count,
         records,
     )
     fresh_fingerprint: ReviewedRollFingerprint | None = None
@@ -976,8 +1129,7 @@ def _derive_live_frame_selection(
         fresh_fingerprint = build_reviewed_roll_fingerprint(
             rgb16,
             frame_intervals=tuple(
-                (interval.start_row, interval.end_row)
-                for interval in detection.intervals
+                (interval.start_row, interval.end_row) for interval in scanner_intervals
             ),
             frame_native_origins=tuple(
                 origin.native_origin for origin in mapping.origins
@@ -1014,10 +1166,14 @@ def _derive_live_frame_selection(
     base_selected = mapping.origins[frame - 1]
     if base_selected.frame != frame:
         raise ProtocolError("transport mapping frame order is inconsistent")
+    if "terminal-transport-tail" in base_selected.review_reasons:
+        raise ProtocolError(
+            f"frame {frame} belongs to the terminal transport tail and is not "
+            "scanner-addressable"
+        )
     if (
-        (not base_selected.automatic or base_selected.manual_review)
-        and not manual_review_approved
-    ):
+        not base_selected.automatic or base_selected.manual_review
+    ) and not manual_review_approved:
         raise ProtocolError(
             f"frame {frame} transport origin requires manual review; "
             "refusing an unattended fine scan"
@@ -1109,9 +1265,7 @@ def _derive_live_batch_selections(
         records,
         tuple((spec.slot, spec.boundary_offset_rows) for spec in frames),
         approved_manual_slots=frozenset(
-            spec.slot
-            for spec in frames
-            if spec.manual_review_approval is not None
+            spec.slot for spec in frames if spec.manual_review_approval is not None
         ),
     )
     # The reviewed fingerprint's frame count is in scope here, so cross-check
@@ -1149,7 +1303,7 @@ def _derive_live_batch_selections(
     # the live table cannot address. So the only direction left for this
     # comparison to refuse on its own is the one with no legitimate cause at
     # all: more addressable live records than the reviewed roll described.
-    live_signable_frame_count = build_live_frame_table_payload(combined)[2]
+    live_signable_frame_count = len(_addressable_frame_origins(combined))
     reviewed_frame_count = len(reviewed_fingerprint.frame_start_rows)
     if live_signable_frame_count > reviewed_frame_count + 1:
         raise ProtocolError(
@@ -1157,7 +1311,7 @@ def _derive_live_batch_selections(
             f"frame records, more than one above the {reviewed_frame_count} "
             "the reviewed roll fingerprint described"
         )
-    for origin in combined.origins[:FRAME_TABLE_SEND_RECORDS]:
+    for origin in _addressable_frame_origins(combined):
         if origin.native_origin + FINE_NATIVE_HEIGHT > context.geometry.native_height:
             raise ProtocolError(
                 f"frame {origin.frame} fine window exceeds native transport height"
@@ -1207,17 +1361,33 @@ def _validate_boundary_offset(frame: int, offset_rows: int) -> None:
 def load_validated_batch_job(
     path: Path,
     *,
+    expected_job_sha256: str,
     expected_plan_sha256: str,
     expected_continuation_sha256: str,
 ) -> LiveBatchJob:
     """Load an exact path-confined parent/child batch handshake contract."""
 
     path = Path(path).expanduser().resolve()
+    if (
+        not isinstance(expected_job_sha256, str)
+        or len(expected_job_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_job_sha256)
+    ):
+        raise ProtocolError("expected batch job SHA-256 is malformed")
     try:
         job_bytes = path.read_bytes()
-        payload = json.loads(job_bytes.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except OSError as error:
         raise ProtocolError(f"batch job could not be read: {error}") from error
+    actual_job_sha256 = hashlib.sha256(job_bytes).hexdigest()
+    if actual_job_sha256 != expected_job_sha256:
+        raise ProtocolError(
+            "batch job SHA-256 mismatch before USB access: "
+            f"expected {expected_job_sha256}, got {actual_job_sha256}"
+        )
+    try:
+        payload = json.loads(job_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProtocolError(f"batch job could not be decoded: {error}") from error
     if not isinstance(payload, dict):
         raise ProtocolError("batch job must be a JSON object")
     expected_top_level = {
@@ -1226,10 +1396,12 @@ def load_validated_batch_job(
         "continuation_plan_sha256": expected_continuation_sha256,
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
-        "schema_version": 2,
+        "schema_version": 3,
         "session_contract": "one-process-one-reservation",
     }
     expected_keys = set(expected_top_level) | {
+        "expected_usb_address",
+        "expected_usb_bus",
         "frames",
         "reviewed_roll_fingerprint",
         "session_id",
@@ -1248,7 +1420,8 @@ def load_validated_batch_job(
     if (
         not isinstance(session_id, str)
         or not 1 <= len(session_id) <= 128
-        or session_id[0] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        or session_id[0]
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         or any(
             character
             not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
@@ -1261,7 +1434,23 @@ def load_validated_batch_job(
             payload.get("reviewed_roll_fingerprint")
         )
     except (TypeError, ValueError) as error:
-        raise ProtocolError(f"batch reviewed roll fingerprint is invalid: {error}") from error
+        raise ProtocolError(
+            f"batch reviewed roll fingerprint is invalid: {error}"
+        ) from error
+    expected_usb_bus = payload.get("expected_usb_bus")
+    expected_usb_address = payload.get("expected_usb_address")
+    if (
+        isinstance(expected_usb_bus, bool)
+        or not isinstance(expected_usb_bus, int)
+        or not 0 <= expected_usb_bus <= 999
+    ):
+        raise ProtocolError("batch expected USB bus must be an integer in 0..999")
+    if (
+        isinstance(expected_usb_address, bool)
+        or not isinstance(expected_usb_address, int)
+        or not 1 <= expected_usb_address <= 127
+    ):
+        raise ProtocolError("batch expected USB address must be an integer in 1..127")
     raw_frames = payload.get("frames")
     if not isinstance(raw_frames, list) or not raw_frames:
         raise ProtocolError("batch job must contain at least one frame")
@@ -1285,9 +1474,7 @@ def load_validated_batch_job(
         if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= 40:
             raise ProtocolError(f"batch frame {index} has an invalid slot")
         if isinstance(offset, bool) or not isinstance(offset, int):
-            raise ProtocolError(
-                f"batch frame {index} has an invalid boundary offset"
-            )
+            raise ProtocolError(f"batch frame {index} has an invalid boundary offset")
         _validate_boundary_offset(slot, offset)
         raw_approval = raw.get("manual_review_approval")
         approval: ManualFrameApproval | None = None
@@ -1317,9 +1504,7 @@ def load_validated_batch_job(
         }
         for key, expected in expected_paths.items():
             if raw.get(key) != expected:
-                raise ProtocolError(
-                    f"batch frame {index} {key} must be {expected!r}"
-                )
+                raise ProtocolError(f"batch frame {index} {key} must be {expected!r}")
         frames.append(
             BatchFrameSpec(
                 slot=slot,
@@ -1338,9 +1523,11 @@ def load_validated_batch_job(
         root=root,
         frames=tuple(frames),
         reviewed_fingerprint=reviewed_fingerprint,
+        expected_usb_bus=expected_usb_bus,
+        expected_usb_address=expected_usb_address,
         plan_sha256=expected_plan_sha256,
         continuation_plan_sha256=expected_continuation_sha256,
-        job_sha256=hashlib.sha256(job_bytes).hexdigest(),
+        job_sha256=actual_job_sha256,
     )
 
 
@@ -1426,16 +1613,39 @@ def apply_boundary_offset(
     base = mapping.origins[frame - 1]
     if base.frame != frame:
         raise ProtocolError("transport mapping frame order is inconsistent")
+    if "terminal-transport-tail" in base.review_reasons:
+        raise ProtocolError(
+            f"frame {frame} belongs to the terminal transport tail and is not "
+            "scanner-addressable"
+        )
     resolved_row = base.lookup_row + offset_rows
     if not 0 <= resolved_row < len(records):
         raise ProtocolError(
             f"frame {frame} boundary offset resolves outside the live 0x8e table"
+        )
+    tail_start = terminal_transport_tail_start(records)
+    if tail_start is not None and resolved_row >= tail_start:
+        raise ProtocolError(
+            f"frame {frame} boundary offset resolves into the terminal transport tail"
         )
     record = records[resolved_row]
     if record.row != resolved_row:
         raise ProtocolError("live 0x8e records are not indexed by preview row")
     if transport_native_origin(record.code, record.selector) != record.native_origin:
         raise ProtocolError("resolved 0x8e record does not reproduce its origin")
+    predicted_origin = (
+        mapping.native_intercept
+        + mapping.native_units_per_preview_row
+        * (base.boundary_output_row + offset_rows)
+    )
+    residual_rows = (
+        predicted_origin - record.native_origin
+    ) / mapping.native_units_per_preview_row
+    if abs(residual_rows) > 2.0:
+        raise ProtocolError(
+            f"frame {frame} boundary offset resolves to a transport origin "
+            f"{abs(residual_rows):.3f} rows outside the affine mapping"
+        )
     selected = replace(
         base,
         lookup_row=resolved_row,
@@ -1448,6 +1658,7 @@ def apply_boundary_offset(
             else f"{base.method}+operator-boundary-offset"
         ),
         automatic=base.automatic,
+        affine_residual_rows=float(residual_rows),
     )
     origins = list(mapping.origins)
     origins[frame - 1] = selected
@@ -1485,16 +1696,19 @@ def apply_batch_boundary_offsets(
     for frame, offset_rows in frames:
         if not 1 <= frame <= len(original.origins):
             raise ProtocolError(
-                f"requested frame {frame} is outside mapping "
-                f"1..{len(original.origins)}"
+                f"requested frame {frame} is outside mapping 1..{len(original.origins)}"
             )
         base = original.origins[frame - 1]
         if base.frame != frame:
             raise ProtocolError("transport mapping frame order is inconsistent")
+        if "terminal-transport-tail" in base.review_reasons:
+            raise ProtocolError(
+                f"frame {frame} belongs to the terminal transport tail and is "
+                "not scanner-addressable"
+            )
         if (
-            (not base.automatic or base.manual_review)
-            and frame not in approved_manual_slots
-        ):
+            not base.automatic or base.manual_review
+        ) and frame not in approved_manual_slots:
             raise ProtocolError(
                 f"frame {frame} transport origin requires manual review; "
                 "refusing an unattended batch"
@@ -1507,10 +1721,12 @@ def apply_batch_boundary_offsets(
         )
         resolved.append((base, selected))
 
-    # Validate the exact fixed-size payload now, before any selected frame is
-    # scanned.  This also catches offsets that would make origins overlap.
-    table = build_live_frame_table_payload(combined)
-    table_count = table[2]
+    # Validate the fixed-size Nikon page now, before any selected frame is
+    # scanned.  Its 37 entries are a firmware configuration page, rather than
+    # a count of detected film frames.  Selection legality must therefore use
+    # the separately derived physical prefix, not the page header.
+    build_live_frame_table_payload(combined)
+    table_count = len(_addressable_frame_origins(combined))
     for frame in ordered_slots:
         if frame > table_count:
             raise ProtocolError(
@@ -1520,8 +1736,15 @@ def apply_batch_boundary_offsets(
     return combined, tuple(resolved)
 
 
-def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
-    """Encode Nikon SEND(0x8f) records from this traversal's raw 0x8e fields."""
+def _addressable_frame_origins(
+    mapping: TransportMapping,
+) -> tuple[NativeFrameOrigin, ...]:
+    """Return the proven physical prefix of a preview traversal.
+
+    This count is deliberately independent of the 37 entries in Nikon's
+    SEND(0x8f) configuration page.  A preview may expose an advisory terminal
+    cell, while the firmware page remains fixed-size even for a short strip.
+    """
 
     # The preview UI deliberately exposes every aligned candidate cell, including
     # a partial final cell when the index raster ends mid-frame.  That advisory
@@ -1530,34 +1753,82 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
     # rejects with ILLEGAL REQUEST 05/26/00.  Keep the UI's slot numbering intact,
     # but stop the hardware table before the first candidate that the detector
     # proved lies outside the raster or has invalid physical spacing.
-    non_addressable_reasons = {"outside-index-raster", "spacing-outlier"}
-    origins = []
+    non_addressable_reasons = {
+        "outside-index-raster",
+        "spacing-outlier",
+        "terminal-transport-tail",
+    }
+    origins: list[NativeFrameOrigin] = []
     for origin in mapping.origins:
+        leading_reviewed_prefix = (
+            origin.frame == 1
+            and origin.boundary_index == 0
+            and origin.method == "direct-gap-trailing-row"
+            and LEADING_ANCHOR_REVIEW_REASON in origin.review_reasons
+            and origin.manual_review
+            and not origin.automatic
+        )
+        residual_limit = (
+            MAXIMUM_LEADING_ANCHOR_ERROR_ROWS
+            if leading_reviewed_prefix
+            else MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS
+        )
         if (
             non_addressable_reasons.intersection(origin.review_reasons)
-            or abs(origin.affine_residual_rows) > 2.0
+            or abs(origin.affine_residual_rows) > residual_limit
         ):
             break
         origins.append(origin)
-    # Every full-roll Nikon host SEND observed on this firmware used exactly
-    # 37 records / 300 bytes, so this function used to require at least 37
-    # origins before building anything and always truncated to exactly 37.
-    # That was a full-roll-era tripwire against truncated indexes, not a
-    # hardware minimum: roll identity is guarded by the reviewed-fingerprint
-    # comparison that runs immediately after, and addressing safety only
-    # requires that every requested slot actually exist in the table this
-    # function returns. apply_batch_boundary_offsets and
-    # _bind_plan_to_live_selection both already refuse a requested frame
-    # beyond the table they receive, so the only floor this function needs
-    # to hold on its own is unconditional: fewer than 2 records cannot
-    # describe an addressable roll or strip at all. The preview UI's own
-    # advisory ceiling above stays capped at the proven 37, since nothing
-    # bigger than a full roll has ever been sent.
     if len(origins) < 2:
         raise ProtocolError(
             "live mapping has fewer than 2 scanner-addressable frame records"
         )
-    origins = tuple(origins[:FRAME_TABLE_SEND_RECORDS])
+    return tuple(origins[:FRAME_TABLE_SEND_RECORDS])
+
+
+def _canonical_frame_table_records() -> tuple[tuple[int, int, int], ...]:
+    """Read the immutable Nikon-accepted 37-record SEND(0x8f) page."""
+
+    entry = next(
+        entry
+        for entry in load_canonical_plan()
+        if entry.get("seq") == FRAME_TABLE_SEND_SEQUENCE
+    )
+    payload = bytes.fromhex(str(entry.get("data_out", "")))
+    if len(payload) != FRAME_TABLE_SEND_BYTES or payload[:4] != bytes(
+        (0x01, 0x2A, FRAME_TABLE_SEND_RECORDS, 0x00)
+    ):
+        raise ProtocolError("canonical SEND(0x8f) page is not the proven 37 records")
+    records = tuple(
+        struct.unpack_from(">IHH", payload, 4 + record * 8)
+        for record in range(FRAME_TABLE_SEND_RECORDS)
+    )
+    previous = -1
+    for native_origin, selector, code in records:
+        if (
+            native_origin <= previous
+            or transport_native_origin(code, selector) != native_origin
+        ):
+            raise ProtocolError(
+                "canonical SEND(0x8f) page has an invalid transport record"
+            )
+        previous = native_origin
+    return records
+
+
+def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
+    """Build the fixed 37-record Nikon SEND(0x8f) configuration page.
+
+    The physical prefix belongs to this traversal; the unused suffix comes
+    from the captured Nikon page.  On a short strip the latter is not a
+    candidate for capture -- only the physical prefix can be selected -- but
+    it preserves the firmware-required 300-byte page shape.  The canonical
+    tail was accepted by this firmware on the retained short-strip preview;
+    the live prefix remains guarded by its exact transport identity and every
+    selected-frame geometry check.
+    """
+
+    origins = _addressable_frame_origins(mapping)
     payload = bytearray((0x01, 0x2A, len(origins), 0x00))
     previous = -1
     for expected_frame, origin in enumerate(origins, start=1):
@@ -1576,6 +1847,20 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
             struct.pack(">IHH", origin.native_origin, origin.selector, origin.code)
         )
         previous = origin.native_origin
+
+    if len(origins) < FRAME_TABLE_SEND_RECORDS:
+        canonical_records = _canonical_frame_table_records()
+        for native_origin, selector, code in canonical_records[len(origins) :]:
+            if native_origin <= previous:
+                raise ProtocolError(
+                    "canonical SEND(0x8f) tail does not continue after the live mapping"
+                )
+            payload.extend(struct.pack(">IHH", native_origin, selector, code))
+            previous = native_origin
+
+    payload[2] = FRAME_TABLE_SEND_RECORDS
+    if len(payload) != FRAME_TABLE_SEND_BYTES:
+        raise ProtocolError("SEND(0x8f) frame table is not the proven 37 records")
     return bytes(payload)
 
 
@@ -1601,14 +1886,15 @@ def _bind_plan_to_live_selection(
     bound = [dict(entry) for entry in plan]
     native_origin = selection.selected.native_origin
 
+    addressable_origins = _addressable_frame_origins(selection.mapping)
     table_payload = build_live_frame_table_payload(selection.mapping)
-    table_count = table_payload[2]
-    if selection.frame > table_count:
+    addressable_count = len(addressable_origins)
+    if selection.frame > addressable_count:
         raise ProtocolError(
             f"requested frame {selection.frame} is outside the scanner-addressable "
-            f"table 1..{table_count}"
+            f"table 1..{addressable_count}"
         )
-    for origin in selection.mapping.origins[:table_count]:
+    for origin in addressable_origins:
         if origin.native_origin + FINE_NATIVE_HEIGHT > selection.geometry.native_height:
             raise ProtocolError(
                 f"frame {origin.frame} fine window exceeds native transport height"
@@ -1660,17 +1946,16 @@ def _bind_plan_to_live_selection(
         expected[18:22] = native_origin.to_bytes(4, "big")
         entry["expected_data_in"] = expected.hex()
 
-    # Recheck the exact values that cross the unsafe hardware boundary. The
-    # table's byte length is no longer pinned to the full-roll 300-byte shape
-    # (build_live_frame_table_payload now sizes it from the live mapping); what
-    # still has to hold, unconditionally, is that the bytes the CDB declares
-    # are exactly the bytes being transferred, so a short or long USB transfer
-    # can never desynchronize the device.
+    # Recheck the exact values that cross the unsafe hardware boundary.  Nikon
+    # accepts only this fixed 300-byte page, and the CDB must declare precisely
+    # those bytes.
     if (
-        len(table_payload) != 4 + table_count * 8
-        or int.from_bytes(table_cdb[6:9], "big") != len(table_payload)
+        len(table_payload) != FRAME_TABLE_SEND_BYTES
+        or int.from_bytes(table_cdb[6:9], "big") != FRAME_TABLE_SEND_BYTES
     ):
-        raise ProtocolError("SEND(0x8f) transfer length does not match its declared table")
+        raise ProtocolError(
+            "SEND(0x8f) transfer length does not match its declared table"
+        )
     if int.from_bytes(autofocus[5:9], "big") != autofocus_y:
         raise ProtocolError("dynamic autofocus Y was not bound")
     for sequence in DYNAMIC_WINDOW_SEQUENCES:
@@ -1904,9 +2189,7 @@ def _validate_live_meter_windows(
     for payload in payloads:
         window = decode_window_block(payload)
         if window is None:
-            raise SynchronizedProtocolError(
-                "meter GET_WINDOW responses are incomplete"
-            )
+            raise SynchronizedProtocolError("meter GET_WINDOW responses are incomplete")
         decoded.append(window)
     for color, window in zip((9, 1, 2, 3), decoded, strict=True):
         checks = (
@@ -1975,9 +2258,7 @@ def _validate_live_fine_windows(
     for payload in payloads:
         window = decode_window_block(payload)
         if window is None:
-            raise SynchronizedProtocolError(
-                "fine GET_WINDOW responses are incomplete"
-            )
+            raise SynchronizedProtocolError("fine GET_WINDOW responses are incomplete")
         decoded.append(window)
     expected_colors = [9, 1, 2, 3]
     for color, window in zip(expected_colors, decoded, strict=True):
@@ -2025,13 +2306,65 @@ def _validate_live_fine_windows(
     return decoded
 
 
-def _connect_device():
+def _find_ls5000_usb_device(
+    usb_core: Any,
+    *,
+    expected_bus: int | None = None,
+    expected_address: int | None = None,
+    backend: Any | None = None,
+) -> Any:
+    if (expected_bus is None) != (expected_address is None):
+        raise ProtocolError("expected USB bus and address are inseparable")
+    if expected_bus is None:
+        device = usb_core.find(
+            idVendor=0x04B0,
+            idProduct=0x4002,
+            backend=backend,
+        )
+        if device is None:
+            raise ProtocolError("Nikon LS-5000 (04b0:4002) is not on the USB bus")
+        return device
+
+    devices = tuple(
+        usb_core.find(
+            idVendor=0x04B0,
+            idProduct=0x4002,
+            find_all=True,
+            backend=backend,
+        )
+        or ()
+    )
+    matches = tuple(
+        device
+        for device in devices
+        if getattr(device, "bus", None) == expected_bus
+        and getattr(device, "address", None) == expected_address
+    )
+    if len(matches) != 1:
+        raise ProtocolError(
+            "exact USB topology "
+            f"{expected_bus:03d}:{expected_address:03d} resolved to "
+            f"{len(matches)} Nikon LS-5000 devices; refusing fallback selection"
+        )
+    return matches[0]
+
+
+def _connect_device(
+    *,
+    expected_usb_bus: int | None = None,
+    expected_usb_address: int | None = None,
+):
     import usb.core
     import usb.util
 
-    device = usb.core.find(idVendor=0x04B0, idProduct=0x4002)
-    if device is None:
-        raise ProtocolError("Nikon LS-5000 (04b0:4002) is not on the USB bus")
+    from .usb_backend import get_libusb_backend
+
+    device = _find_ls5000_usb_device(
+        usb.core,
+        expected_bus=expected_usb_bus,
+        expected_address=expected_usb_address,
+        backend=get_libusb_backend(),
+    )
     try:
         configuration = device.get_active_configuration()
     except usb.core.USBError:
@@ -2195,7 +2528,7 @@ def _perform_variable_frame_table_transaction(
     *,
     data_timeout_ms: int,
 ) -> TransactionResult:
-    """Accept sequence 64's positive short response only if it is complete."""
+    """Accept a complete short 0x8f table despite Nikon's underrun status."""
 
     checks = {
         "seq": VARIABLE_FRAME_TABLE_SEQUENCE,
@@ -2252,7 +2585,12 @@ def _perform_variable_frame_table_transaction(
         raise DesynchronizedProtocolError(
             f"command 64 status length {len(status)} != 8"
         )
-    if status.hex() != entry["expected_status"]:
+    expected_status = bytes.fromhex(entry["expected_status"])
+    short_table_underrun = (
+        status == VARIABLE_FRAME_TABLE_SHORT_STATUS
+        and len(payload) < VARIABLE_FRAME_TABLE_MAX_BYTES
+    )
+    if status != expected_status and not short_table_underrun:
         raise SynchronizedProtocolError(
             f"command 64 status {status.hex()} != {entry['expected_status']}"
         )
@@ -2262,6 +2600,199 @@ def _perform_variable_frame_table_transaction(
         status=status,
         sense=status[1:4].hex(),
         stall_recoveries=phase_stalls + data_stalls + status_stalls,
+    )
+
+
+def _patched_preview_window_height(
+    payload: bytes,
+    *,
+    native_height: int,
+    sequence: int,
+) -> bytes:
+    decoded = decode_window_block(payload)
+    canonical_height = (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    if decoded is None or decoded["height"] != canonical_height:
+        raise ProtocolError(
+            f"command {sequence}: preview window is not the canonical template"
+        )
+    mutable = bytearray(payload)
+    mutable[26:30] = native_height.to_bytes(4, "big")
+    patched = bytes(mutable)
+    verified = decode_window_block(patched)
+    if verified is None or verified["height"] != native_height:
+        raise ProtocolError(f"command {sequence}: preview height patch did not verify")
+    return patched
+
+
+def _patch_preview_read_allocation(
+    entry: dict,
+    *,
+    request_len: int,
+    drains_scan: bool,
+) -> None:
+    cdb = bytearray.fromhex(entry.get("cdb", ""))
+    if (
+        entry.get("name") != "READ"
+        or len(cdb) != 10
+        or cdb[0] != 0x28
+        or cdb[9] != 0x80
+        or not 0 <= request_len <= PREVIEW_READ_MAX_BYTES
+    ):
+        raise ProtocolError(
+            f"command {entry.get('seq')}: invalid preview READ template"
+        )
+    if request_len:
+        cdb[6:9] = request_len.to_bytes(3, "big")
+        entry["cdb"] = cdb.hex()
+        entry["request_len"] = request_len
+        entry["request_parts"] = [request_len]
+        entry["live_bound_request_len"] = request_len
+        entry["drains_scan"] = drains_scan
+        entry.pop("preview_skipped", None)
+        return
+    entry["request_len"] = 0
+    entry["request_parts"] = []
+    entry["live_bound_request_len"] = 0
+    entry["preview_skipped"] = True
+    entry.pop("drains_scan", None)
+
+
+def _validate_short_preview_frame_table_records(payload: bytes) -> None:
+    """Validate a live 37-record Nikon transport table without freezing its positions."""
+
+    records = tuple(struct.iter_unpack(">IHH", payload[10:]))
+    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    if len(records) != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS:
+        raise SynchronizedProtocolError(
+            "command 64: short startup table does not contain the required "
+            f"{SHORT_FULL_ROLL_FRAME_TABLE_RECORDS} complete transport records; "
+            "no preview window was sent"
+        )
+
+    first_selector = records[0][1]
+    previous_origin = -1
+    for index, (native_origin, selector, code) in enumerate(records):
+        if (
+            selector != first_selector + 8 * index
+            or native_origin <= previous_origin
+            or native_origin >= native_height
+            or transport_native_origin(code, selector) != native_origin
+        ):
+            raise SynchronizedProtocolError(
+                "command 64: short startup table is not a valid Nikon transport "
+                "record table; no preview window was sent"
+            )
+        previous_origin = native_origin
+
+
+def _bind_preview_to_startup_table(
+    plan: list[dict],
+    payload: bytes,
+    status: bytes,
+    canonical_geometry: IndexGeometry,
+) -> PreviewTraversalBinding:
+    """Bind preview motion and reads to the validated startup-table prefix."""
+
+    table = _validate_variable_frame_table_payload(payload)
+    if (
+        len(payload) != VARIABLE_FRAME_TABLE_MAX_BYTES
+        or table["count"] != FIXED_PREVIEW_FRAME_TABLE_RECORDS
+        or status != bytes(8)
+    ):
+        if (
+            table["count"] != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS
+            or status != VARIABLE_FRAME_TABLE_SHORT_STATUS
+        ):
+            raise SynchronizedProtocolError(
+                "command 64: scanner returned a "
+                f"{len(payload)}-byte/{table['count']}-record startup table with "
+                f"status {status.hex()}; supported preview bindings require "
+                f"{FIXED_PREVIEW_FRAME_TABLE_RECORDS} canonical records or the "
+                f"observed {SHORT_FULL_ROLL_FRAME_TABLE_RECORDS}-record full-roll "
+                "prefix"
+            )
+    else:
+        return PreviewTraversalBinding(
+            geometry=canonical_geometry,
+            active_read_sequences=PREVIEW_READ_SEQUENCES,
+            skipped_read_sequences=(),
+            startup_records=FIXED_PREVIEW_FRAME_TABLE_RECORDS,
+            mode="canonical-40-record",
+        )
+
+    canonical_payload = bytes.fromhex(
+        _entry(plan, VARIABLE_FRAME_TABLE_SEQUENCE).get("expected_data_in", "")
+    )
+    if len(canonical_payload) != VARIABLE_FRAME_TABLE_MAX_BYTES:
+        raise SynchronizedProtocolError(
+            "command 64: canonical startup table template is malformed; "
+            "no preview window was sent"
+        )
+    if payload[10:] != canonical_payload[10 : len(payload)]:
+        _validate_short_preview_frame_table_records(payload)
+
+    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    for sequence in PREVIEW_SET_WINDOW_SEQUENCES:
+        entry = _entry(plan, sequence)
+        entry["data_out"] = _patched_preview_window_height(
+            bytes.fromhex(entry.get("data_out", "")),
+            native_height=native_height,
+            sequence=sequence,
+        ).hex()
+    for sequence in PREVIEW_GET_WINDOW_SEQUENCES:
+        entry = _entry(plan, sequence)
+        entry["expected_data_in"] = _patched_preview_window_height(
+            bytes.fromhex(entry.get("expected_data_in", "")),
+            native_height=native_height,
+            sequence=sequence,
+        ).hex()
+
+    decoded_height = native_height // canonical_geometry.pitch
+    if decoded_height % 2:
+        raise ProtocolError(
+            "37-record preview height does not end on a two-row index block"
+        )
+    expected_stream_bytes = (decoded_height // 2) * canonical_geometry.block_bytes
+    full_reads, final_bytes = divmod(
+        expected_stream_bytes,
+        PREVIEW_READ_MAX_BYTES,
+    )
+    active_read_count = full_reads + (1 if final_bytes else 0)
+    if not 1 <= active_read_count <= len(PREVIEW_READ_SEQUENCES):
+        raise ProtocolError("37-record preview READ allocation is out of bounds")
+    active_read_sequences = PREVIEW_READ_SEQUENCES[:active_read_count]
+    skipped_read_sequences = PREVIEW_READ_SEQUENCES[active_read_count:]
+    for index, sequence in enumerate(active_read_sequences):
+        request_len = (
+            final_bytes
+            if final_bytes and index == active_read_count - 1
+            else PREVIEW_READ_MAX_BYTES
+        )
+        _patch_preview_read_allocation(
+            _entry(plan, sequence),
+            request_len=request_len,
+            drains_scan=index == active_read_count - 1,
+        )
+    for sequence in skipped_read_sequences:
+        _patch_preview_read_allocation(
+            _entry(plan, sequence),
+            request_len=0,
+            drains_scan=False,
+        )
+
+    geometry = _derive_index_geometry(plan)
+    if (
+        geometry.native_height != native_height
+        or geometry.height != decoded_height
+        or geometry.expected_stream_bytes != expected_stream_bytes
+    ):
+        raise ProtocolError("37-record preview binding failed geometry verification")
+    return PreviewTraversalBinding(
+        geometry=geometry,
+        active_read_sequences=active_read_sequences,
+        skipped_read_sequences=skipped_read_sequences,
+        startup_records=SHORT_FULL_ROLL_FRAME_TABLE_RECORDS,
+        mode="canonical-prefix-37-record",
     )
 
 
@@ -2323,6 +2854,11 @@ def _perform_ready_group(
     template = entries[-1]
     terminal_sense = template.get("expected_sense", "")
     allowed_senses = {entry.get("expected_sense", "") for entry in entries}
+    sequences = tuple(entry.get("seq") for entry in entries)
+    minimum_polls = (
+        len(entries) if sequences in PREVIEW_READY_CONFIRMATION_GROUPS else 1
+    )
+    confirmation_delays = PREVIEW_READY_CONFIRMATION_DELAYS_SECONDS.get(sequences)
     deadline = time.monotonic() + READY_POLL_DEADLINE_SECONDS
     polls = 0
     stalls = 0
@@ -2336,9 +2872,16 @@ def _perform_ready_group(
                 f"phase 0x{result.phase:02x} != expected "
                 f"0x{template.get('expected_phase'):02x}"
             )
-        if result.sense == terminal_sense:
+        if result.sense == terminal_sense and polls >= minimum_polls:
             _require_trace_result(template, result)
             return polls, stalls
+        if result.sense == terminal_sense:
+            # Preserve only Nikon's two proven preview-settle confirmation
+            # groups.  Every other traced TUR run remains state-aware and
+            # collapses as soon as its terminal state is observed.
+            assert confirmation_delays is not None
+            time.sleep(confirmation_delays[polls - 1])
+            continue
         if result.sense in additional_terminal_senses:
             # Callers may name a semantically safe terminal state that differs
             # from the oracle trace.  This is deliberately opt-in so a no-media
@@ -2495,7 +3038,10 @@ def _scan_lifecycle_after_transaction(
         if result.sense == "000000":
             return True, False
         return False, ready_required
-    if entry.get("seq") in DRAINED_SCAN_READ_SEQUENCES:
+    if (
+        entry.get("seq") in DRAINED_SCAN_READ_SEQUENCES
+        or entry.get("drains_scan") is True
+    ):
         # The scan data phase is fully drained.  Cleanup must wait for READY
         # and RELEASE, never send an idle CANCEL that could prevent release.
         return False, True
@@ -2600,6 +3146,38 @@ def _finish_fine_stream(
         }
 
 
+def _density_frame_ownership_receipt(
+    evidence: NikonDensityEvidence,
+    selection: LiveFrameSelection,
+    *,
+    batch_job: LiveBatchJob,
+    frame_index: int,
+    frame_capture_attempt_id: str,
+) -> dict[str, object]:
+    """Close preview ownership for one frame in an uninterrupted batch."""
+
+    if selection.reviewed_fingerprint_sha256 is None:
+        raise ProtocolError("density ownership has no reviewed roll identity")
+    if selection.fresh_fingerprint is None:
+        raise ProtocolError("density ownership has no fresh roll identity")
+    if selection.preview_sha256 != evidence.source_binding.wire_sha256:
+        raise ProtocolError("density ownership preview changed before frame binding")
+    receipt = build_nikon_density_frame_ownership(
+        evidence,
+        reservation_id=evidence.source_binding.session_id,
+        batch_session_id=batch_job.session_id,
+        transport_table_sha256=selection.table_sha256,
+        reviewed_fingerprint_sha256=selection.reviewed_fingerprint_sha256,
+        fresh_fingerprint_sha256=selection.fresh_fingerprint.binding_sha256,
+        frame_capture_attempt_id=frame_capture_attempt_id,
+        frame_index=frame_index,
+        frame_total=len(batch_job.frames),
+        selected_slots=batch_job.selected_slots,
+        selected_slot=selection.frame,
+    )
+    return receipt.to_dict()
+
+
 def _run_live_continuation_frame(
     ep_out: Any,
     ep_in: Any,
@@ -2614,9 +3192,19 @@ def _run_live_continuation_frame(
     batch_job: LiveBatchJob,
     frame_index: int,
     lifecycle: SessionLifecycle,
+    density_calibration: DensityCalibration,
+    density_evidence: NikonDensityEvidence,
+    actual_usb_bus: int,
+    actual_usb_address: int,
 ) -> dict[str, Any]:
     """Capture one later frame without reconnecting, reserving, or releasing."""
 
+    if density_calibration.session_id != batch_job.session_id:
+        raise ProtocolError(
+            "continuation density calibration is from another reservation"
+        )
+    if density_evidence.source_binding.session_id != batch_job.session_id:
+        raise ProtocolError("continuation density preview is from another reservation")
     target = validate_plan(plan)
     if continuation_plan_sha256 != CANONICAL_CONTINUATION_PLAN_SHA256:
         raise ProtocolError("continuation plan digest is not canonical")
@@ -2637,10 +3225,8 @@ def _run_live_continuation_frame(
 
     if (
         selection.frame != frame_spec.slot
-        or selection.requested_boundary_offset_rows
-        != frame_spec.boundary_offset_rows
-        or selection.applied_boundary_offset_rows
-        != frame_spec.boundary_offset_rows
+        or selection.requested_boundary_offset_rows != frame_spec.boundary_offset_rows
+        or selection.applied_boundary_offset_rows != frame_spec.boundary_offset_rows
     ):
         raise ProtocolError(
             "continuation frame does not match its prevalidated batch selection"
@@ -2659,6 +3245,13 @@ def _run_live_continuation_frame(
         "selected_slots": list(batch_job.selected_slots),
         "session_id": batch_job.session_id,
     }
+    density_ownership = _density_frame_ownership_receipt(
+        density_evidence,
+        selection,
+        batch_job=batch_job,
+        frame_index=frame_index,
+        frame_capture_attempt_id=output_path.parent.name,
+    )
     journal: dict[str, Any] = {
         "status": "starting",
         "plan": str(plan_path.resolve()),
@@ -2669,6 +3262,10 @@ def _run_live_continuation_frame(
         "meter_controller_sha256": _meter_controller_sha256(),
         "output": str(output_path.resolve()),
         "capture_mode": "full",
+        "expected_usb_bus": batch_job.expected_usb_bus,
+        "expected_usb_address": batch_job.expected_usb_address,
+        "actual_usb_bus": actual_usb_bus,
+        "actual_usb_address": actual_usb_address,
         "requested_frame": frame_spec.slot,
         "expected_frame_count": None,
         "requested_boundary_offset_rows": frame_spec.boundary_offset_rows,
@@ -2693,16 +3290,14 @@ def _run_live_continuation_frame(
             batch_job.reviewed_fingerprint.binding_sha256
         ),
         "batch_session": batch_identity,
+        "density_calibration_session_id": density_calibration.session_id,
         "session_reservation_retained": True,
         "unit_released": False,
+        "nikon_density_calibration": density_calibration.to_dict(),
+        "nikon_density_frame_ownership": density_ownership,
         "meter_evidence_path": str(meter_path.resolve()),
         "meter_observed_exposures_raw_10ns": [],
-        "meter_layout": {
-            "wire_colors": list(WIRE_METER_COLORS),
-            "controller_channels": list(CONTROLLER_CHANNELS),
-            "pass_count": len(METER_READ_GROUPS),
-            "group_bytes": METER_GROUP_BYTES,
-        },
+        "meter_layout": _meter_layout_receipt(),
         "meter_completed_reads": 0,
         "meter_completed_bytes": 0,
         "meter_pass_exposures_raw_10ns": [],
@@ -2740,9 +3335,7 @@ def _run_live_continuation_frame(
             for step in steps:
                 if step.code == "R":
                     journal["current_command"] = {
-                        "seq": (
-                            f"{step.entries[0]['seq']}..{step.entries[-1]['seq']}"
-                        ),
+                        "seq": (f"{step.entries[0]['seq']}..{step.entries[-1]['seq']}"),
                         "name": "TEST_UNIT_READY group",
                         "cdb": step.entries[0]["cdb"],
                     }
@@ -2772,9 +3365,7 @@ def _run_live_continuation_frame(
                         )
                     preflight = _validate_live_fine_windows(
                         [
-                            bytes.fromhex(
-                                _entry(active_plan, item).get("data_out", "")
-                            )
+                            bytes.fromhex(_entry(active_plan, item).get("data_out", ""))
                             for item in DYNAMIC_WINDOW_GROUPS[-1]
                         ],
                         expected_origin=selection.selected.native_origin,
@@ -2789,9 +3380,7 @@ def _run_live_continuation_frame(
                             ],
                             "resolution": [window["resx"], window["resy"]],
                             "size": [window["width"], window["height"]],
-                            "samples": (
-                                window["samples_per_scan_minus1_nibble"] + 1
-                            ),
+                            "samples": (window["samples_per_scan_minus1_nibble"] + 1),
                             "exposure_raw_10ns": window["exposure_raw_10ns"],
                         }
                         for window in preflight
@@ -2840,9 +3429,7 @@ def _run_live_continuation_frame(
                             for window in (
                                 decode_window_block(
                                     bytes.fromhex(
-                                        _entry(active_plan, item).get(
-                                            "data_out", ""
-                                        )
+                                        _entry(active_plan, item).get("data_out", "")
                                     )
                                 )
                                 for item in DYNAMIC_WINDOW_GROUPS[group_index]
@@ -2859,9 +3446,7 @@ def _run_live_continuation_frame(
                             for window in observed
                         }
                         meter_commanded_wire[group_index] = observed_wire
-                        observed_named = _controller_exposures_from_wire(
-                            observed_wire
-                        )
+                        observed_named = _controller_exposures_from_wire(observed_wire)
                         observed_wire_json = {
                             str(color): exposure
                             for color, exposure in observed_wire.items()
@@ -2982,12 +3567,10 @@ def _run_live_continuation_frame(
                                 or final_result.final_exposures is None
                             ):
                                 codes = ", ".join(
-                                    refusal.code
-                                    for refusal in final_result.refusals
+                                    refusal.code for refusal in final_result.refusals
                                 )
                                 raise SynchronizedProtocolError(
-                                    "meter pass 3 final controller refused: "
-                                    f"{codes}"
+                                    f"meter pass 3 final controller refused: {codes}"
                                 )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
@@ -3009,10 +3592,7 @@ def _run_live_continuation_frame(
                             _write_journal(journal_path, journal)
 
                     if sequence == METER_STOP_SEQUENCE:
-                        if any(
-                            size != METER_GROUP_BYTES
-                            for size in meter_group_bytes
-                        ):
+                        if any(size != METER_GROUP_BYTES for size in meter_group_bytes):
                             raise SynchronizedProtocolError(
                                 f"meter groups have sizes {meter_group_bytes}"
                             )
@@ -3183,6 +3763,8 @@ def run_live_capture(
     meter_only: bool = False,
     preview_only: bool = False,
     expected_frame_count: int | None = None,
+    expected_usb_bus: int | None = None,
+    expected_usb_address: int | None = None,
     batch_job: LiveBatchJob | None = None,
     continuation_plan: dict[str, Any] | None = None,
     continuation_plan_sha256: str | None = None,
@@ -3212,9 +3794,15 @@ def run_live_capture(
         if batch_job.plan_sha256 != plan_sha256:
             raise ProtocolError("live batch plan digest does not match its job")
         if batch_job.continuation_plan_sha256 != continuation_plan_sha256:
-            raise ProtocolError(
-                "live batch continuation digest does not match its job"
-            )
+            raise ProtocolError("live batch continuation digest does not match its job")
+        if expected_usb_bus is None and expected_usb_address is None:
+            expected_usb_bus = batch_job.expected_usb_bus
+            expected_usb_address = batch_job.expected_usb_address
+        elif (
+            expected_usb_bus != batch_job.expected_usb_bus
+            or expected_usb_address != batch_job.expected_usb_address
+        ):
+            raise ProtocolError("live batch USB topology does not match its job")
         derive_equivalent_continuation_blocks(continuation_plan)
         first_spec = batch_job.frames[0]
         if (
@@ -3244,6 +3832,18 @@ def run_live_capture(
     if preview_only and expected_frame_count is not None:
         raise ProtocolError(
             "preview-only capture does not accept an expected frame count"
+        )
+    if (expected_usb_bus is None) != (expected_usb_address is None):
+        raise ProtocolError("expected USB bus and address are inseparable")
+    if expected_usb_bus is not None:
+        if not 0 <= expected_usb_bus <= 999:
+            raise ProtocolError("expected USB bus must be in 0..999")
+        assert expected_usb_address is not None
+        if not 1 <= expected_usb_address <= 127:
+            raise ProtocolError("expected USB address must be in 1..127")
+    if not preview_only and not batch_mode and expected_usb_bus is None:
+        raise ProtocolError(
+            "live full and meter capture require exact USB bus and address"
         )
     if expected_frame_count is not None and (
         isinstance(expected_frame_count, bool) or not 2 <= expected_frame_count <= 40
@@ -3278,6 +3878,11 @@ def run_live_capture(
         if preview_only
         else (METER_CAPTURE_BYTES if meter_only else read_count * target["request_len"])
     )
+    calibration_session_id = (
+        batch_job.session_id
+        if batch_job is not None
+        else f"single-reservation-{secrets.token_hex(16)}"
+    )
     free_bytes = shutil.disk_usage(output_path.parent).free
     required_free = expected_bytes + max(1_073_741_824, expected_bytes // 10)
     if free_bytes < required_free:
@@ -3297,6 +3902,10 @@ def run_live_capture(
         ),
         "requested_frame": frame,
         "expected_frame_count": expected_frame_count,
+        "expected_usb_bus": expected_usb_bus,
+        "expected_usb_address": expected_usb_address,
+        "actual_usb_bus": None,
+        "actual_usb_address": None,
         "requested_boundary_offset_rows": boundary_offset_rows,
         "applied_boundary_offset_rows": None,
         "resolved_lookup_row": None,
@@ -3311,6 +3920,7 @@ def run_live_capture(
         "completed_bytes": 0,
         "stall_recoveries": 0,
         "started_unix": time.time(),
+        "density_calibration_session_id": calibration_session_id,
     }
     session_journal: dict[str, Any] | None = None
     frame_journal_finalized = False
@@ -3346,6 +3956,7 @@ def run_live_capture(
         session_journal = {
             "status": "capturing",
             "session_id": batch_job.session_id,
+            "density_calibration_session_id": calibration_session_id,
             "selected_slots": list(batch_job.selected_slots),
             "completed_slots": [],
             "active_frame_index": 1,
@@ -3366,6 +3977,10 @@ def run_live_capture(
             "reviewed_roll_fingerprint_sha256": (
                 batch_job.reviewed_fingerprint.binding_sha256
             ),
+            "expected_usb_bus": expected_usb_bus,
+            "expected_usb_address": expected_usb_address,
+            "actual_usb_bus": None,
+            "actual_usb_address": None,
             "reservation_acquired": False,
             "unit_release_attempts": 0,
             "unit_released": False,
@@ -3388,8 +4003,38 @@ def run_live_capture(
     ready_required = False
     meter_output = None
     fine_stream: FineStreamSession | None = None
+    density_calibration_reads: list[DensityCalibrationRead] = []
+    density_calibration: DensityCalibration | None = None
+    density_evidence: NikonDensityEvidence | None = None
     try:
-        device, interface, ep_out, ep_in, usb_util = _connect_device()
+        if expected_usb_bus is None:
+            device, interface, ep_out, ep_in, usb_util = _connect_device()
+        else:
+            device, interface, ep_out, ep_in, usb_util = _connect_device(
+                expected_usb_bus=expected_usb_bus,
+                expected_usb_address=expected_usb_address,
+            )
+        actual_usb_bus = getattr(device, "bus", None)
+        actual_usb_address = getattr(device, "address", None)
+        if expected_usb_bus is not None and (
+            isinstance(actual_usb_bus, bool)
+            or not isinstance(actual_usb_bus, int)
+            or isinstance(actual_usb_address, bool)
+            or not isinstance(actual_usb_address, int)
+            or actual_usb_bus != expected_usb_bus
+            or actual_usb_address != expected_usb_address
+        ):
+            raise ProtocolError(
+                "connected Nikon LS-5000 did not report the exact requested USB "
+                "topology"
+            )
+        journal["actual_usb_bus"] = actual_usb_bus
+        journal["actual_usb_address"] = actual_usb_address
+        if session_journal is not None:
+            assert session_journal_path is not None
+            session_journal["actual_usb_bus"] = actual_usb_bus
+            session_journal["actual_usb_address"] = actual_usb_address
+            _write_journal(session_journal_path, session_journal)
         journal["status"] = "preamble"
         journal["endpoint_out"] = f"0x{ep_out.bEndpointAddress:02x}"
         journal["endpoint_in"] = f"0x{ep_in.bEndpointAddress:02x}"
@@ -3401,9 +4046,17 @@ def run_live_capture(
             active_plan = [dict(entry) for entry in plan]
             preamble = active_plan[:-1]
             geometry = _derive_index_geometry(active_plan)
+            preview_binding = PreviewTraversalBinding(
+                geometry=geometry,
+                active_read_sequences=PREVIEW_READ_SEQUENCES,
+                skipped_read_sequences=(),
+                startup_records=FIXED_PREVIEW_FRAME_TABLE_RECORDS,
+                mode="pending-startup-table",
+            )
             entry_index = 0
             fine_window_payloads: list[bytes] = []
             preview_window_payloads: list[bytes] = []
+            preview_windows: list[WindowBlock] | None = None
             meter_window_payloads: list[list[bytes]] = [
                 [] for _group in METER_GET_WINDOW_GROUPS
             ]
@@ -3427,6 +4080,9 @@ def run_live_capture(
             output_sha256 = hashlib.sha256()
             while entry_index < len(preamble):
                 entry = preamble[entry_index]
+                if entry.get("preview_skipped") is True:
+                    entry_index += 1
+                    continue
                 if entry["seq"] == DYNAMIC_WINDOW_GROUPS[-1][0]:
                     if not final_controller_accepted:
                         raise SynchronizedProtocolError(
@@ -3529,6 +4185,29 @@ def run_live_capture(
                 if entry["seq"] == 1:
                     _validate_scanner_identity(result.payload)
                     journal["scanner_identity"] = "Nikon LS-5000 ED 1.03"
+                if entry["seq"] in DENSITY_CALIBRATION_SEQUENCES:
+                    density_calibration_reads.append(
+                        decode_density_calibration_read(
+                            bytes.fromhex(entry["cdb"]),
+                            result.payload,
+                        )
+                    )
+                    if entry["seq"] == DENSITY_CALIBRATION_SEQUENCES[-1]:
+                        density_calibration = assemble_density_calibration(
+                            density_calibration_reads,
+                            session_id=calibration_session_id,
+                        )
+                        calibration_payload = density_calibration.to_dict()
+                        journal["nikon_density_calibration"] = calibration_payload
+                        if (
+                            session_journal is not None
+                            and session_journal_path is not None
+                        ):
+                            session_journal["nikon_density_calibration"] = (
+                                calibration_payload
+                            )
+                            _write_journal(session_journal_path, session_journal)
+                        _write_journal(journal_path, journal)
                 if entry["seq"] == 17:
                     reserved = True
                     if session_journal is not None and session_journal_path is not None:
@@ -3539,8 +4218,21 @@ def run_live_capture(
                         result.payload
                     )
                     journal["live_startup_0x8f"] = startup_table
+                    journal["live_startup_0x8f_payload_hex"] = result.payload.hex()
+                    journal["live_startup_0x8f_status"] = result.status.hex()
+                    journal["live_startup_0x8f_short_underrun_accepted"] = (
+                        result.status == VARIABLE_FRAME_TABLE_SHORT_STATUS
+                    )
+                    preview_binding = _bind_preview_to_startup_table(
+                        active_plan,
+                        result.payload,
+                        result.status,
+                        geometry,
+                    )
+                    geometry = preview_binding.geometry
+                    journal["live_preview_binding"] = preview_binding.receipt()
                     _write_journal(journal_path, journal)
-                if entry["seq"] in (115, 116, 117):
+                if entry["seq"] in PREVIEW_GET_WINDOW_SEQUENCES:
                     preview_window_payloads.append(result.payload)
                     if entry["seq"] == 117:
                         preview_windows = _validate_live_preview_windows(
@@ -3556,6 +4248,9 @@ def run_live_capture(
                                 ],
                                 "size": [window["width"], window["height"]],
                                 "bit_depth": window["bit_depth"],
+                                "density_f03_exposure_raw_10ns": window[
+                                    "exposure_raw_10ns"
+                                ],
                             }
                             for window in preview_windows
                         ]
@@ -3586,16 +4281,36 @@ def run_live_capture(
                         raise SynchronizedProtocolError(
                             "command 172 completed without a live 0x8e table"
                         )
-                    if len(preview_data) != EXPECTED_PREVIEW_BYTES:
+                    if len(preview_data) != geometry.expected_stream_bytes:
                         raise SynchronizedProtocolError(
                             f"live preview has {len(preview_data)} bytes, expected "
-                            f"{EXPECTED_PREVIEW_BYTES}"
+                            f"{geometry.expected_stream_bytes}"
                         )
                     preview_bytes = bytes(preview_data)
                     preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
                     table_sha256 = hashlib.sha256(live_sub_8e_table).hexdigest()
                     _write_bytes_exclusive(artifact_paths["preview"], preview_bytes)
                     _write_bytes_exclusive(artifact_paths["table"], live_sub_8e_table)
+                    if density_calibration is None or preview_windows is None:
+                        raise SynchronizedProtocolError(
+                            "density source completed without calibration/exposure evidence"
+                        )
+                    density_scan_identity = (
+                        f"{calibration_session_id}:density-97dpi:{preview_sha256}"
+                    )
+                    density_evidence = build_nikon_density_evidence(
+                        preview_bytes,
+                        calibration=density_calibration,
+                        density_f03_exposures_raw_10ns=tuple(
+                            window["exposure_raw_10ns"] for window in preview_windows
+                        ),
+                        session_id=calibration_session_id,
+                        capture_attempt_id=output_path.parent.name,
+                        scan_identity=density_scan_identity,
+                        source_native_height=geometry.native_height,
+                        source_height=geometry.height,
+                    )
+                    density_receipt = density_evidence.to_dict()
                     journal["live_index_evidence"] = {
                         "status": "persisted-before-frame-detection",
                         "preview_bytes": len(preview_bytes),
@@ -3603,6 +4318,18 @@ def run_live_capture(
                         "table_bytes": len(live_sub_8e_table),
                         "table_sha256": table_sha256,
                     }
+                    journal["nikon_density_evidence"] = density_receipt
+                    if session_journal is not None and session_journal_path is not None:
+                        session_journal["nikon_density_evidence"] = density_receipt
+                        session_journal["nikon_density_preview_identity"] = {
+                            "reservation_id": calibration_session_id,
+                            "batch_session_id": calibration_session_id,
+                            "preview_sha256": preview_sha256,
+                            "preview_identity_sha256": (
+                                density_evidence.preview_identity_sha256
+                            ),
+                        }
+                        _write_journal(session_journal_path, session_journal)
                     _write_journal(journal_path, journal)
                     if preview_only:
                         if startup_table is None:
@@ -3620,6 +4347,12 @@ def run_live_capture(
                             "table_bytes": len(live_sub_8e_table),
                             "table_sha256": table_sha256,
                             "frame_detection": "deferred-offline",
+                            "startup_table": {
+                                "count": startup_table["count"],
+                                "sha256": startup_table["sha256"],
+                                "status": journal["live_startup_0x8f_status"],
+                            },
+                            "preview_binding": preview_binding.receipt(),
                         }
                         _write_json_exclusive(
                             artifact_paths["mapping"], preview_receipt
@@ -3640,9 +4373,7 @@ def run_live_capture(
                                 preview_bytes,
                                 live_sub_8e_table,
                                 batch_job.frames,
-                                reviewed_fingerprint=(
-                                    batch_job.reviewed_fingerprint
-                                ),
+                                reviewed_fingerprint=(batch_job.reviewed_fingerprint),
                             )
                             live_selection = batch_selections[0]
                             journal["batch_prevalidated_frame_selections"] = [
@@ -3704,36 +4435,37 @@ def run_live_capture(
                     for sequence in range(FRAME_TABLE_SEND_SEQUENCE, 608):
                         active_plan[sequence - 1].clear()
                         active_plan[sequence - 1].update(bound_plan[sequence - 1])
-                    _write_json_exclusive(
-                        artifact_paths["mapping"], live_selection.diagnostics()
-                    )
-                    journal["live_frame_selection"] = live_selection.diagnostics()
-                    journal["meter_observed_exposures_raw_10ns"] = []
-                    journal["meter_layout"] = {
-                        "passes": 3,
-                        "rows_per_pass": 425,
-                        "columns": 281,
-                        "decoded_raster_channel_order": ["R", "G", "B", "IR"],
-                        "wire_window_color_order": list(WIRE_METER_COLORS),
-                        "wire_color_to_controller_channel": {
-                            str(color): channel
-                            for color, channel in (
-                                WIRE_COLOR_TO_CONTROLLER_CHANNEL.items()
-                            )
-                        },
-                        "sample_byte_order": "big-endian-u16",
-                        "row_core_bytes": 2_248,
-                        "row_stride_bytes": 2_560,
-                        "row_tail_bytes": 312,
+                    selection_receipt = live_selection.diagnostics()
+                    selection_receipt["startup_table"] = {
+                        "count": startup_table["count"],
+                        "sha256": startup_table["sha256"],
+                        "status": journal["live_startup_0x8f_status"],
                     }
+                    selection_receipt["preview_binding"] = preview_binding.receipt()
+                    _write_json_exclusive(
+                        artifact_paths["mapping"],
+                        selection_receipt,
+                    )
+                    journal["live_frame_selection"] = selection_receipt
+                    if batch_mode:
+                        assert batch_job is not None
+                        journal["nikon_density_frame_ownership"] = (
+                            _density_frame_ownership_receipt(
+                                density_evidence,
+                                live_selection,
+                                batch_job=batch_job,
+                                frame_index=1,
+                                frame_capture_attempt_id=output_path.parent.name,
+                            )
+                        )
+                    journal["meter_observed_exposures_raw_10ns"] = []
+                    journal["meter_layout"] = _meter_layout_receipt()
                     journal["meter_completed_reads"] = 0
                     journal["meter_completed_bytes"] = 0
                     journal["meter_pass_exposures_raw_10ns"] = []
                     journal["meter_pass_commanded_exposures"] = []
                     meter_controller_proposals.clear()
-                    journal["meter_controller_proposals"] = (
-                        meter_controller_proposals
-                    )
+                    journal["meter_controller_proposals"] = meter_controller_proposals
                     journal["meter_controller_seed"] = {
                         "controller_channels_raw_10ns": dict(DEFAULT_EXPOSURES),
                         "wire_colors_raw_10ns": {
@@ -4060,7 +4792,9 @@ def run_live_capture(
                             f"short file write {written} of {len(result.payload)} bytes"
                         )
                     output_sha256.update(result.payload)
-                    fine_stream = _submit_fine_stream_record(fine_stream, result.payload)
+                    fine_stream = _submit_fine_stream_record(
+                        fine_stream, result.payload
+                    )
                     journal["completed_reads"] = read_index + 1
                     journal["completed_bytes"] += len(result.payload)
                     journal["stall_recoveries"] += result.stall_recoveries
@@ -4100,6 +4834,10 @@ def run_live_capture(
             raw_sha256=journal["output_sha256"],
             raw_bytes=expected_bytes,
         )
+        if density_calibration is None:
+            raise SynchronizedProtocolError(
+                "capture completed without the RGB READ(0x8c) calibration"
+            )
         if batch_mode:
             assert batch_job is not None
             assert continuation_plan is not None
@@ -4108,8 +4846,9 @@ def run_live_capture(
             assert session_journal_path is not None
             if (
                 live_sub_8e_table is None
-                or len(preview_data) != EXPECTED_PREVIEW_BYTES
+                or len(preview_data) != geometry.expected_stream_bytes
                 or batch_selections is None
+                or density_evidence is None
             ):
                 raise SynchronizedProtocolError(
                     "batch first frame lost its retained roll-index evidence"
@@ -4177,6 +4916,10 @@ def run_live_capture(
                         batch_job=batch_job,
                         frame_index=frame_index,
                         lifecycle=batch_lifecycle,
+                        density_calibration=density_calibration,
+                        density_evidence=density_evidence,
+                        actual_usb_bus=actual_usb_bus,
+                        actual_usb_address=actual_usb_address,
                     )
                     completed_slots.append(frame_spec.slot)
                     session_journal.update(
@@ -4362,6 +5105,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="one-process/one-reservation ordered frame job",
     )
     parser.add_argument(
+        "--expected-batch-job-sha256",
+        help="parent-pinned SHA-256 of the exact batch job bytes",
+    )
+    parser.add_argument(
         "--continuation-plan",
         type=Path,
         help="pinned later-frame continuation recipe required by --batch-job",
@@ -4412,6 +5159,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             "candidate-slot geometry"
         ),
     )
+    parser.add_argument(
+        "--expected-usb-bus",
+        type=int,
+        help="exact local USB bus parsed from the reviewed SANE device id",
+    )
+    parser.add_argument(
+        "--expected-usb-address",
+        type=int,
+        help="exact local USB address parsed from the reviewed SANE device id",
+    )
+    parser.add_argument(
+        "--expected-capture-bundle-sha256",
+        help="parent-pinned packaged capture bundle identity for this live child",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--meter-only",
@@ -4445,6 +5206,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         value is not None
         for value in (
             args.batch_job,
+            args.expected_batch_job_sha256,
             args.continuation_plan,
             args.session_journal,
         )
@@ -4454,12 +5216,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             value is None
             for value in (
                 args.batch_job,
+                args.expected_batch_job_sha256,
                 args.continuation_plan,
                 args.session_journal,
             )
         ):
             raise ProtocolError(
-                "--batch-job, --continuation-plan, and --session-journal are inseparable"
+                "--batch-job, --expected-batch-job-sha256, --continuation-plan, "
+                "and --session-journal are inseparable"
             )
         if (
             args.output is not None
@@ -4467,6 +5231,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             or args.frame is not None
             or args.boundary_offset_rows != 0
             or args.expected_frame_count is not None
+            or args.expected_usb_bus is not None
+            or args.expected_usb_address is not None
             or args.meter_only
             or args.preview_only
             or args.confirm_full_capture
@@ -4475,14 +5241,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "batch capture owns frame, output, journal, and mode arguments"
             )
         continuation_payload = args.continuation_plan.read_bytes()
-        continuation_plan_sha256 = hashlib.sha256(
-            continuation_payload
-        ).hexdigest()
-        continuation_plan = verify_canonical_continuation_plan(
-            continuation_payload
-        )
+        continuation_plan_sha256 = hashlib.sha256(continuation_payload).hexdigest()
+        continuation_plan = verify_canonical_continuation_plan(continuation_payload)
         batch_job = load_validated_batch_job(
             args.batch_job,
+            expected_job_sha256=args.expected_batch_job_sha256,
             expected_plan_sha256=plan_sha256,
             expected_continuation_sha256=continuation_plan_sha256,
         )
@@ -4502,6 +5265,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not args.live:
             print("dry run only; scanner was not accessed")
             return
+        _verify_live_capture_bundle(
+            plan_path=args.plan,
+            manifest_path=args.manifest,
+            plan_sha256=plan_sha256,
+            expected_bundle_sha256=args.expected_capture_bundle_sha256,
+        )
         output.parent.mkdir(parents=False, exist_ok=False)
         run_live_capture(
             plan,
@@ -4516,6 +5285,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             continuation_plan=continuation_plan,
             continuation_plan_sha256=continuation_plan_sha256,
             session_journal_path=args.session_journal,
+            expected_usb_bus=batch_job.expected_usb_bus,
+            expected_usb_address=batch_job.expected_usb_address,
         )
         return
     if args.preview_only and args.frame is not None:
@@ -4561,6 +5332,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not args.live:
         print("dry run only; scanner was not accessed")
         return
+    _verify_live_capture_bundle(
+        plan_path=args.plan,
+        manifest_path=args.manifest,
+        plan_sha256=plan_sha256,
+        expected_bundle_sha256=args.expected_capture_bundle_sha256,
+    )
     run_live_capture(
         plan,
         args.plan,
@@ -4573,6 +5350,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         meter_only=args.meter_only,
         preview_only=args.preview_only,
         expected_frame_count=args.expected_frame_count,
+        expected_usb_bus=args.expected_usb_bus,
+        expected_usb_address=args.expected_usb_address,
     )
 
 

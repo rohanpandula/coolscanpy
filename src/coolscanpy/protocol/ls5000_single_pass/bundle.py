@@ -23,15 +23,20 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # ``packed.py`` (the shared decode kernel and streaming decoder) and
 # ``streaming_sidecar.py`` (the fail-open capture hook) are pinned because the
 # capture worker imports them at runtime, so their bytes are part of the
-# scanner-facing capture identity.
+# scanner-facing capture identity. ``density.py`` is pinned for the same
+# reason: it validates the acquisition-specific READ(0x8c) replies, the
+# density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
+# evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
-    "capture_process.py": "6fdc34056c077269cba963a643f103b6a0487ac011c7afca031d3ae44a4bbd5a",
-    "worker.py": "30294ae72265b29f0f951f6d5b5dca36226e9b6861e6bad1e9c11670e22625bb",
+    "capture_process.py": "6d452ee52ad04ed0039365017b2c6bd4e3323e61f1b6a5f1cc2f78e2e4fb0b14",
+    "worker.py": "dcea2491d7652ed85f2ccab95109c0764a95ea6caf4e4a0fdb32acc9eec96c7c",
+    "usb_backend.py": "a1cee3db705afa0067e5866b3efe520c743b09f444f2b8024b72b84ac0cd6932",
+    "density.py": "15838dc24c2f39058447ef73cea74f8cafa48420b45175632c97ed48c062b15b",
     "packed.py": "aae6707216d8ed50c12dc7859b78c7331150fd3cde074fb9bf9c60938dd3604f",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "c7d00c9c8796b7264a553848106a1fe075ab4a25315fbe5a05d05bc35515ca10",
-    "roll_index.py": "5cec9535322847e34aa980ace0f91f589579486464c68be643bd9910ae90d252",
+    "roll_index.py": "48bfab350a5b26a6adf26d521acf85d4e9ad6d7f57b3116f61c6a31e6569cff7",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (
@@ -61,9 +66,7 @@ def canonical_manifest_bytes() -> bytes:
     """Return the bundled Nikon wire manifest after validating its plan binding."""
 
     payload = files(DATA_PACKAGE).joinpath(CANONICAL_MANIFEST_FILENAME).read_bytes()
-    expected = CAPTURE_BUNDLE_COMPONENT_SHA256[
-        f"data/{CANONICAL_MANIFEST_FILENAME}"
-    ]
+    expected = CAPTURE_BUNDLE_COMPONENT_SHA256[f"data/{CANONICAL_MANIFEST_FILENAME}"]
     actual = _sha256(payload)
     if actual != expected:
         raise CaptureBundleIntegrityError(
@@ -75,7 +78,10 @@ def canonical_manifest_bytes() -> bytes:
         raise CaptureBundleIntegrityError(
             f"canonical capture manifest is not valid JSON: {error}"
         ) from error
-    if not isinstance(manifest, dict) or manifest.get("plan_sha256") != CANONICAL_PLAN_SHA256:
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("plan_sha256") != CANONICAL_PLAN_SHA256
+    ):
         raise CaptureBundleIntegrityError(
             "canonical capture manifest is not bound to the packaged replay plan"
         )

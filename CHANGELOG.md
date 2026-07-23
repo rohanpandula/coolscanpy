@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+Full-roll transport mapping now permits the directly observed Nikon leading
+record to differ by up to five 97-dpi preview rows from the independently
+fitted interior traversal. A live 36-frame reservation produced a 3.924-row
+leader residual while its 33 interior anchors remained tightly consistent
+(0.275-row MAE, 1.161-row maximum); the former three-row leader cap therefore
+refused before frame binding despite clean same-traversal evidence. The wider
+cap applies only to the excluded leading record. Interior scale, MAE, maximum
+residual, monotonicity, exact live-table provenance, and manual-review gates
+remain unchanged, and a leader beyond five rows still fails closed.
+
+Whole-roll preview now binds its motion window and USB read allocation to a
+validated complete 37-record startup table. The Nikon 40-record trace uses a
+native height of `42 * 5959`; the observed full-roll response omits the last
+three records, so the bound preview uses `39 * 5959`, decodes 5,668 complete
+rows, reads exactly 5,804,032 bytes, and marks that shorter final read as the
+scan drain boundary. The original 40-record plan remains byte-for-byte
+unchanged. Both Nikon's archived prefix and live position-bearing tables are
+accepted, but live records must reproduce Nikon's transport-coordinate
+identity, remain strictly increasing and in range, and follow the proven
+selector cadence. Any other short count, status, record shape, odd row
+geometry, or non-contiguous read allocation still refuses before the first
+preview `SET_WINDOW`. Nikon-density evidence, offline replay, and the durable
+preview/frame mapping receipt carry the exact whitelisted preview geometry, so
+a 37-record traversal remains independently size- and identity-verifiable.
+
+`Device.roll()` now accepts an optional caller-owned `attempts_root`. Evidence
+written below that directory survives `Roll.close()`, including failed-preview
+rasters, live `0x8e` transport tables, and journals needed for offline
+diagnosis. Omitting the argument preserves the temporary self-cleaning
+behavior. This closes an evidence-loss path in which a synchronized refusal
+was recorded and then removed during otherwise successful cleanup.
+
+Short-strip transport mapping now recognizes Nikon's contiguous terminal
+`0x81xx`/`0x83xx` table suffix after the film leaves the drive. Those records
+are excluded from the affine anchor fit and are unconditionally
+scanner-nonaddressable: manual approval and boundary offsets cannot put one
+back into `SEND(0x8f)`. The physical `40..45` scale and anchor-residual gates
+remain unchanged. This prevents a terminal slot from pulling an otherwise
+valid six-strip fit from about `42.33` to the observed false `61.34` scale.
+
+Continuation frames now record the same complete 285-dpi analyzer layout as
+the first frame, allowing their durable meter sidecars to pass Nikon-exact
+publication validation in multi-frame batches.
+
 0.1.3's live-table-vs-fingerprint frame count check broke full-roll scanning.
 A batch run over slots 3 and 20 of a reviewed 36-exposure roll failed with
 a `RollMismatch` reporting a live table of 37 scanner-addressable records
@@ -104,12 +148,18 @@ count is also checked against the fingerprint's frame count, tolerating a
 difference of one for a trailing sliver that crosses the 16-row
 visual-signing threshold between traversals.
 
-A preview traversal of a short strip parks the transport at its physical
-end-stop. The next fine-scan attempt's fresh index read then fails with a
-non-zero status on command 64. That failure now raises a new
-`RefeedRequired` instead of a generic protocol error, with a message
-telling the operator to pull the strip out, reinsert it until the feeder
-grips, and retry the batch. No automatic eject or retry is attempted.
+The tested LS-5000/SA-21 can return a complete shorter startup `0x8f`
+frame-table envelope with status `022b4b` after a preview traversal. That
+status is the observed completion for the shorter transfer, not proof that
+the transport requires a refeed. It is now accepted only when the
+self-declared envelope is valid and shorter than the 40-slot request; the
+fresh live `0x8e` index and preview still independently bind roll identity
+and frame addressability before fine scanning. Malformed, full-length, and
+differently failed replies remain fail-closed.
+
+`RefeedRequired` remains exported for compatibility, but generic command-64
+status text is no longer translated into it without a separately confirmed
+physical refeed condition.
 
 ## 0.1.2
 

@@ -41,6 +41,8 @@ from coolscanpy.types import (
     Capabilities,
     ClippingTelemetry,
     DeviceInfo,
+    DigitalIceAcquisition,
+    DigitalIceAcquisitionEvidence,
     ExposureVector,
     FingerprintComparison,
     FocusDetailTelemetry,
@@ -55,6 +57,7 @@ from coolscanpy.types import (
     SplitAlignment,
     Thumbnail,
     TransportSmearAssessment,
+    build_digital_ice_acquisition_evidence,
 )
 
 __all__ = [
@@ -69,6 +72,8 @@ __all__ = [
     "OptionUnit",
     "Capabilities",
     "DeviceInfo",
+    "DigitalIceAcquisition",
+    "DigitalIceAcquisitionEvidence",
     # roll extension
     "Roll",
     "Material",
@@ -86,6 +91,7 @@ __all__ = [
     "TransportSmearAssessment",
     "ArtifactEvidence",
     "ApprovalReceipt",
+    "build_digital_ice_acquisition_evidence",
     # exceptions
     "PyCoolscanError",
     "DeviceNotFound",

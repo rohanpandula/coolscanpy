@@ -185,6 +185,11 @@ sugar for scanning one slot. Calling `roll.safe_stop()` from another thread
 lets the frame in flight finish normally; the next one raises
 `SafeStopRequested` instead of starting.
 
+For live diagnostics or acceptance runs, pass an absolute caller-owned
+directory as `dev.roll(attempts_root=...)`. Preview rasters, transport tables,
+journals, and capture scratch written there survive `Roll.close()` for offline
+verification. Omitting it retains the self-cleaning temporary default.
+
 ## Hardware support
 
 Tested: Nikon Super Coolscan 5000 ED (LS-5000), firmware 1.03, with an SA-21
@@ -200,14 +205,30 @@ against other bodies are welcome, and an LS-50 test is particularly wanted:
 its transport and optics differ from the LS-5000, and none of those
 differences are covered here yet.
 
-Strips shorter than a full roll work for preview and fine scanning. A preview
-traversal parks a short strip at the transport end-stop, so a batch run started
-right after a preview can raise `RefeedRequired`. Pull the strip out, reinsert
-it until the feeder grips, and run the batch again.
+On the tested LS-5000/SA-21, startup `READ(0x8f)` can return a complete
+self-declared shorter frame-table envelope with the observed `022b4b`
+data-underrun status. coolscanpy accepts that status only when the envelope is
+valid and shorter than the requested 40-slot maximum. The observed exact
+37-record canonical prefix is also bound to a matching shorter preview window
+and read allocation; the canonical 40-record path is unchanged. Every other
+short count, changed record prefix, malformed envelope, full-length underrun,
+or differently failed response still refuses before motion. The later live
+`0x8e` index and preview independently validate roll identity and frame
+addressability before any fine scan. If the live transport table has already
+entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain
+visible for review but are deliberately not scanner-addressable on that
+insertion.
 
-The converted SA-21 can park a strip after an unknown idle interval, and the
-transport will not wake from that parked state. A stall in the transport-index
-read means the feeder parked; refeed rather than retry.
+Strips shorter than a full roll work for preview and fine scanning. A preview
+traversal can park a short strip at the transport end-stop, so a batch run
+started right after a preview can raise `RefeedRequired`. Pull the strip out,
+reinsert it until the feeder grips, and run the batch again. Treat that refeed
+as a new registration.
+
+The converted SA-21 can park or eject a strip after an uncharacterized idle
+interval. Start the intended capture promptly after feeding. A transport-index
+stall or refusal is a stop condition: preserve the evidence, establish the
+physical media state, and do not retry the same insertion.
 
 ## Relationship to NegPy
 

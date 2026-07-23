@@ -450,6 +450,83 @@ def test_batch_finalization_refuses_unproven_roll_or_manual_review_evidence(
     assert stream.is_file()
 
 
+def test_batch_finalization_retains_valid_redundant_manual_review_approval(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["live_frame_selection"]["selected"].update(
+        automatic=True,
+        manual_review=False,
+        method="direct-gap-trailing-row",
+    )
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    completed = _workflow().finalize_attempt(attempt)
+
+    assert completed.scratch_deleted is True
+    assert not stream.exists()
+    manifest = json.loads(completed.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["frame_evidence"]["manual_review_approval"]["slot"] == 39
+
+
+@pytest.mark.parametrize(
+    "approval_change",
+    [
+        {"reviewed_fingerprint_sha256": "f" * 64},
+        {"slot": 38},
+        {"boundary_offset_rows": 1},
+    ],
+)
+def test_batch_finalization_refuses_unbound_redundant_manual_review_approval(
+    tmp_path: Path,
+    approval_change: dict[str, object],
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["live_frame_selection"]["selected"].update(
+        automatic=True,
+        manual_review=False,
+        method="direct-gap-trailing-row",
+    )
+    approval = ManualFrameApproval.from_payload(journal["manual_review_approval"])
+    journal["manual_review_approval"] = replace(
+        approval,
+        **approval_change,
+    ).to_payload()
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        SinglePassIntegrityError,
+        match="manual review approval does not bind",
+    ):
+        _workflow().finalize_attempt(attempt)
+
+    assert stream.is_file()
+
+
+def test_batch_finalization_refuses_tampered_redundant_manual_review_approval(
+    tmp_path: Path,
+) -> None:
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["live_frame_selection"]["selected"].update(
+        automatic=True,
+        manual_review=False,
+        method="direct-gap-trailing-row",
+    )
+    journal["manual_review_approval"]["binding_sha256"] = "0" * 64
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        SinglePassIntegrityError,
+        match="manual review approval is missing or malformed",
+    ):
+        _workflow().finalize_attempt(attempt)
+
+    assert stream.is_file()
+
+
 def test_batch_frame_refuses_missing_continuation_plan_provenance(
     tmp_path: Path,
 ) -> None:

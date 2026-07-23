@@ -28,6 +28,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from coolscanpy import _roll as roll_module
+from coolscanpy.capture.single_pass_workflow import (
+    SinglePassAttempt,
+    SinglePassFinalizationResult,
+    SinglePassSession,
+)
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import streaming_sidecar as sidecar_module
 from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import FineStreamSession
@@ -65,6 +71,27 @@ def _reviewed_fingerprint() -> ReviewedRollFingerprint:
     )
 
 
+def _density_calibration(session_id: str) -> worker_module.DensityCalibration:
+    reads = [
+        worker_module.decode_density_calibration_read(
+            bytes.fromhex(f"28008c000{color}0300000a80"),
+            bytes.fromhex(payload),
+        )
+        for color, payload in enumerate(
+            (
+                "8c20000000040000df1a",
+                "8c20000000040000bba4",
+                "8c200000000400007fab",
+            ),
+            start=1,
+        )
+    ]
+    return worker_module.assemble_density_calibration(
+        reads,
+        session_id=session_id,
+    )
+
+
 def _records_and_mapping() -> tuple[tuple[TransportRecord, ...], TransportMapping]:
     records = tuple(
         TransportRecord(
@@ -95,7 +122,7 @@ def _records_and_mapping() -> tuple[tuple[TransportRecord, ...], TransportMappin
             start=1,
         )
     )
-    return records, TransportMapping(6_000, 0.0, 42.0, 0.0, 0.0, origins)
+    return records, TransportMapping(6_000, 168.0, 42.0, 0.0, 0.0, origins)
 
 
 class RecordingStreamSession:
@@ -135,7 +162,11 @@ def _new_log() -> dict:
 
 
 def _patch_continuation_common(
-    monkeypatch: pytest.MonkeyPatch, plan: list[dict], *, fine_reads: int = 1
+    monkeypatch: pytest.MonkeyPatch,
+    plan: list[dict],
+    *,
+    fine_reads: int = 1,
+    full_meter_payload: bool = False,
 ) -> dict:
     canonical_target = worker_module.validate_plan(plan)
     tiny_target = {
@@ -145,8 +176,9 @@ def _patch_continuation_common(
         "request_parts": [1],
     }
     monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", fine_reads)
-    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
-    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    if not full_meter_payload:
+        monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+        monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
 
     accepted_proposal = SimpleNamespace(
@@ -159,7 +191,17 @@ def _patch_continuation_common(
         accepted=True,
         final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
         refusals=(),
-        to_dict=lambda: {"accepted": True},
+        to_dict=lambda: {
+            "accepted": True,
+            "final_exposures_raw_10ns": dict(worker_module.DEFAULT_EXPOSURES),
+            "steps": [
+                {
+                    "observation": {
+                        "exposures_raw_10ns": dict(worker_module.DEFAULT_EXPOSURES)
+                    }
+                }
+            ],
+        },
     )
     monkeypatch.setattr(worker_module, "observe_meter_pass", lambda *_a, **_k: object())
     monkeypatch.setattr(
@@ -182,6 +224,7 @@ def _drive_continuation(
     perform=None,
     fine_reads: int = 1,
     fail_fine_read_index: int | None = None,
+    full_meter_payload: bool = False,
 ) -> tuple[dict, worker_module.BatchFrameSpec]:
     """Run one continuation frame with the fake-USB harness; return its journal."""
 
@@ -222,11 +265,18 @@ def _drive_continuation(
         root,
         (first, second),
         _reviewed_fingerprint(),
+        1,
+        2,
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
     )
-    _patch_continuation_common(monkeypatch, plan, fine_reads=fine_reads)
+    _patch_continuation_common(
+        monkeypatch,
+        plan,
+        fine_reads=fine_reads,
+        full_meter_payload=full_meter_payload,
+    )
 
     def ready(_ep_out, _ep_in, entries, **_kwargs):
         return 1, 0
@@ -246,7 +296,13 @@ def _drive_continuation(
                 *worker_module.FINE_GET_WINDOW_SEQUENCES,
             ):
                 payload = bytes.fromhex(entry["expected_data_in"])
-            elif sequence in worker_module.METER_READ_SEQUENCES or sequence == 607:
+            elif sequence in worker_module.METER_READ_SEQUENCES:
+                payload = (
+                    b"\x12\x34" * (entry["request_len"] // 2)
+                    if full_meter_payload
+                    else b"x"
+                )
+            elif sequence == 607:
                 payload = b"x"
             else:
                 payload = bytes.fromhex(entry.get("expected_data_in", ""))
@@ -261,6 +317,14 @@ def _drive_continuation(
     monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
     monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
     monkeypatch.setattr(worker_module, "_open_fine_stream_session", open_session)
+    density_evidence = SimpleNamespace(
+        source_binding=SimpleNamespace(session_id=batch.session_id)
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
 
     journal = worker_module._run_live_continuation_frame(
         "out",
@@ -275,6 +339,10 @@ def _drive_continuation(
         batch_job=batch,
         frame_index=2,
         lifecycle=worker_module.SessionLifecycle(),
+        density_calibration=_density_calibration(batch.session_id),
+        density_evidence=density_evidence,
+        actual_usb_bus=1,
+        actual_usb_address=2,
     )
     return journal, second
 
@@ -296,6 +364,58 @@ def test_continuation_loop_wires_hook_and_binds_finish_to_raw_sha(
     assert len(log["sessions"]) == 1
     assert log["submit_calls"] == [(0, b"x")]
     assert log["finish_calls"] == [(0, hashlib.sha256(b"x").hexdigest(), 1)]
+
+
+def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal, second = _drive_continuation(
+        tmp_path,
+        monkeypatch,
+        open_session=lambda *_a: None,
+        full_meter_payload=True,
+    )
+    journal_payload = second.journal.read_bytes()
+    attempt = SinglePassAttempt(
+        session=SinglePassSession(root=tmp_path, session_id="continuation-consumer"),
+        attempt_id=second.output.parent.name,
+        directory=second.output.parent,
+        stream_path=second.output,
+        journal_path=second.journal,
+        selected_slot=second.slot,
+        worker_returncode=0,
+        boundary_offset_rows=second.boundary_offset_rows,
+    )
+    finalization = SinglePassFinalizationResult(
+        manifest_path=second.output.parent / "manifest.json",
+        output_paths={},
+        manifest={
+            "sources": {
+                "capture_journal": {
+                    "path": second.journal.name,
+                    "bytes": len(journal_payload),
+                    "sha256": hashlib.sha256(journal_payload).hexdigest(),
+                }
+            },
+            "exposure_evidence": {
+                "accepted_contract": journal["meter_final_exposures"]
+            },
+        },
+        resumed=False,
+        scratch_deleted=False,
+    )
+
+    meter_rgbi, final_rgb = roll_module._read_exact_analyzer_source(
+        attempt, finalization
+    )
+
+    assert meter_rgbi.shape == (425, 281, 4)
+    assert int(meter_rgbi[0, 0, 0]) == 0x1234
+    assert final_rgb == (
+        worker_module.DEFAULT_EXPOSURES["R"],
+        worker_module.DEFAULT_EXPOSURES["G"],
+        worker_module.DEFAULT_EXPOSURES["B"],
+    )
 
 
 def test_synchronous_decoder_exception_never_aborts_continuation_capture(
@@ -457,6 +577,8 @@ def _drive_two_frame_batch(
         root,
         (first, second),
         _reviewed_fingerprint(),
+        1,
+        2,
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
@@ -476,11 +598,11 @@ def _drive_two_frame_batch(
         encoding="utf-8",
     )
 
-    startup = bytearray(10 + 37 * 8)
+    startup = bytearray(10 + 40 * 8)
     startup[:4] = b"\x8f\0\0\0"
     startup[4:6] = (len(startup) - 6).to_bytes(2, "big")
     startup[6:8] = (len(startup) - 8).to_bytes(2, "big")
-    startup[8] = 37
+    startup[8] = 40
     header_8e = b"\0\x8e\0\0\0\x06"
     state = {"prevalidated": False}
 
@@ -598,6 +720,7 @@ def _drive_two_frame_batch(
             "width": 3_946,
             "height": 250_278,
             "bit_depth": 16,
+            "exposure_raw_10ns": 70_000 + color,
         }
         for color in (1, 2, 3)
     ]
@@ -614,6 +737,20 @@ def _drive_two_frame_batch(
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_a: preview_windows
     )
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        lambda *_args, **kwargs: SimpleNamespace(
+            source_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_density_frame_ownership_receipt",
+        lambda *_args, **_kwargs: {"fixture": "owned"},
+    )
     monkeypatch.setattr(worker_module, "_derive_live_batch_selections", derive_batch)
     monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
     monkeypatch.setattr(
@@ -626,7 +763,13 @@ def _drive_two_frame_batch(
     monkeypatch.setattr(
         worker_module,
         "_connect_device",
-        lambda: (object(), interface, ep_out, ep_in, USBUtil),
+        lambda **_kwargs: (
+            SimpleNamespace(bus=1, address=2),
+            interface,
+            ep_out,
+            ep_in,
+            USBUtil,
+        ),
     )
     monkeypatch.setattr(worker_module, "_open_fine_stream_session", open_session)
 

@@ -9,6 +9,7 @@ import sys
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import FrozenInstanceError, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,220 @@ def _argument(argv: Sequence[str], name: str) -> str:
     return argv[index + 1]
 
 
+def _density_calibration_provenance(session_id: str) -> dict[str, object]:
+    reads = [
+        single_pass.decode_density_calibration_read(
+            bytes.fromhex(cdb),
+            bytes.fromhex(payload),
+        )
+        for cdb, payload in zip(
+            (
+                "28008c00010300000a80",
+                "28008c00020300000a80",
+                "28008c00030300000a80",
+            ),
+            (
+                "8c20000000040000df1a",
+                "8c20000000040000bba4",
+                "8c200000000400007fab",
+            ),
+            strict=True,
+        )
+    ]
+    calibration = single_pass.assemble_density_calibration(
+        reads,
+        session_id=session_id,
+    )
+    return {
+        "density_calibration_session_id": session_id,
+        "nikon_density_calibration": calibration.to_dict(),
+    }
+
+
+@lru_cache(maxsize=1)
+def _density_source_fixture() -> bytes:
+    samples = np.concatenate(
+        (
+            np.full(96, 45_000, dtype=np.uint16),
+            np.full(96, 40_000, dtype=np.uint16),
+            np.full(96, 32_000, dtype=np.uint16),
+        )
+    ).astype(">u2")
+    row = samples.tobytes() + bytes(448)
+    return bytes(100 * 1_024) + row + bytes((6_104 - 101) * 1_024)
+
+
+def _batch_density_frame_provenance(
+    job_path: Path,
+    *,
+    output: Path,
+    frame_index: int,
+    selected_slot: int,
+) -> tuple[dict[str, object], str, str]:
+    """Build exact density evidence/ownership for a synthetic batch frame."""
+
+    job = json.loads(job_path.read_text(encoding="utf-8"))
+    session_id = job["session_id"]
+    selected_slots = tuple(frame["slot"] for frame in job["frames"])
+    first_output = job_path.parent / job["frames"][0]["output"]
+    calibration = single_pass.DensityCalibration.from_dict(
+        _density_calibration_provenance(session_id)["nikon_density_calibration"]
+    )
+    source = _density_source_fixture()
+    evidence = single_pass.build_nikon_density_evidence(
+        source,
+        calibration=calibration,
+        density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
+        session_id=session_id,
+        capture_attempt_id=first_output.parent.name,
+        scan_identity=f"{session_id}:density-97dpi:{hashlib.sha256(source).hexdigest()}",
+    )
+    if frame_index == 1:
+        first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
+    reviewed_sha = job["reviewed_roll_fingerprint"]["binding_sha256"]
+    table_sha = "e" * 64
+    ownership = single_pass.build_nikon_density_frame_ownership(
+        evidence,
+        reservation_id=session_id,
+        batch_session_id=session_id,
+        transport_table_sha256=table_sha,
+        reviewed_fingerprint_sha256=reviewed_sha,
+        fresh_fingerprint_sha256="d" * 64,
+        frame_capture_attempt_id=output.parent.name,
+        frame_index=frame_index,
+        frame_total=len(selected_slots),
+        selected_slots=selected_slots,
+        selected_slot=selected_slot,
+    )
+    provenance: dict[str, object] = {
+        "nikon_density_frame_ownership": ownership.to_dict(),
+    }
+    if "expected_usb_bus" in job and "expected_usb_address" in job:
+        provenance.update(
+            {
+                "expected_usb_bus": job["expected_usb_bus"],
+                "expected_usb_address": job["expected_usb_address"],
+                "actual_usb_bus": job["expected_usb_bus"],
+                "actual_usb_address": job["expected_usb_address"],
+            }
+        )
+    if frame_index == 1:
+        provenance["nikon_density_evidence"] = evidence.to_dict()
+    return provenance, evidence.source_binding.wire_sha256, table_sha
+
+
+def test_capture_process_replays_37_record_density_geometry(tmp_path: Path) -> None:
+    session_id = "reservation-preview-37"
+    output = tmp_path / "frame-001" / "capture.bin"
+    output.parent.mkdir()
+    source = _density_source_fixture()[: 5_668 * 1_024]
+    calibration = single_pass.DensityCalibration.from_dict(
+        _density_calibration_provenance(session_id)["nikon_density_calibration"]
+    )
+    evidence = single_pass.build_nikon_density_evidence(
+        source,
+        calibration=calibration,
+        density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
+        session_id=session_id,
+        capture_attempt_id=output.parent.name,
+        scan_identity=f"{session_id}:density-97dpi:{hashlib.sha256(source).hexdigest()}",
+        source_native_height=232_401,
+        source_height=5_668,
+    )
+    output.with_name(f"{output.stem}-preview.bin").write_bytes(source)
+
+    rebuilt = capture._validated_density_evidence(
+        {"nikon_density_evidence": evidence.to_dict()},
+        output_path=output,
+    )
+
+    assert rebuilt == evidence
+    assert rebuilt.source_binding.native_height == 232_401
+    assert rebuilt.source_binding.height == 5_668
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-receipt",
+        "new-preview",
+        "new-transport-table",
+        "new-registration",
+        "new-reservation",
+    ],
+)
+def test_capture_boundary_invalidates_density_on_any_ownership_change(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    session_id = "reservation-preview-test"
+    job_path = tmp_path / "batch-job.json"
+    output = tmp_path / "frame-004" / "capture.bin"
+    output.parent.mkdir()
+    job = {
+        "session_id": session_id,
+        "frames": [{"slot": 4, "output": "frame-004/capture.bin"}],
+        "reviewed_roll_fingerprint": {"binding_sha256": "2" * 64},
+    }
+    job_path.write_text(json.dumps(job), encoding="utf-8")
+    density, preview_sha, table_sha = _batch_density_frame_provenance(
+        job_path,
+        output=output,
+        frame_index=1,
+        selected_slot=4,
+    )
+    journal: dict[str, object] = {
+        **density,
+        "batch_session": {
+            "frame_index": 1,
+            "frame_total": 1,
+            "selected_slots": [4],
+            "session_id": session_id,
+        },
+        "live_frame_selection": {
+            "frame": 4,
+            "preview_sha256": preview_sha,
+            "table_sha256": table_sha,
+            "roll_identity": {
+                "reviewed_fingerprint_sha256": "2" * 64,
+                "fresh_fingerprint_sha256": "d" * 64,
+            },
+        },
+        "session_reservation_retained": True,
+    }
+    if mutation == "missing-receipt":
+        journal.pop("nikon_density_frame_ownership")
+    elif mutation == "new-preview":
+        journal["live_frame_selection"]["preview_sha256"] = "4" * 64
+    elif mutation == "new-transport-table":
+        journal["live_frame_selection"]["table_sha256"] = "5" * 64
+    elif mutation == "new-registration":
+        journal["live_frame_selection"]["roll_identity"]["fresh_fingerprint_sha256"] = (
+            "6" * 64
+        )
+    elif mutation == "new-reservation":
+        journal["batch_session"]["session_id"] = "another-reservation"
+
+    with pytest.raises(ValueError, match="density|ownership|receipt|batch"):
+        capture._validated_density_frame_ownership(
+            journal,
+            output_path=output,
+            expected_session_id=session_id,
+            expected_frame_index=1,
+            expected_frame_total=1,
+            expected_selected_slots=(4,),
+            expected_selected_slot=4,
+        )
+
+
+def _tamper_density_calibration_payload(journal: dict[str, object]) -> None:
+    calibration = journal["nikon_density_calibration"]
+    assert isinstance(calibration, dict)
+    payloads = calibration["payload_hex_rgb"]
+    assert isinstance(payloads, list)
+    payloads[0] = "00" * 10
+
+
 @dataclass
 class FakeRunner:
     worker_sha256: str
@@ -49,7 +264,9 @@ class FakeRunner:
     write_journal: bool = True
     calls: list[tuple[tuple[str, ...], Path]] = field(default_factory=list)
 
-    def __call__(self, argv: Sequence[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    def __call__(
+        self, argv: Sequence[str], *, cwd: Path
+    ) -> subprocess.CompletedProcess[str]:
         command = tuple(argv)
         self.calls.append((command, cwd))
         if self.during_run is not None:
@@ -82,6 +299,26 @@ class FakeRunner:
             "capture_mode": mode,
             "requested_frame": selected,
             "expected_frame_count": None,
+            "expected_usb_bus": (
+                int(_argument(command, "--expected-usb-bus"))
+                if "--expected-usb-bus" in command
+                else None
+            ),
+            "expected_usb_address": (
+                int(_argument(command, "--expected-usb-address"))
+                if "--expected-usb-address" in command
+                else None
+            ),
+            "actual_usb_bus": (
+                int(_argument(command, "--expected-usb-bus"))
+                if "--expected-usb-bus" in command
+                else None
+            ),
+            "actual_usb_address": (
+                int(_argument(command, "--expected-usb-address"))
+                if "--expected-usb-address" in command
+                else None
+            ),
             "expected_reads": expected_reads,
             "expected_bytes": expected_bytes,
             "requested_boundary_offset_rows": int(
@@ -98,6 +335,7 @@ class FakeRunner:
                 unit_released=True,
                 output_sha256="a" * 64,
             )
+            payload.update(_density_calibration_provenance("single-reservation-test"))
             if mode != "preview-only":
                 payload.update(
                     applied_boundary_offset_rows=payload[
@@ -112,7 +350,9 @@ class FakeRunner:
             self.mutate_journal(payload)
         if self.write_journal:
             journal_path.write_text(json.dumps(payload), encoding="utf-8")
-        return subprocess.CompletedProcess(command, self.returncode, self.stdout, self.stderr)
+        return subprocess.CompletedProcess(
+            command, self.returncode, self.stdout, self.stderr
+        )
 
 
 @dataclass(frozen=True)
@@ -128,9 +368,14 @@ def _batch_session_provenance(
 ) -> dict[str, object]:
     job = json.loads(job_path.read_text(encoding="utf-8"))
     return {
+        **_density_calibration_provenance(job["session_id"]),
         "batch_job_sha256": hashlib.sha256(job_path.read_bytes()).hexdigest(),
         "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
         "capture_engine_sha256": worker_sha256,
+        "expected_usb_bus": job["expected_usb_bus"],
+        "expected_usb_address": job["expected_usb_address"],
+        "actual_usb_bus": job["expected_usb_bus"],
+        "actual_usb_address": job["expected_usb_address"],
         "manual_review_approval_sha256_by_slot": {
             str(frame["slot"]): (
                 None
@@ -139,9 +384,9 @@ def _batch_session_provenance(
             )
             for frame in job["frames"]
         },
-        "reviewed_roll_fingerprint_sha256": job[
-            "reviewed_roll_fingerprint"
-        ]["binding_sha256"],
+        "reviewed_roll_fingerprint_sha256": job["reviewed_roll_fingerprint"][
+            "binding_sha256"
+        ],
     }
 
 
@@ -230,11 +475,15 @@ def binding(tmp_path: Path) -> Binding:
     worker.write_text("# fake external capture worker\n", encoding="utf-8")
     worker_sha256 = hashlib.sha256(worker.read_bytes()).hexdigest()
     manifest = tmp_path / "replay-first-rgbi4-manifest.json"
-    manifest.write_text(json.dumps({"plan_sha256": CANONICAL_PLAN_SHA256}), encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"plan_sha256": CANONICAL_PLAN_SHA256}), encoding="utf-8"
+    )
     return Binding(worker, manifest, worker_sha256)
 
 
-def _adapter(tmp_path: Path, binding: Binding, runner: FakeRunner) -> capture.CaptureProcessAdapter:
+def _adapter(
+    tmp_path: Path, binding: Binding, runner: FakeRunner
+) -> capture.CaptureProcessAdapter:
     return capture.CaptureProcessAdapter(
         worker_path=binding.worker,
         expected_worker_sha256=binding.worker_sha256,
@@ -281,16 +530,22 @@ def test_batch_request_is_one_immutable_ordered_full_capture_unit() -> None:
             ),
         ),
         reviewed_fingerprint=fingerprint,
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
 
     assert request.selected_slots == (17, 19)
     assert request.reviewed_fingerprint is fingerprint
     assert request.frames[0].manual_review_approval is approval
+    assert request.expected_usb_bus == 1
+    assert request.expected_usb_address == 2
     with pytest.raises(FrozenInstanceError):
         setattr(request, "frames", ())
 
 
-def test_roll_fingerprint_accepts_harmless_reread_noise_but_rejects_reordered_film() -> None:
+def test_roll_fingerprint_accepts_harmless_reread_noise_but_rejects_reordered_film() -> (
+    None
+):
     rgb, intervals = _fingerprint_raster()
     origins = tuple(6_000 + 6_000 * index for index in range(40))
     reviewed = capture.build_reviewed_roll_fingerprint(
@@ -313,7 +568,9 @@ def test_roll_fingerprint_accepts_harmless_reread_noise_but_rejects_reordered_fi
     fresh = capture.build_reviewed_roll_fingerprint(
         reread,
         frame_intervals=intervals,
-        frame_native_origins=tuple(value + (-28 if index % 2 else 28) for index, value in enumerate(origins)),
+        frame_native_origins=tuple(
+            value + (-28 if index % 2 else 28) for index, value in enumerate(origins)
+        ),
         source_preview_sha256="4" * 64,
         source_table_sha256="5" * 64,
     )
@@ -326,17 +583,13 @@ def test_roll_fingerprint_accepts_harmless_reread_noise_but_rejects_reordered_fi
 
     frame_height = intervals[0][1] - intervals[0][0]
     reordered = np.concatenate(
-        [
-            rgb[start:end]
-            for start, end in reversed(intervals)
-        ],
+        [rgb[start:end] for start, end in reversed(intervals)],
         axis=0,
     )
     changed = capture.build_reviewed_roll_fingerprint(
         reordered,
         frame_intervals=tuple(
-            (slot * frame_height, (slot + 1) * frame_height)
-            for slot in range(40)
+            (slot * frame_height, (slot + 1) * frame_height) for slot in range(40)
         ),
         frame_native_origins=origins,
         source_preview_sha256="6" * 64,
@@ -476,12 +729,26 @@ def test_roll_fingerprint_thresholds_retain_archived_same_roll_margin() -> None:
     assert max(item["native_origin_max_delta"] for item in same_roll) <= 56
     guard = fixture["discriminative_guard"]
     assert guard["same_roll_selected_visual_hamming_max"] <= 32
-    assert guard["same_roll_selected_visual_hamming_max"] < thresholds["selected_visual_hamming"]
-    assert guard["same_roll_visual_log_span_min"] > 3 * thresholds["visual_log_span_min"]
+    assert (
+        guard["same_roll_selected_visual_hamming_max"]
+        < thresholds["selected_visual_hamming"]
+    )
+    assert (
+        guard["same_roll_visual_log_span_min"] > 3 * thresholds["visual_log_span_min"]
+    )
     different = fixture["different_roll"]
-    assert different["common_slot_visual_hamming_median"] > thresholds["visual_median_hamming"]
-    assert different["frame_start_delta_median_rows"] > thresholds["frame_start_median_delta_rows"]
-    assert different["native_origin_delta_median"] > thresholds["native_origin_median_delta"]
+    assert (
+        different["common_slot_visual_hamming_median"]
+        > thresholds["visual_median_hamming"]
+    )
+    assert (
+        different["frame_start_delta_median_rows"]
+        > thresholds["frame_start_median_delta_rows"]
+    )
+    assert (
+        different["native_origin_delta_median"]
+        > thresholds["native_origin_median_delta"]
+    )
 
 
 def test_batch_session_foundation_is_exported_from_scanner_package() -> None:
@@ -512,6 +779,8 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
             ),
         ),
         reviewed_fingerprint=fingerprint,
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
 
     prepared = adapter.prepare_batch_session(request)
@@ -527,12 +796,17 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert _argument(prepared.argv, "--session-journal") == str(
         prepared.paths.session_journal
     )
+    assert _argument(prepared.argv, "--expected-batch-job-sha256") == (
+        prepared.job_sha256
+    )
     assert "--frame" not in prepared.argv
     assert job["session_id"] == prepared.session_id
     assert job == {
         "apply_all_boundary_offsets_before_first_frame": True,
         "capture_plan_sha256": CANONICAL_PLAN_SHA256,
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+        "expected_usb_address": 2,
+        "expected_usb_bus": 1,
         "frames": [
             {
                 "ack": "frame-017/parent-ack.json",
@@ -554,16 +828,17 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
         "reviewed_roll_fingerprint": fingerprint.to_payload(),
-        "schema_version": 2,
+        "schema_version": 3,
         "session_id": prepared.session_id,
         "session_contract": "one-process-one-reservation",
     }
     assert hashlib.sha256(prepared.paths.first_plan.read_bytes()).hexdigest() == (
         CANONICAL_PLAN_SHA256
     )
-    assert hashlib.sha256(
-        prepared.paths.continuation_plan.read_bytes()
-    ).hexdigest() == CANONICAL_CONTINUATION_PLAN_SHA256
+    assert (
+        hashlib.sha256(prepared.paths.continuation_plan.read_bytes()).hexdigest()
+        == CANONICAL_CONTINUATION_PLAN_SHA256
+    )
     assert hashlib.sha256(prepared.paths.job.read_bytes()).hexdigest() == (
         prepared.job_sha256
     )
@@ -575,6 +850,10 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "batch_job_sha256",
         "capture_engine_sha256",
         "capture_bundle_sha256",
+        "density_calibration_session_id",
+        "expected_usb_bus",
+        "actual_usb_address",
+        "actual_usb_topology",
     ],
 )
 def test_batch_session_receipt_rejects_tampered_process_identity(
@@ -586,6 +865,8 @@ def test_batch_session_receipt_rejects_tampered_process_identity(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
     prepared = adapter.prepare_batch_session(request)
     receipt: dict[str, object] = {
@@ -604,13 +885,19 @@ def test_batch_session_receipt_rejects_tampered_process_identity(
         "unit_release_attempts": 1,
         "unit_released": True,
     }
-    receipt[field] = "f" * 64
+    expected_error = field
+    if field == "actual_usb_topology":
+        receipt["actual_usb_bus"] = None
+        receipt["actual_usb_address"] = None
+        expected_error = "reserved batch session"
+    else:
+        receipt[field] = "f" * 64
     prepared.paths.session_journal.write_text(
         json.dumps(receipt),
         encoding="utf-8",
     )
 
-    with pytest.raises(capture.CaptureProcessError, match=field):
+    with pytest.raises(capture.CaptureProcessError, match=expected_error):
         adapter._load_and_validate_batch_session_journal(
             prepared,
             returncode=0,
@@ -630,6 +917,8 @@ def test_failed_batch_receipt_rejects_unobserved_completed_frames(
             capture.CaptureRequest(capture.CaptureMode.FULL, 19, 0),
         ),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
     prepared = adapter.prepare_batch_session(request)
     receipt: dict[str, object] = {
@@ -702,6 +991,8 @@ def test_stop_winning_the_launch_gate_prevents_batch_process_creation(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
     errors: list[BaseException] = []
 
@@ -753,12 +1044,18 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
             journal = directory / frame["journal"]
             output.parent.mkdir(parents=True)
             with output.open("xb") as stream:
-                stream.truncate(
-                    CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
-                )
+                stream.truncate(CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES)
+            density, preview_sha, table_sha = _batch_density_frame_provenance(
+                self.job_path,
+                output=output,
+                frame_index=self.index + 1,
+                selected_slot=frame["slot"],
+            )
             journal.write_text(
                 json.dumps(
                     {
+                        **_density_calibration_provenance(self.job["session_id"]),
+                        **density,
                         "ack_nonce": f"nonce-{frame['slot']}",
                         "batch_session": {
                             "frame_index": self.index + 1,
@@ -771,42 +1068,35 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
                         "capture_engine_sha256": binding.worker_sha256,
                         "capture_mode": "full",
                         "completed_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "completed_reads": CANONICAL_FINE_READ_COUNT,
                         "continuation_plan_sha256": (
                             CANONICAL_CONTINUATION_PLAN_SHA256
                         ),
                         "disk_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "expected_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "expected_reads": CANONICAL_FINE_READ_COUNT,
                         "frame_complete": True,
                         "live_frame_selection": {
                             "frame": frame["slot"],
+                            "preview_sha256": preview_sha,
+                            "table_sha256": table_sha,
                             "roll_identity": _roll_identity_evidence(
-                                self.job["reviewed_roll_fingerprint"][
-                                    "binding_sha256"
-                                ],
+                                self.job["reviewed_roll_fingerprint"]["binding_sha256"],
                                 slot=frame["slot"],
                             ),
                         },
-                        "manual_review_approval": frame[
-                            "manual_review_approval"
-                        ],
+                        "manual_review_approval": frame["manual_review_approval"],
                         "output": str(output.resolve()),
                         "output_sha256": "a" * 64,
                         "plan_sha256": CANONICAL_PLAN_SHA256,
                         "recovery_required": None,
-                        "requested_boundary_offset_rows": frame[
-                            "boundary_offset_rows"
-                        ],
+                        "requested_boundary_offset_rows": frame["boundary_offset_rows"],
                         "requested_frame": frame["slot"],
                         "reviewed_roll_fingerprint_sha256": self.job[
                             "reviewed_roll_fingerprint"
@@ -829,15 +1119,11 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
                 return None
             ack = json.loads(ack_path.read_text(encoding="utf-8"))
             events.append(f"ack-{frame['slot']}-{ack['action']}")
-            if ack["action"] == "continue" and self.index + 1 < len(
-                self.job["frames"]
-            ):
+            if ack["action"] == "continue" and self.index + 1 < len(self.job["frames"]):
                 self.index += 1
                 self._emit_frame()
                 return None
-            completed = [
-                item["slot"] for item in self.job["frames"][: self.index + 1]
-            ]
+            completed = [item["slot"] for item in self.job["frames"][: self.index + 1]]
             self.session_journal.write_text(
                 json.dumps(
                     {
@@ -852,9 +1138,7 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
                         "plan_sha256": CANONICAL_PLAN_SHA256,
                         "recovery_required": "none",
                         "reservation_acquired": True,
-                        "selected_slots": [
-                            item["slot"] for item in self.job["frames"]
-                        ],
+                        "selected_slots": [item["slot"] for item in self.job["frames"]],
                         "session_id": self.job["session_id"],
                         "status": (
                             "stopped" if ack["action"] == "stop" else "complete"
@@ -898,10 +1182,15 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
             capture.CaptureRequest(capture.CaptureMode.FULL, 19, 8),
         ),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
 
     def finalize(result: capture.CaptureAttemptResult) -> capture.BatchAckAction:
         events.append(f"finalized-{result.request.selected_slot}")
+        assert result.density_calibration is not None
+        assert result.density_calibration.session_id == result.batch_session_id
+        assert result.density_calibration.numerators == (57_114, 48_036, 32_683)
         # This is the scratch-deletion point.  The child must not need the raw
         # stream again after the parent acknowledges it.
         result.paths.output.unlink()
@@ -921,6 +1210,10 @@ def test_batch_parent_finalizes_each_frame_before_acknowledging_the_next(
         "ack-19-continue",
     ]
     assert result.session_journal["unit_release_attempts"] == 1
+    assert (
+        result.session_journal["density_calibration_session_id"]
+        == (result.session_journal["session_id"])
+    )
 
 
 def test_batch_adapter_refuses_false_roll_comparison_before_parent_handler(
@@ -932,6 +1225,8 @@ def test_batch_adapter_refuses_false_roll_comparison_before_parent_handler(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=fingerprint,
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
     prepared = adapter.prepare_batch_session(request)
     frame_request = request.frames[0]
@@ -946,6 +1241,7 @@ def test_batch_adapter_refuses_false_roll_comparison_before_parent_handler(
     roll_identity["comparison"]["matches"] = False
     roll_identity["comparison"]["reason"] = "visual-content-mismatch"
     payload = {
+        **_density_calibration_provenance(prepared.session_id),
         "ack_nonce": "nonce-17",
         "batch_session": {
             "frame_index": 1,
@@ -955,6 +1251,10 @@ def test_batch_adapter_refuses_false_roll_comparison_before_parent_handler(
         },
         "capture_engine_sha256": binding.worker_sha256,
         "capture_mode": "full",
+        "expected_usb_bus": 1,
+        "expected_usb_address": 2,
+        "actual_usb_bus": 1,
+        "actual_usb_address": 2,
         "completed_bytes": CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES,
         "completed_reads": CANONICAL_FINE_READ_COUNT,
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -976,7 +1276,9 @@ def test_batch_adapter_refuses_false_roll_comparison_before_parent_handler(
         "unit_released": False,
     }
 
-    with pytest.raises(capture.CaptureProcessError, match="roll fingerprint comparison"):
+    with pytest.raises(
+        capture.CaptureProcessError, match="roll fingerprint comparison"
+    ):
         adapter._validate_batch_frame_result(
             prepared,
             frame_request,
@@ -1016,12 +1318,18 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
             journal = self.job_path.parent / frame["journal"]
             output.parent.mkdir(parents=True)
             with output.open("xb") as stream:
-                stream.truncate(
-                    CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
-                )
+                stream.truncate(CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES)
+            density, preview_sha, table_sha = _batch_density_frame_provenance(
+                self.job_path,
+                output=output,
+                frame_index=1,
+                selected_slot=17,
+            )
             journal.write_text(
                 json.dumps(
                     {
+                        **_density_calibration_provenance(self.job["session_id"]),
+                        **density,
                         "ack_nonce": "nonce-17",
                         "batch_session": {
                             "frame_index": 1,
@@ -1036,35 +1344,30 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
                         ),
                         "capture_mode": "full",
                         "completed_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "completed_reads": CANONICAL_FINE_READ_COUNT,
                         "continuation_plan_sha256": (
                             CANONICAL_CONTINUATION_PLAN_SHA256
                         ),
                         "disk_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "expected_bytes": (
-                            CANONICAL_FINE_READ_COUNT
-                            * CANONICAL_FINE_READ_BYTES
+                            CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES
                         ),
                         "expected_reads": CANONICAL_FINE_READ_COUNT,
                         "frame_complete": True,
                         "live_frame_selection": {
                             "frame": 17,
+                            "preview_sha256": preview_sha,
+                            "table_sha256": table_sha,
                             "roll_identity": _roll_identity_evidence(
-                                self.job["reviewed_roll_fingerprint"][
-                                    "binding_sha256"
-                                ],
+                                self.job["reviewed_roll_fingerprint"]["binding_sha256"],
                                 slot=17,
                             ),
                         },
-                        "manual_review_approval": frame[
-                            "manual_review_approval"
-                        ],
+                        "manual_review_approval": frame["manual_review_approval"],
                         "output": str(output.resolve()),
                         "output_sha256": "a" * 64,
                         "plan_sha256": CANONICAL_PLAN_SHA256,
@@ -1094,9 +1397,7 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
                 and json.loads(ack.read_text(encoding="utf-8"))["action"] == "stop"
             )
             acknowledged = ack.exists()
-            cleanup_before_release = (
-                failure_mode == "handler-cleanup-before-release"
-            )
+            cleanup_before_release = failure_mode == "handler-cleanup-before-release"
             release_failed = failure_mode in (
                 "handler-cleanup-before-release",
                 "handler-release-failed",
@@ -1114,9 +1415,7 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
                         ),
                         "plan_sha256": CANONICAL_PLAN_SHA256,
                         "recovery_required": (
-                            capture.POWER_CYCLE_RECOVERY
-                            if release_failed
-                            else "none"
+                            capture.POWER_CYCLE_RECOVERY if release_failed else "none"
                         ),
                         "reservation_acquired": True,
                         "selected_slots": [17],
@@ -1126,9 +1425,7 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
                             if release_failed or not acknowledged
                             else ("stopped" if stopped else "complete")
                         ),
-                        "unit_release_attempts": (
-                            0 if cleanup_before_release else 1
-                        ),
+                        "unit_release_attempts": (0 if cleanup_before_release else 1),
                         "unit_released": not release_failed,
                     }
                 ),
@@ -1193,6 +1490,8 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
     with pytest.raises(capture.CaptureBatchProcessError) as raised:
         adapter.run_batch_session(request, frame_handler=handler)
@@ -1204,12 +1503,10 @@ def test_batch_parent_always_waits_for_child_release_after_post_spawn_failure(
         0 if failure_mode == "handler-cleanup-before-release" else 1
     )
     assert receipt["unit_released"] is (
-        failure_mode
-        not in ("handler-cleanup-before-release", "handler-release-failed")
+        failure_mode not in ("handler-cleanup-before-release", "handler-release-failed")
     )
     assert raised.value.recovery_required is (
-        failure_mode
-        in ("handler-cleanup-before-release", "handler-release-failed")
+        failure_mode in ("handler-cleanup-before-release", "handler-release-failed")
     )
     if failure_mode == "journal":
         assert raised.value.frames == ()
@@ -1252,6 +1549,12 @@ def test_failed_batch_before_reserve_preserves_recovery_without_release(
                             self.job_path,
                             binding.worker_sha256,
                         ),
+                        # A connect failure can happen before the worker has
+                        # observed any actual USB topology. This is the exact
+                        # fail-closed pre-reservation receipt emitted by the
+                        # worker, not an inferred copy of the expected device.
+                        "actual_usb_bus": None,
+                        "actual_usb_address": None,
                         "completed_slots": [],
                         "continuation_plan_sha256": (
                             CANONICAL_CONTINUATION_PLAN_SHA256
@@ -1291,6 +1594,8 @@ def test_failed_batch_before_reserve_preserves_recovery_without_release(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
 
     with pytest.raises(capture.CaptureBatchProcessError) as raised:
@@ -1305,6 +1610,8 @@ def test_failed_batch_before_reserve_preserves_recovery_without_release(
     )
     assert raised.value.session_journal is not None
     assert raised.value.session_journal["reservation_acquired"] is False
+    assert raised.value.session_journal["actual_usb_bus"] is None
+    assert raised.value.session_journal["actual_usb_address"] is None
 
 
 def test_terminal_batch_receipt_wakes_parent_before_repeated_process_polling(
@@ -1382,6 +1689,8 @@ def test_terminal_batch_receipt_wakes_parent_before_repeated_process_polling(
     request = capture.CaptureBatchRequest(
         (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
         reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
     )
 
     result = adapter.run_batch_session(
@@ -1425,11 +1734,15 @@ def test_batch_wait_defers_interrupt_until_child_cleanup_finishes(
     assert process.calls == 2
 
 
-def test_preview_uses_preview_only_without_slot_or_exposure_count(tmp_path: Path, binding: Binding) -> None:
+def test_preview_uses_preview_only_without_slot_or_exposure_count(
+    tmp_path: Path, binding: Binding
+) -> None:
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
 
-    result = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    result = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
 
     assert result.outcome is capture.CaptureOutcome.COMPLETE
     assert "--preview-only" in result.argv
@@ -1440,11 +1753,97 @@ def test_preview_uses_preview_only_without_slot_or_exposure_count(tmp_path: Path
     assert result.paths.output.stat().st_size == 0
 
 
-def test_meter_uses_one_explicit_slot_and_never_passes_expected_count(tmp_path: Path, binding: Binding) -> None:
+def test_preview_binds_fresh_usb_fingerprint_to_exact_sane_topology(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
 
-    result = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.METER_ONLY, selected_slot=18))
+    result = adapter.run_attempt(
+        capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        )
+    )
+
+    assert _argument(result.argv, "--expected-usb-bus") == "1"
+    assert _argument(result.argv, "--expected-usb-address") == "2"
+    assert "--preview-only" in result.argv
+    assert result.journal is not None
+    assert result.journal["actual_usb_bus"] == 1
+    assert result.journal["actual_usb_address"] == 2
+
+
+@pytest.mark.parametrize(
+    "mode", (capture.CaptureMode.METER_ONLY, capture.CaptureMode.FULL)
+)
+def test_live_meter_and_full_requests_preserve_the_reviewed_usb_topology(
+    tmp_path: Path,
+    binding: Binding,
+    mode: capture.CaptureMode,
+) -> None:
+    runner = FakeRunner(binding.worker_sha256)
+    adapter = _adapter(tmp_path, binding, runner)
+
+    result = adapter.run_attempt(
+        capture.CaptureRequest(
+            mode=mode,
+            selected_slot=18,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        )
+    )
+
+    assert _argument(result.argv, "--expected-usb-bus") == "1"
+    assert _argument(result.argv, "--expected-usb-address") == "2"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda journal: journal.update(
+            actual_usb_bus=None,
+            actual_usb_address=None,
+        ),
+        lambda journal: journal.update(
+            actual_usb_bus=1,
+            actual_usb_address=3,
+        ),
+    ),
+)
+def test_topology_bound_preview_refuses_missing_or_changed_actual_usb_receipt(
+    tmp_path: Path,
+    binding: Binding,
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    runner = FakeRunner(binding.worker_sha256, mutate_journal=mutate)
+    adapter = _adapter(tmp_path, binding, runner)
+
+    result = adapter.run_attempt(
+        capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        )
+    )
+
+    assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
+    assert result.journal is None
+    assert result.journal_error is not None
+    assert "actual USB topology" in result.journal_error
+
+
+def test_meter_uses_one_explicit_slot_and_never_passes_expected_count(
+    tmp_path: Path, binding: Binding
+) -> None:
+    runner = FakeRunner(binding.worker_sha256)
+    adapter = _adapter(tmp_path, binding, runner)
+
+    result = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.METER_ONLY, selected_slot=18)
+    )
 
     assert result.outcome is capture.CaptureOutcome.COMPLETE
     assert _argument(result.argv, "--frame") == "18"
@@ -1455,11 +1854,15 @@ def test_meter_uses_one_explicit_slot_and_never_passes_expected_count(tmp_path: 
     assert result.journal["expected_frame_count"] is None
 
 
-def test_full_capture_uses_complete_stream_confirmation(tmp_path: Path, binding: Binding) -> None:
+def test_full_capture_uses_complete_stream_confirmation(
+    tmp_path: Path, binding: Binding
+) -> None:
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
 
-    result = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=7))
+    result = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=7)
+    )
 
     assert result.outcome is capture.CaptureOutcome.COMPLETE
     assert _argument(result.argv, "--frame") == "7"
@@ -1527,9 +1930,14 @@ def test_worker_and_materialized_package_plan_are_hash_pinned_before_launch(
 ) -> None:
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
-    result = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    result = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
 
-    assert hashlib.sha256(result.paths.plan.read_bytes()).hexdigest() == CANONICAL_PLAN_SHA256
+    assert (
+        hashlib.sha256(result.paths.plan.read_bytes()).hexdigest()
+        == CANONICAL_PLAN_SHA256
+    )
     assert _argument(result.argv, "--plan") == str(result.paths.plan)
 
     binding.worker.write_text("changed after binding\n", encoding="utf-8")
@@ -1538,7 +1946,9 @@ def test_worker_and_materialized_package_plan_are_hash_pinned_before_launch(
     assert len(runner.calls) == 1
 
 
-def test_manifest_must_bind_the_packaged_plan_before_launch(tmp_path: Path, binding: Binding) -> None:
+def test_manifest_must_bind_the_packaged_plan_before_launch(
+    tmp_path: Path, binding: Binding
+) -> None:
     binding.manifest.write_text(json.dumps({"plan_sha256": "0" * 64}), encoding="utf-8")
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
@@ -1567,8 +1977,15 @@ def test_packaged_factory_uses_isolated_module_dispatch_and_internal_manifest(
     )
     assert result.paths.manifest.is_file()
     assert _argument(result.argv, "--manifest") == str(result.paths.manifest)
+    assert (
+        _argument(result.argv, "--expected-capture-bundle-sha256")
+        == CAPTURE_BUNDLE_SHA256
+    )
     assert result.journal is not None
     assert result.journal["capture_bundle_sha256"] == CAPTURE_BUNDLE_SHA256
+    assert result.density_calibration is not None
+    assert result.density_calibration.numerators == (57_114, 48_036, 32_683)
+    assert result.density_calibration.session_id == "single-reservation-test"
 
 
 def test_packaged_factory_uses_frozen_app_helper_dispatch(
@@ -1588,12 +2005,18 @@ def test_packaged_factory_uses_frozen_app_helper_dispatch(
     assert "-m" not in result.argv[:2]
 
 
-def test_attempt_paths_never_overlap_and_capture_stdout_stderr(tmp_path: Path, binding: Binding) -> None:
+def test_attempt_paths_never_overlap_and_capture_stdout_stderr(
+    tmp_path: Path, binding: Binding
+) -> None:
     runner = FakeRunner(binding.worker_sha256)
     adapter = _adapter(tmp_path, binding, runner)
 
-    first = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
-    second = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    first = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
+    second = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
 
     assert first.paths.directory != second.paths.directory
     assert first.paths.stdout.read_text(encoding="utf-8") == runner.stdout
@@ -1602,28 +2025,36 @@ def test_attempt_paths_never_overlap_and_capture_stdout_stderr(tmp_path: Path, b
     assert first.stderr == runner.stderr
 
 
-def test_synchronized_refusal_is_safe_to_retry_without_power_cycle(tmp_path: Path, binding: Binding) -> None:
+def test_synchronized_refusal_is_safe_to_retry_without_power_cycle(
+    tmp_path: Path, binding: Binding
+) -> None:
     runner = FakeRunner(
         binding.worker_sha256,
         status="failed",
         recovery="none",
         returncode=1,
     )
-    result = _adapter(tmp_path, binding, runner).run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.METER_ONLY, selected_slot=18))
+    result = _adapter(tmp_path, binding, runner).run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.METER_ONLY, selected_slot=18)
+    )
 
     assert result.outcome is capture.CaptureOutcome.SYNCHRONIZED_REFUSAL
     assert result.recovery_required is False
     assert result.journal_error is None
 
 
-def test_desynchronized_failure_requires_power_cycle(tmp_path: Path, binding: Binding) -> None:
+def test_desynchronized_failure_requires_power_cycle(
+    tmp_path: Path, binding: Binding
+) -> None:
     runner = FakeRunner(
         binding.worker_sha256,
         status="failed",
         recovery=capture.POWER_CYCLE_RECOVERY,
         returncode=1,
     )
-    result = _adapter(tmp_path, binding, runner).run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=18))
+    result = _adapter(tmp_path, binding, runner).run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=18)
+    )
 
     assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
     assert result.recovery_required is True
@@ -1666,7 +2097,13 @@ def test_completed_frame_capture_requires_resolved_boundary_offset_evidence(
         ),
         lambda digest: FakeRunner(
             digest,
-            mutate_journal=lambda journal: journal.update(capture_engine_sha256="f" * 64),
+            mutate_journal=lambda journal: journal.update(
+                capture_engine_sha256="f" * 64
+            ),
+        ),
+        lambda digest: FakeRunner(
+            digest,
+            mutate_journal=_tamper_density_calibration_payload,
         ),
     ],
 )
@@ -1676,7 +2113,9 @@ def test_missing_or_untrustworthy_journal_fails_closed_to_recovery(
     runner_factory: Callable[[str], FakeRunner],
 ) -> None:
     runner = runner_factory(binding.worker_sha256)
-    result = _adapter(tmp_path, binding, runner).run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    result = _adapter(tmp_path, binding, runner).run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
 
     assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
     assert result.recovery_required is True
@@ -1692,7 +2131,9 @@ def test_stop_requested_during_child_waits_for_that_attempt_then_blocks_next(
     adapter = _adapter(tmp_path, binding, runner)
     runner.during_run = adapter.request_stop
 
-    active = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    active = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
 
     assert active.outcome is capture.CaptureOutcome.COMPLETE
     with pytest.raises(capture.CaptureStopped, match="between attempts"):
@@ -1701,21 +2142,43 @@ def test_stop_requested_during_child_waits_for_that_attempt_then_blocks_next(
 
     adapter.clear_stop()
     runner.during_run = None
-    resumed = adapter.run_attempt(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    resumed = adapter.run_attempt(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
     assert resumed.outcome is capture.CaptureOutcome.COMPLETE
 
 
 @pytest.mark.parametrize(
     "request_factory",
     [
-        lambda: capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW, selected_slot=1),
+        lambda: capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW, selected_slot=1
+        ),
         lambda: capture.CaptureRequest(mode=capture.CaptureMode.METER_ONLY),
         lambda: capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=0),
-        lambda: capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=True),
+        lambda: capture.CaptureRequest(
+            mode=capture.CaptureMode.FULL, selected_slot=True
+        ),
         lambda: capture.CaptureRequest(mode=capture.CaptureMode.FULL, selected_slot=41),
+        lambda: capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW,
+            expected_usb_bus=1,
+        ),
+        lambda: capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW,
+            expected_usb_bus=True,
+            expected_usb_address=2,
+        ),
+        lambda: capture.CaptureRequest(
+            mode=capture.CaptureMode.PREVIEW,
+            expected_usb_bus=1,
+            expected_usb_address=0,
+        ),
     ],
 )
-def test_request_rejects_ambiguous_or_out_of_capacity_slots(request_factory: Callable[[], object]) -> None:
+def test_request_rejects_ambiguous_or_out_of_capacity_slots(
+    request_factory: Callable[[], object],
+) -> None:
     with pytest.raises(ValueError):
         request_factory()
 
@@ -1741,7 +2204,9 @@ def test_default_runner_uses_argv_without_shell_and_isolates_child_signals(
     assert recorded["capture_output"] is True
 
 
-def test_roll_fingerprint_skips_trailing_sliver_and_filters_origins_in_lockstep() -> None:
+def test_roll_fingerprint_skips_trailing_sliver_and_filters_origins_in_lockstep() -> (
+    None
+):
     rgb, intervals = _fingerprint_raster()
     sliver_rows = capture.MIN_FINGERPRINT_FRAME_ROWS - 14
     padded = np.concatenate((rgb, rgb[-sliver_rows:, :, :]), axis=0)

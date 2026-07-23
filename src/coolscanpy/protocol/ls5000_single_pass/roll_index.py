@@ -25,6 +25,9 @@ INDEX_RGB_WORDS_PER_ROW = 96 * INDEX_CHANNELS
 INDEX_TRAILER_WORDS = 224
 INDEX_TRAILER_MARK = 0xAA55
 INDEX_TRAILER_COUNTER0 = 0xAAE5
+MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS = 2.0
+MAXIMUM_LEADING_ANCHOR_ERROR_ROWS = 5.0
+LEADING_ANCHOR_REVIEW_REASON = "leading-anchor-divergence"
 
 
 class IndexDecodeError(ValueError):
@@ -258,6 +261,8 @@ class RollDetection:
             "boundaries": [asdict(item) for item in self.boundaries],
             "intervals": [asdict(item) for item in self.intervals],
         }
+
+
 def parse_oracle_boundaries(payload: bytes) -> list[OracleBoundary]:
     """Parse Nikon Scan's same-roll SEND(0x8f) oracle table.
 
@@ -401,6 +406,24 @@ def parse_live_transport_records_bytes(
             f"{usable_rows:,} usable rows"
         )
     return tuple(records)
+
+
+def terminal_transport_tail_start(
+    records: Sequence[TransportRecord],
+) -> int | None:
+    """Return the first row of Nikon's terminal high-bit transport suffix.
+
+    Live short-strip tables keep their ordinary coordinate ramp until the
+    trailing edge clears the drive, then end in a contiguous run of 0x81xx /
+    0x83xx records whose decoded origins jump several frames forward. High-bit
+    records observed earlier in a table are not classified: only the maximal
+    terminal suffix is excluded.
+    """
+
+    start = len(records)
+    while start > 0 and records[start - 1].code & 0x8000:
+        start -= 1
+    return start if start < len(records) else None
 
 
 def _validate_full_index_rows(rows: np.ndarray, usable_rows: int) -> dict:
@@ -566,6 +589,8 @@ def decode_full_index_stream(
     return decode_full_index_bytes(
         Path(stream).read_bytes(), geometry, usable_rows=usable_rows
     )
+
+
 def _largest_true_run(mask: np.ndarray) -> tuple[int, int] | None:
     runs = _true_runs(mask)
     return max(runs, key=lambda item: item[1] - item[0], default=None)
@@ -916,10 +941,16 @@ def detect_roll_frames(
     # extent, capped by the feeder's 40-slot protocol limit.  A weak/blank
     # leading slot remains slot 1 with warnings instead of silently renumbering
     # every later frame.  The final slot may likewise be partial.
+    # ``_lattice_positions`` keeps a two-row margin while fitting because its
+    # local evidence window needs neighbours on both sides.  The extended
+    # lattice used here has already been fitted, so applying that margin again
+    # silently drops a complete first cell whose rounded boundary is row 0 or
+    # row 1.  Admit those fully in-raster starts.  A genuinely clipped leading
+    # cell still has a negative start and remains excluded fail-closed.
     lattice_starts = [
         index
         for index, row in enumerate(all_positions[:-1])
-        if 2 <= row < len(evidence)
+        if 0 <= row < len(evidence)
     ]
     if not lattice_starts:
         raise IndexDecodeError("roll detector found no in-raster lattice origin")
@@ -1140,6 +1171,50 @@ def detect_live_boundaries(
     ).frame_starts
 
 
+def scanner_addressable_interval_count(intervals: Sequence[FrameInterval]) -> int:
+    """Exclude only an incomplete terminal sliver from transport mapping.
+
+    The whole-roll lattice deliberately retains a trailing partial cell as
+    diagnostic evidence.  It has no end boundary in the live ``0x8e`` table,
+    so treating it as another physical frame makes a valid six-frame strip
+    fail while resolving a nonexistent seventh origin.  Interior or fully
+    covered manual-review cells remain visible; this trims only a contiguous
+    suffix that explicitly ends outside the captured preview raster.
+    """
+
+    # Some boundary consumers use deliberately minimal structural doubles in
+    # their tests (or carry only the two row coordinates in a persisted
+    # compatibility view).  Those objects have no diagnostic basis on which
+    # to distinguish a terminal sliver, so retain their complete count rather
+    # than silently reinterpreting them as one.
+    if any(
+        not all(
+            hasattr(interval, attribute)
+            for attribute in (
+                "count_supported",
+                "coverage_fraction",
+                "review_reasons",
+            )
+        )
+        for interval in intervals
+    ):
+        return len(intervals)
+
+    count = len(intervals)
+    while count:
+        interval = intervals[count - 1]
+        if (
+            interval.count_supported
+            or interval.coverage_fraction >= 1.0
+            or "end-outside-index-raster" not in interval.review_reasons
+        ):
+            break
+        count -= 1
+    if count < 1:
+        raise IndexDecodeError("roll index has no scanner-addressable frame interval")
+    return count
+
+
 def derive_transport_mapping(
     boundaries: Sequence[GapBoundary],
     frame_count: int,
@@ -1148,7 +1223,8 @@ def derive_transport_mapping(
     minimum_scale: float = 40.0,
     maximum_scale: float = 45.0,
     maximum_anchor_mae_rows: float = 1.0,
-    maximum_anchor_error_rows: float = 2.0,
+    maximum_anchor_error_rows: float = MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS,
+    maximum_leading_anchor_error_rows: float = MAXIMUM_LEADING_ANCHOR_ERROR_ROWS,
 ) -> TransportMapping:
     """Map physical preview gaps through the same capture's 0x8e lookup.
 
@@ -1165,6 +1241,7 @@ def derive_transport_mapping(
         raise IndexDecodeError("transport mapping has no live 0x8e records")
     frame_boundaries = list(boundaries[:frame_count])
 
+    tail_start = terminal_transport_tail_start(records)
     direct: list[tuple[GapBoundary, TransportRecord]] = []
     for boundary in frame_boundaries:
         if (
@@ -1180,13 +1257,41 @@ def derive_transport_mapping(
                 f"{boundary.index + 1} is outside the live 0x8e table"
             )
         direct.append((boundary, records[lookup_row]))
-    if len(direct) < 3:
+    fit_candidates = [
+        item for item in direct if tail_start is None or item[1].row < tail_start
+    ]
+    # The leading clear-film run may be clipped by the preview raster edge.
+    # Keep its exact same-traversal 0x8e origin, but do not let that one-sided
+    # run tilt the affine model used to resolve genuinely inferred gaps.  It
+    # remains separately bounded below, while the interior anchors retain the
+    # stricter global residual contract.  Repeated LS-5000 full-roll captures
+    # show that Nikon's special leading record can move by almost four preview
+    # rows even when the interior fit is exceptionally tight (MAE 0.275, max
+    # 1.161).  Five rows admits that bounded leader behavior without weakening
+    # any interior anchor, scale, monotonicity, or same-traversal requirement.
+    leading_anchor = next(
+        (item for item in fit_candidates if item[0].index == 0),
+        None,
+    )
+    fit_direct = (
+        [item for item in fit_candidates if item[0].index != 0]
+        if leading_anchor is not None and len(fit_candidates) > 4
+        else fit_candidates
+    )
+    if len(fit_direct) < 3:
         raise IndexDecodeError(
-            "transport mapping requires at least three direct physical gaps"
+            "transport mapping requires at least three direct physical gaps "
+            "before the terminal transport tail"
         )
 
-    x = np.asarray([item.output_row for item, _record in direct], dtype=np.float64)
-    y = np.asarray([record.native_origin for _item, record in direct], dtype=np.float64)
+    x = np.asarray(
+        [item.output_row for item, _record in fit_direct],
+        dtype=np.float64,
+    )
+    y = np.asarray(
+        [record.native_origin for _item, record in fit_direct],
+        dtype=np.float64,
+    )
     design = np.column_stack((np.ones(len(x)), x))
     intercept, scale = np.linalg.lstsq(design, y, rcond=None)[0]
     if not minimum_scale <= scale <= maximum_scale:
@@ -1203,9 +1308,22 @@ def derive_transport_mapping(
             f"preview traversal (MAE {anchor_mae:.3f} rows, max "
             f"{anchor_max:.3f} rows)"
         )
+    leading_anchor_requires_review = False
+    if leading_anchor is not None and leading_anchor not in fit_direct:
+        boundary, record = leading_anchor
+        leading_error = abs(
+            (intercept + scale * boundary.output_row - record.native_origin) / scale
+        )
+        if leading_error > maximum_leading_anchor_error_rows:
+            raise IndexDecodeError(
+                "leading transport anchor is inconsistent with the interior "
+                f"preview traversal ({leading_error:.3f} rows)"
+            )
+        leading_anchor_requires_review = leading_error > maximum_anchor_error_rows
 
     direct_by_index = {item.index: record for item, record in direct}
     origins: list[NativeFrameOrigin] = []
+    terminal_boundary_index: int | None = None
     for frame, boundary in enumerate(frame_boundaries, start=1):
         prediction = float(intercept + scale * boundary.output_row)
         record = direct_by_index.get(boundary.index)
@@ -1233,6 +1351,18 @@ def derive_transport_mapping(
             method = "affine-guided-local-lookup"
             reasons = list(boundary.review_reasons)
             reasons.append("transport-origin-inferred")
+            automatic = False
+        if tail_start is not None and record.row >= tail_start:
+            if terminal_boundary_index is None:
+                terminal_boundary_index = boundary.index
+        if boundary.index == 0 and leading_anchor_requires_review:
+            reasons.append(LEADING_ANCHOR_REVIEW_REASON)
+            automatic = False
+        if (
+            terminal_boundary_index is not None
+            and boundary.index >= terminal_boundary_index
+        ):
+            reasons.append("terminal-transport-tail")
             automatic = False
         residual = (prediction - record.native_origin) / scale
         origins.append(

@@ -92,14 +92,9 @@ class ManualReviewRequired(RollMismatch):
 
 
 class RefeedRequired(RollMismatch):
-    """The transport is parked at a physical end-stop and will not answer a
-    fresh index read.
+    """Compatibility exception for a confirmed physical refeed condition.
 
-    A preview traversal of a strip shorter than a full roll can leave the
-    transport parked at the end of its travel. The next batch's fine-scan
-    fresh index read then fails outright. No automatic recovery is
-    attempted: the operator has to physically refeed the strip before
-    retrying.
+    Generic command-status text is not sufficient to emit this exception.
     """
 
 

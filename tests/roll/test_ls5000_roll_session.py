@@ -76,7 +76,9 @@ def _synthetic_index(
     aperture[: boundaries[0]] = clear_base + clear_noise[: boundaries[0]]
     aperture[boundaries[-1] :] = clear_base + clear_noise[boundaries[-1] :]
     for boundary in boundaries:
-        aperture[boundary - 3 : boundary + 3] = clear_base + clear_noise[boundary - 3 : boundary + 3]
+        aperture[boundary - 3 : boundary + 3] = (
+            clear_base + clear_noise[boundary - 3 : boundary + 3]
+        )
     if content_frames < 40:
         clear_start = boundaries[content_frames]
         aperture[clear_start:] = clear_base + clear_noise[clear_start:]
@@ -107,6 +109,20 @@ def _preview_fixture(
     content_frames: int = 40,
     slot_capacity_hint: int = 40,
 ) -> PreviewFixture:
+    dynamic_37 = slot_capacity_hint == 37
+    native_height = 232_401 if dynamic_37 else 250_278
+    decoded_height = 5_668 if dynamic_37 else 6_104
+    startup_status = "022b4b0000000000" if dynamic_37 else "0000000000000000"
+    preview_binding = {
+        "mode": ("canonical-prefix-37-record" if dynamic_37 else "canonical-40-record"),
+        "startup_records": 37 if dynamic_37 else 40,
+        "native_height": native_height,
+        "decoded_height": decoded_height,
+        "expected_stream_bytes": decoded_height * 1_024,
+        "read_count": 45 if dynamic_37 else 48,
+        "active_read_sequence_range": [118, 162] if dynamic_37 else [118, 165],
+        "skipped_read_sequence_range": [163, 165] if dynamic_37 else None,
+    }
     attempt = tmp_path / "preview-attempt"
     attempt.mkdir()
     output = attempt / "capture.bin"
@@ -114,7 +130,10 @@ def _preview_fixture(
     preview_path = attempt / "capture-preview.bin"
     table_path = attempt / "capture-008e.bin"
     mapping_path = attempt / "capture-frame-map.json"
-    rgb = _synthetic_index(content_frames=content_frames)
+    rgb = _synthetic_index(
+        height=decoded_height,
+        content_frames=content_frames,
+    )
     preview = _encode_index(rgb)
     table = _transport_table(len(rgb))
     preview_path.write_bytes(preview)
@@ -122,16 +141,26 @@ def _preview_fixture(
     receipt = {
         "status": "preview-only-complete",
         "slot_capacity_hint": slot_capacity_hint,
-        "slot_capacity_semantics": ("scanner-addressable preview slots; not an exposure count"),
+        "slot_capacity_semantics": (
+            "scanner-addressable preview slots; not an exposure count"
+        ),
         "preview_bytes": len(preview),
         "preview_sha256": _sha256(preview),
         "table_bytes": len(table),
         "table_sha256": _sha256(table),
         "frame_detection": "deferred-offline",
+        "startup_table": {
+            "count": slot_capacity_hint,
+            "sha256": "a" * 64,
+            "status": startup_status,
+        },
+        "preview_binding": preview_binding,
     }
     mapping_path.write_text(json.dumps(receipt), encoding="utf-8")
     journal_path = attempt / "journal.json"
     engine_sha256 = "b" * 64
+    density_session_id = "single-reservation-roll-preview"
+    density_exposures = [71_373, 137_524, 126_126]
     journal = {
         "status": "complete",
         "capture_mode": "preview-only",
@@ -149,18 +178,41 @@ def _preview_fixture(
         "plan_sha256": CANONICAL_PLAN_SHA256,
         "capture_engine_sha256": engine_sha256,
         "scanner_identity": "Nikon LS-5000 ED 1.03",
+        "expected_usb_bus": 1,
+        "expected_usb_address": 2,
+        "actual_usb_bus": 1,
+        "actual_usb_address": 2,
         "preview_geometry_validated_before_reads": True,
         "preview_windows": [
             {
                 "color_id": color,
                 "resolution": [97, 97],
                 "origin": [0, 0],
-                "size": [3_946, 250_278],
+                "size": [3_946, native_height],
                 "bit_depth": 16,
+                "density_f03_exposure_raw_10ns": exposure,
             }
-            for color in (1, 2, 3)
+            for color, exposure in zip(
+                (1, 2, 3),
+                density_exposures,
+                strict=True,
+            )
         ],
-        "live_startup_0x8f": {"count": slot_capacity_hint},
+        "density_calibration_session_id": density_session_id,
+        "nikon_density_evidence": {
+            "exposure_binding": {
+                "session_id": density_session_id,
+                "capture_attempt_id": attempt.name,
+                "scan_identity": f"{density_session_id}:density-97dpi:{_sha256(preview)}",
+                "density_f03_exposures_raw_10ns_rgb": density_exposures,
+            }
+        },
+        "live_startup_0x8f": {
+            "count": slot_capacity_hint,
+            "sha256": "a" * 64,
+        },
+        "live_startup_0x8f_status": startup_status,
+        "live_preview_binding": preview_binding,
         "live_index_artifacts": {
             "mapping": str(mapping_path.resolve()),
             "preview": str(preview_path.resolve()),
@@ -224,19 +276,150 @@ def test_complete_preview_builds_fixed_order_session_with_exact_transport_origin
     assert all(slot.thumbnail.shape[1:] == (96, 3) for slot in session.slots)
     assert all(slot.thumbnail.dtype == np.uint16 for slot in session.slots)
     assert session.selected_slots == ()
+    assert session.preview.usb_topology == (1, 2)
     origin = session.resolve_origin(18, 0)
     assert origin.native_origin == 42 * origin.lookup_row
     assert origin is session.slots[17].base_origin
 
 
-def test_preview_refuses_a_live_startup_table_that_is_not_40_slots(
+def test_37_record_preview_builds_dynamic_geometry_and_slots(tmp_path: Path) -> None:
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=37,
+        slot_capacity_hint=37,
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert session.geometry == roll_index.IndexGeometry(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=232_401,
+        width=96,
+        height=5_668,
+        block_bytes=2_048,
+        expected_stream_bytes=5_804_032,
+    )
+    assert [slot.slot_id for slot in session.slots] == list(range(1, 38))
+    assert session.preview.preview_artifact.byte_length == 5_804_032
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("expected_usb_bus", None, "expected USB topology is invalid"),
+        ("actual_usb_address", 0, "actual USB topology is invalid"),
+        (
+            "actual_usb_address",
+            3,
+            "actual USB topology differs from the expected device",
+        ),
+    ],
+)
+def test_preview_refuses_invalid_or_mismatched_usb_topology(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    journal[field] = value
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(RollSessionIntegrityError, match=message):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+@pytest.mark.parametrize("value", [None, True, 0, -1, 0x1_0000_0000])
+def test_preview_refuses_invalid_density_f03_window_exposure(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    journal["preview_windows"][0]["density_f03_exposure_raw_10ns"] = value
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        RollSessionIntegrityError,
+        match="density f03 exposure.*nonzero uint32",
+    ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+def test_preview_refuses_old_window_schema_without_density_f03_exposure(
+    tmp_path: Path,
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    del journal["preview_windows"][0]["density_f03_exposure_raw_10ns"]
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        RollSessionIntegrityError,
+        match="preview window has an unexpected schema",
+    ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+def test_preview_refuses_density_f03_exposure_that_disagrees_with_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    journal["preview_windows"][0]["density_f03_exposure_raw_10ns"] += 1
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        RollSessionIntegrityError,
+        match="density f03 exposures disagree with their evidence",
+    ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+@pytest.mark.parametrize(
+    "exposure_binding",
+    [
+        None,
+        {},
+        {
+            "session_id": "single-reservation-roll-preview",
+            "capture_attempt_id": "preview-attempt",
+            "scan_identity": "scan",
+            "density_f03_exposures_raw_10ns_rgb": [71_373, 137_524],
+        },
+    ],
+)
+def test_preview_refuses_malformed_density_exposure_evidence(
+    tmp_path: Path,
+    exposure_binding: object,
+) -> None:
+    fixture = _preview_fixture(tmp_path)
+    journal = json.loads(json.dumps(fixture.result.journal))
+    journal["nikon_density_evidence"]["exposure_binding"] = exposure_binding
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        RollSessionIntegrityError,
+        match="preview density exposure evidence is malformed",
+    ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+def test_preview_refuses_a_live_startup_table_outside_proven_counts(
     tmp_path: Path,
 ) -> None:
     fixture = _preview_fixture(tmp_path, slot_capacity_hint=6)
 
     with pytest.raises(
         RollSessionIntegrityError,
-        match="40-slot|SA-30",
+        match="40- or 37-record",
     ):
         build_roll_preview_session(fixture.result)
 
@@ -280,7 +463,9 @@ def test_material_change_uses_explicit_rgb4_routes_without_claiming_bw_ir(
     assert bw.recipe.repair_with_ir_after_import is False
 
 
-def test_selected_slots_are_an_immutable_ordered_operator_choice(tmp_path: Path) -> None:
+def test_selected_slots_are_an_immutable_ordered_operator_choice(
+    tmp_path: Path,
+) -> None:
     session = build_roll_preview_session(_preview_fixture(tmp_path).result)
 
     selected = session.with_selected_slots((3, 7, 18))
@@ -386,10 +571,38 @@ def test_manual_origin_approval_is_bound_to_exact_reviewed_thumbnail_and_roll(
     assert approval.slot == 37
     assert approval.boundary_offset_rows == 0
     assert approval.review_reasons
-    assert session.validate_manual_approval(approval, slot_id=37, boundary_offset_rows=0)
+    assert session.validate_manual_approval(
+        approval, slot_id=37, boundary_offset_rows=0
+    )
 
     with pytest.raises(ValueError, match="does not require manual review"):
         session.approve_manual_origin(2, 0)
+
+
+def test_boundary_only_review_with_automatic_origin_can_be_approved(
+    tmp_path: Path,
+) -> None:
+    session = build_roll_preview_session(
+        _preview_fixture(tmp_path, content_frames=36).result,
+        expected_frame_count=36,
+    )
+    slot = session.slots[35]
+    assert slot.slot_id == 36
+    assert slot.manual_review is True
+    assert slot.base_origin.automatic is True
+    assert slot.base_origin.manual_review is False
+    assert "end-broad-clear-region" in slot.warnings
+
+    approval = session.approve_manual_origin(36, 0)
+
+    assert approval.reviewed_lookup_row == slot.base_origin.lookup_row
+    assert approval.reviewed_native_origin == slot.base_origin.native_origin
+    assert "end-broad-clear-region" in approval.review_reasons
+    assert session.validate_manual_approval(
+        approval,
+        slot_id=36,
+        boundary_offset_rows=0,
+    )
 
 
 def test_session_pixel_arrays_cannot_be_made_writeable(tmp_path: Path) -> None:
