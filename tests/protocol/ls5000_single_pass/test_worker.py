@@ -93,6 +93,19 @@ LIVE8_TRANSPORT_FIELDS = (
     (223958, 296, 260),
 )
 
+LIVE37_STARTUP_FRAME_TABLE_HEX = (
+    "8f000000012c012a25000000039c0001001800001b4a0009001a000032f80011001c"
+    "00004a980019001c000062380021001c000079a0002900140000915c003100180000"
+    "a90a0039001a0000c0aa0041001a0000d84a0049001a0000efea0051001a000107"
+    "440059001000011f2a0061001a000136ca0069001a00014e6a0071001a000165fc"
+    "0079001800017db80081001c0001954a0089001a0001acea0091001a0001c47c0099"
+    "01020001dc3800a1001c0001f3bc00a9001800020b4000b10014000222ee00b90016"
+    "00023ab800c1001c0002523c00c90018000269c000d100140002816e00d900160002"
+    "992a00e1001a0002b0ca00e9001a0002c85c00f100180002dfe000f900140002f78e"
+    "0101001600030f3c01090102000326ea0111001a00033e7c01190018000356460121"
+    "001e"
+)
+
 
 def _reviewed_fingerprint() -> ReviewedRollFingerprint:
     return ReviewedRollFingerprint(
@@ -322,15 +335,32 @@ def test_preview_binds_37_record_canonical_prefix_before_set_window() -> None:
     ]
 
 
-def test_preview_refuses_37_record_noncanonical_prefix_before_set_window() -> None:
+def test_preview_binds_live_37_record_transport_table_before_set_window() -> None:
     plan = load_canonical_plan()
     canonical_geometry = worker_module._derive_index_geometry(plan)
-    payload = bytearray(_canonical_startup_frame_table(37))
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        bytes.fromhex(LIVE37_STARTUP_FRAME_TABLE_HEX),
+        worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        canonical_geometry,
+    )
+
+    assert binding.mode == "canonical-prefix-37-record"
+    assert binding.startup_records == 37
+    assert binding.geometry.native_height == 232_401
+    assert binding.geometry.expected_stream_bytes == 5_804_032
+
+
+def test_preview_refuses_invalid_37_record_transport_table_before_set_window() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = bytearray(bytes.fromhex(LIVE37_STARTUP_FRAME_TABLE_HEX))
     payload[-1] ^= 1
 
     with pytest.raises(
         worker_module.SynchronizedProtocolError,
-        match="not the exact canonical Nikon record prefix",
+        match="not a valid Nikon transport record table",
     ):
         worker_module._bind_preview_to_startup_table(
             plan,
@@ -343,6 +373,28 @@ def test_preview_refuses_37_record_noncanonical_prefix_before_set_window() -> No
         window = decode_window_block(bytes.fromhex(plan[sequence - 1]["data_out"]))
         assert window is not None
         assert window["height"] == 250_278
+
+
+def test_preview_refuses_irregular_37_record_selector_ramp() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = bytearray(bytes.fromhex(LIVE37_STARTUP_FRAME_TABLE_HEX))
+    final_record = 10 + 36 * 8
+    _origin, selector, code = struct.unpack_from(">IHH", payload, final_record)
+    selector += 1
+    origin = worker_module.transport_native_origin(code, selector)
+    struct.pack_into(">IHH", payload, final_record, origin, selector, code)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="not a valid Nikon transport record table",
+    ):
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            bytes(payload),
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
+        )
 
 
 def test_dynamic_preview_final_read_marks_scan_drained() -> None:

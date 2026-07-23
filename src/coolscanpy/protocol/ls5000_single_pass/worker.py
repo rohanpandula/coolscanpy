@@ -2641,6 +2641,34 @@ def _patch_preview_read_allocation(
     entry.pop("drains_scan", None)
 
 
+def _validate_short_preview_frame_table_records(payload: bytes) -> None:
+    """Validate a live 37-record Nikon transport table without freezing its positions."""
+
+    records = tuple(struct.iter_unpack(">IHH", payload[10:]))
+    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    if len(records) != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS:
+        raise SynchronizedProtocolError(
+            "command 64: short startup table does not contain the required "
+            f"{SHORT_FULL_ROLL_FRAME_TABLE_RECORDS} complete transport records; "
+            "no preview window was sent"
+        )
+
+    first_selector = records[0][1]
+    previous_origin = -1
+    for index, (native_origin, selector, code) in enumerate(records):
+        if (
+            selector != first_selector + 8 * index
+            or native_origin <= previous_origin
+            or native_origin >= native_height
+            or transport_native_origin(code, selector) != native_origin
+        ):
+            raise SynchronizedProtocolError(
+                "command 64: short startup table is not a valid Nikon transport "
+                "record table; no preview window was sent"
+            )
+        previous_origin = native_origin
+
+
 def _bind_preview_to_startup_table(
     plan: list[dict],
     payload: bytes,
@@ -2679,14 +2707,13 @@ def _bind_preview_to_startup_table(
     canonical_payload = bytes.fromhex(
         _entry(plan, VARIABLE_FRAME_TABLE_SEQUENCE).get("expected_data_in", "")
     )
-    if (
-        len(canonical_payload) != VARIABLE_FRAME_TABLE_MAX_BYTES
-        or payload[10:] != canonical_payload[10 : len(payload)]
-    ):
+    if len(canonical_payload) != VARIABLE_FRAME_TABLE_MAX_BYTES:
         raise SynchronizedProtocolError(
-            "command 64: short startup table is not the exact canonical Nikon "
-            "record prefix; no preview window was sent"
+            "command 64: canonical startup table template is malformed; "
+            "no preview window was sent"
         )
+    if payload[10:] != canonical_payload[10 : len(payload)]:
+        _validate_short_preview_frame_table_records(payload)
 
     native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
     for sequence in PREVIEW_SET_WINDOW_SEQUENCES:
