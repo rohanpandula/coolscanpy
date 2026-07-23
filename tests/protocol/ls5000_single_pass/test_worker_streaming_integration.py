@@ -28,6 +28,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from coolscanpy import _roll as roll_module
+from coolscanpy.capture.single_pass_workflow import (
+    SinglePassAttempt,
+    SinglePassFinalizationResult,
+    SinglePassSession,
+)
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import streaming_sidecar as sidecar_module
 from coolscanpy.protocol.ls5000_single_pass.streaming_sidecar import FineStreamSession
@@ -156,7 +162,11 @@ def _new_log() -> dict:
 
 
 def _patch_continuation_common(
-    monkeypatch: pytest.MonkeyPatch, plan: list[dict], *, fine_reads: int = 1
+    monkeypatch: pytest.MonkeyPatch,
+    plan: list[dict],
+    *,
+    fine_reads: int = 1,
+    full_meter_payload: bool = False,
 ) -> dict:
     canonical_target = worker_module.validate_plan(plan)
     tiny_target = {
@@ -166,8 +176,9 @@ def _patch_continuation_common(
         "request_parts": [1],
     }
     monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", fine_reads)
-    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
-    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    if not full_meter_payload:
+        monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+        monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
 
     accepted_proposal = SimpleNamespace(
@@ -180,7 +191,17 @@ def _patch_continuation_common(
         accepted=True,
         final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
         refusals=(),
-        to_dict=lambda: {"accepted": True},
+        to_dict=lambda: {
+            "accepted": True,
+            "final_exposures_raw_10ns": dict(worker_module.DEFAULT_EXPOSURES),
+            "steps": [
+                {
+                    "observation": {
+                        "exposures_raw_10ns": dict(worker_module.DEFAULT_EXPOSURES)
+                    }
+                }
+            ],
+        },
     )
     monkeypatch.setattr(worker_module, "observe_meter_pass", lambda *_a, **_k: object())
     monkeypatch.setattr(
@@ -203,6 +224,7 @@ def _drive_continuation(
     perform=None,
     fine_reads: int = 1,
     fail_fine_read_index: int | None = None,
+    full_meter_payload: bool = False,
 ) -> tuple[dict, worker_module.BatchFrameSpec]:
     """Run one continuation frame with the fake-USB harness; return its journal."""
 
@@ -249,7 +271,12 @@ def _drive_continuation(
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
     )
-    _patch_continuation_common(monkeypatch, plan, fine_reads=fine_reads)
+    _patch_continuation_common(
+        monkeypatch,
+        plan,
+        fine_reads=fine_reads,
+        full_meter_payload=full_meter_payload,
+    )
 
     def ready(_ep_out, _ep_in, entries, **_kwargs):
         return 1, 0
@@ -269,7 +296,13 @@ def _drive_continuation(
                 *worker_module.FINE_GET_WINDOW_SEQUENCES,
             ):
                 payload = bytes.fromhex(entry["expected_data_in"])
-            elif sequence in worker_module.METER_READ_SEQUENCES or sequence == 607:
+            elif sequence in worker_module.METER_READ_SEQUENCES:
+                payload = (
+                    b"\x12\x34" * (entry["request_len"] // 2)
+                    if full_meter_payload
+                    else b"x"
+                )
+            elif sequence == 607:
                 payload = b"x"
             else:
                 payload = bytes.fromhex(entry.get("expected_data_in", ""))
@@ -331,6 +364,58 @@ def test_continuation_loop_wires_hook_and_binds_finish_to_raw_sha(
     assert len(log["sessions"]) == 1
     assert log["submit_calls"] == [(0, b"x")]
     assert log["finish_calls"] == [(0, hashlib.sha256(b"x").hexdigest(), 1)]
+
+
+def test_continuation_meter_evidence_is_accepted_by_publication_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal, second = _drive_continuation(
+        tmp_path,
+        monkeypatch,
+        open_session=lambda *_a: None,
+        full_meter_payload=True,
+    )
+    journal_payload = second.journal.read_bytes()
+    attempt = SinglePassAttempt(
+        session=SinglePassSession(root=tmp_path, session_id="continuation-consumer"),
+        attempt_id=second.output.parent.name,
+        directory=second.output.parent,
+        stream_path=second.output,
+        journal_path=second.journal,
+        selected_slot=second.slot,
+        worker_returncode=0,
+        boundary_offset_rows=second.boundary_offset_rows,
+    )
+    finalization = SinglePassFinalizationResult(
+        manifest_path=second.output.parent / "manifest.json",
+        output_paths={},
+        manifest={
+            "sources": {
+                "capture_journal": {
+                    "path": second.journal.name,
+                    "bytes": len(journal_payload),
+                    "sha256": hashlib.sha256(journal_payload).hexdigest(),
+                }
+            },
+            "exposure_evidence": {
+                "accepted_contract": journal["meter_final_exposures"]
+            },
+        },
+        resumed=False,
+        scratch_deleted=False,
+    )
+
+    meter_rgbi, final_rgb = roll_module._read_exact_analyzer_source(
+        attempt, finalization
+    )
+
+    assert meter_rgbi.shape == (425, 281, 4)
+    assert int(meter_rgbi[0, 0, 0]) == 0x1234
+    assert final_rgb == (
+        worker_module.DEFAULT_EXPOSURES["R"],
+        worker_module.DEFAULT_EXPOSURES["G"],
+        worker_module.DEFAULT_EXPOSURES["B"],
+    )
 
 
 def test_synchronous_decoder_exception_never_aborts_continuation_capture(

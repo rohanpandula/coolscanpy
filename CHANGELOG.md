@@ -17,6 +17,10 @@ back into `SEND(0x8f)`. The physical `40..45` scale and anchor-residual gates
 remain unchanged. This prevents a terminal slot from pulling an otherwise
 valid six-strip fit from about `42.33` to the observed false `61.34` scale.
 
+Continuation frames now record the same complete 285-dpi analyzer layout as
+the first frame, allowing their durable meter sidecars to pass Nikon-exact
+publication validation in multi-frame batches.
+
 0.1.3's live-table-vs-fingerprint frame count check broke full-roll scanning.
 A batch run over slots 3 and 20 of a reviewed 36-exposure roll failed with
 a `RollMismatch` reporting a live table of 37 scanner-addressable records

@@ -148,6 +148,26 @@ VARIABLE_FRAME_TABLE_CDB = "28008f00000300014a80"
 VARIABLE_FRAME_TABLE_MAX_BYTES = 330
 
 
+def _meter_layout_receipt() -> dict[str, object]:
+    """Return the one pinned meter layout used by every batch frame."""
+
+    return {
+        "passes": 3,
+        "rows_per_pass": 425,
+        "columns": 281,
+        "decoded_raster_channel_order": ["R", "G", "B", "IR"],
+        "wire_window_color_order": list(WIRE_METER_COLORS),
+        "wire_color_to_controller_channel": {
+            str(color): channel
+            for color, channel in WIRE_COLOR_TO_CONTROLLER_CHANNEL.items()
+        },
+        "sample_byte_order": "big-endian-u16",
+        "row_core_bytes": 2_248,
+        "row_stride_bytes": 2_560,
+        "row_tail_bytes": 312,
+    }
+
+
 class ProtocolError(RuntimeError):
     pass
 
@@ -2912,12 +2932,7 @@ def _run_live_continuation_frame(
         "nikon_density_frame_ownership": density_ownership,
         "meter_evidence_path": str(meter_path.resolve()),
         "meter_observed_exposures_raw_10ns": [],
-        "meter_layout": {
-            "wire_colors": list(WIRE_METER_COLORS),
-            "controller_channels": list(CONTROLLER_CHANNELS),
-            "pass_count": len(METER_READ_GROUPS),
-            "group_bytes": METER_GROUP_BYTES,
-        },
+        "meter_layout": _meter_layout_receipt(),
         "meter_completed_reads": 0,
         "meter_completed_bytes": 0,
         "meter_pass_exposures_raw_10ns": [],
@@ -4040,23 +4055,7 @@ def run_live_capture(
                             )
                         )
                     journal["meter_observed_exposures_raw_10ns"] = []
-                    journal["meter_layout"] = {
-                        "passes": 3,
-                        "rows_per_pass": 425,
-                        "columns": 281,
-                        "decoded_raster_channel_order": ["R", "G", "B", "IR"],
-                        "wire_window_color_order": list(WIRE_METER_COLORS),
-                        "wire_color_to_controller_channel": {
-                            str(color): channel
-                            for color, channel in (
-                                WIRE_COLOR_TO_CONTROLLER_CHANNEL.items()
-                            )
-                        },
-                        "sample_byte_order": "big-endian-u16",
-                        "row_core_bytes": 2_248,
-                        "row_stride_bytes": 2_560,
-                        "row_tail_bytes": 312,
-                    }
+                    journal["meter_layout"] = _meter_layout_receipt()
                     journal["meter_completed_reads"] = 0
                     journal["meter_completed_bytes"] = 0
                     journal["meter_pass_exposures_raw_10ns"] = []
