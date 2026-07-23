@@ -267,6 +267,33 @@ def test_startup_frame_table_accepts_complete_short_payload_underrun(
     ]
 
 
+def test_fixed_preview_refuses_short_startup_table_before_set_window() -> None:
+    payload = _startup_frame_table(37)
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match=(
+            "306-byte/37-record startup table.*"
+            "fixed 40-slot preview window was not sent"
+        ),
+    ):
+        worker_module._require_fixed_preview_startup_table(
+            payload,
+            worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        )
+
+
+def test_fixed_preview_accepts_complete_canonical_startup_table() -> None:
+    payload = _startup_frame_table(40)
+
+    table = worker_module._require_fixed_preview_startup_table(
+        payload,
+        bytes(8),
+    )
+
+    assert table["count"] == 40
+
+
 def test_startup_frame_table_rejects_nonzero_status_without_a_short_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2334,7 +2361,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         encoding="utf-8",
     )
 
-    startup = _startup_frame_table(36)
+    startup = _startup_frame_table(40)
     header_8e = b"\0\x8e\0\0\0\x06"
     prevalidated = False
     reserves: list[int] = []
@@ -2426,8 +2453,8 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         return TransactionResult(
             phase=3,
             payload=startup,
-            status=worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
-            sense="2b4b00",
+            status=bytes(8),
+            sense="000000",
             stall_recoveries=0,
         )
 
@@ -2615,9 +2642,9 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     assert releases == [(ep_out, ep_in)]
     first_receipt = json.loads(first.journal.read_text(encoding="utf-8"))
     assert first_receipt["status"] == "frame-complete"
-    assert first_receipt["live_startup_0x8f"]["count"] == 36
-    assert first_receipt["live_startup_0x8f_status"] == "022b4b0000000000"
-    assert first_receipt["live_startup_0x8f_short_underrun_accepted"] is True
+    assert first_receipt["live_startup_0x8f"]["count"] == 40
+    assert first_receipt["live_startup_0x8f_status"] == "0000000000000000"
+    assert first_receipt["live_startup_0x8f_short_underrun_accepted"] is False
     assert first_receipt["session_reservation_retained"] is True
     assert first_receipt["unit_released"] is False
     assert first_receipt["nikon_density_calibration"]["numerators_rgb"] == [

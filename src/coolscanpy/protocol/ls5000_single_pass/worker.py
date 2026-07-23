@@ -166,6 +166,7 @@ VARIABLE_FRAME_TABLE_SEQUENCE = 64
 VARIABLE_FRAME_TABLE_CDB = "28008f00000300014a80"
 VARIABLE_FRAME_TABLE_MAX_BYTES = 330
 VARIABLE_FRAME_TABLE_SHORT_STATUS = bytes.fromhex("022b4b0000000000")
+FIXED_PREVIEW_FRAME_TABLE_RECORDS = 40
 
 
 def _meter_layout_receipt() -> dict[str, object]:
@@ -2525,6 +2526,27 @@ def _perform_variable_frame_table_transaction(
     )
 
 
+def _require_fixed_preview_startup_table(
+    payload: bytes,
+    status: bytes,
+) -> dict[str, object]:
+    """Refuse the fixed 40-slot preview path when the scanner reports less."""
+
+    table = _validate_variable_frame_table_payload(payload)
+    if (
+        len(payload) != VARIABLE_FRAME_TABLE_MAX_BYTES
+        or table["count"] != FIXED_PREVIEW_FRAME_TABLE_RECORDS
+        or status != bytes(8)
+    ):
+        raise SynchronizedProtocolError(
+            "command 64: scanner returned a "
+            f"{len(payload)}-byte/{table['count']}-record startup table with "
+            f"status {status.hex()}; the fixed "
+            f"{FIXED_PREVIEW_FRAME_TABLE_RECORDS}-slot preview window was not sent"
+        )
+    return table
+
+
 def _perform_with_busy_retry(
     ep_out: Any,
     ep_in: Any,
@@ -3934,11 +3956,16 @@ def run_live_capture(
                         result.payload
                     )
                     journal["live_startup_0x8f"] = startup_table
+                    journal["live_startup_0x8f_payload_hex"] = result.payload.hex()
                     journal["live_startup_0x8f_status"] = result.status.hex()
                     journal["live_startup_0x8f_short_underrun_accepted"] = (
                         result.status == VARIABLE_FRAME_TABLE_SHORT_STATUS
                     )
                     _write_journal(journal_path, journal)
+                    _require_fixed_preview_startup_table(
+                        result.payload,
+                        result.status,
+                    )
                 if entry["seq"] in (115, 116, 117):
                     preview_window_payloads.append(result.payload)
                     if entry["seq"] == 117:

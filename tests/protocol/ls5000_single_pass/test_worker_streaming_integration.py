@@ -598,11 +598,11 @@ def _drive_two_frame_batch(
         encoding="utf-8",
     )
 
-    startup = bytearray(10 + 37 * 8)
+    startup = bytearray(10 + 40 * 8)
     startup[:4] = b"\x8f\0\0\0"
     startup[4:6] = (len(startup) - 6).to_bytes(2, "big")
     startup[6:8] = (len(startup) - 8).to_bytes(2, "big")
-    startup[8] = 37
+    startup[8] = 40
     header_8e = b"\0\x8e\0\0\0\x06"
     state = {"prevalidated": False}
 
