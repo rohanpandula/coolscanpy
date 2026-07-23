@@ -161,6 +161,7 @@ def test_preview_ready_confirmation_groups_replay_every_observed_tur(
     sequences: tuple[int, ...],
 ) -> None:
     calls: list[int] = []
+    sleeps: list[float] = []
 
     def ready(_ep_out, _ep_in, entry, *, data_timeout_ms):
         assert data_timeout_ms == 30_000
@@ -174,7 +175,7 @@ def test_preview_ready_confirmation_groups_replay_every_observed_tur(
         )
 
     monkeypatch.setattr(worker_module, "perform_transaction", ready)
-    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(worker_module.time, "sleep", sleeps.append)
     plan = load_canonical_plan()
     entries = [plan[sequence - 1] for sequence in sequences]
 
@@ -187,6 +188,9 @@ def test_preview_ready_confirmation_groups_replay_every_observed_tur(
     assert polls == len(sequences)
     assert stalls == 0
     assert calls == [sequences[-1]] * len(sequences)
+    assert sleeps == list(
+        worker_module.PREVIEW_READY_CONFIRMATION_DELAYS_SECONDS[sequences]
+    )
 
 
 def test_other_ready_groups_still_collapse_at_the_terminal_state(

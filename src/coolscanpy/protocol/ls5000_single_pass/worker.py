@@ -112,6 +112,14 @@ PREVIEW_READY_CONFIRMATION_GROUPS = (
     (79, 80),
     (84, 85, 86, 87),
 )
+# Completion-to-next-CDB gaps measured from the same Nikon Scan oracle as the
+# immutable preview SET_WINDOW payloads.  These are not ordinary busy-poll
+# intervals: they are host-side settle boundaries between all-ready
+# confirmations, so preserve both the calls and their observed timing.
+PREVIEW_READY_CONFIRMATION_DELAYS_SECONDS = {
+    (79, 80): (1.367343,),
+    (84, 85, 86, 87): (0.0, 0.006530, 0.124961),
+}
 FRAME_TABLE_SEND_SEQUENCE = 174
 FRAME_TABLE_SEND_RECORDS = 37
 FRAME_TABLE_SEND_BYTES = 4 + FRAME_TABLE_SEND_RECORDS * 8
@@ -2579,6 +2587,7 @@ def _perform_ready_group(
     minimum_polls = (
         len(entries) if sequences in PREVIEW_READY_CONFIRMATION_GROUPS else 1
     )
+    confirmation_delays = PREVIEW_READY_CONFIRMATION_DELAYS_SECONDS.get(sequences)
     deadline = time.monotonic() + READY_POLL_DEADLINE_SECONDS
     polls = 0
     stalls = 0
@@ -2599,7 +2608,8 @@ def _perform_ready_group(
             # Preserve only Nikon's two proven preview-settle confirmation
             # groups.  Every other traced TUR run remains state-aware and
             # collapses as soon as its terminal state is observed.
-            time.sleep(READY_POLL_SECONDS)
+            assert confirmation_delays is not None
+            time.sleep(confirmation_delays[polls - 1])
             continue
         if result.sense in additional_terminal_senses:
             # Callers may name a semantically safe terminal state that differs
