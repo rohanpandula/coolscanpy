@@ -46,6 +46,7 @@ from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     derive_transport_mapping,
     detect_roll_frames,
     parse_live_transport_records_bytes,
+    scanner_addressable_interval_count,
     transport_native_origin,
     validate_live_0x8e_bytes,
 )
@@ -883,12 +884,13 @@ def build_roll_preview_session(
         validated_table,
         maximum_rows=geometry.height,
     )
+    scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
     mapping = derive_transport_mapping(
         detection.boundaries,
-        len(detection.intervals),
+        scanner_frame_count,
         records,
     )
-    slot_count = min(capacity, len(detection.intervals), len(mapping.origins))
+    slot_count = min(capacity, scanner_frame_count, len(mapping.origins))
     if slot_count < 1:
         raise RollSessionError("roll preview produced no scanner-addressable slots")
     preview = ValidatedRollPreview(

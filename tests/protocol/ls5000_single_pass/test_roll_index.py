@@ -225,6 +225,24 @@ def test_complete_row_zero_leading_cell_is_not_silently_renumbered() -> None:
     # instead of being mistaken for a seventh complete exposure.
     assert detection.intervals[-1].coverage_fraction < 0.50
     assert detection.intervals[-1].manual_review
+    assert roll.scanner_addressable_interval_count(detection.intervals) == 6
+
+
+def test_scanner_addressable_interval_count_keeps_interior_manual_cells() -> None:
+    rgb, boundaries = _synthetic_roll(6, leader=0, tail=3)
+    # Preserve the final sliver, but make an interior cell require review.
+    rgb[boundaries[2] : boundaries[3], 2:92] = np.asarray(
+        (34_200, 25_500, 17_800), dtype=np.uint16
+    )
+
+    detection = _detect(rgb)
+
+    assert not detection.intervals[2].count_supported
+    assert detection.intervals[-1].coverage_fraction < 0.50
+    # Only the terminal incomplete suffix is trimmed; a full interior cell is
+    # still represented for manual review rather than silently dropping later
+    # frames.
+    assert roll.scanner_addressable_interval_count(detection.intervals) == 6
 
 
 def test_clipped_leading_cell_remains_excluded_fail_closed() -> None:
@@ -628,9 +646,10 @@ def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None
         table,
         maximum_rows=geometry.height,
     )
+    scanner_frame_count = roll.scanner_addressable_interval_count(detection.intervals)
     mapping = roll.derive_transport_mapping(
         detection.boundaries,
-        len(detection.intervals),
+        scanner_frame_count,
         records,
     )
 
@@ -648,6 +667,7 @@ def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None
         (571, 715),
         (715, 857),
     ]
+    assert scanner_frame_count == 6
     assert detection.confidence == "high"
     assert detection.intervals[-1].coverage_fraction < 0.50
     assert detection.intervals[-1].manual_review
@@ -661,7 +681,41 @@ def test_banked_live_row_zero_strip_retains_all_six_complete_intervals() -> None
         30_394,
     ]
     assert mapping.origins[5].automatic
-    assert "terminal-transport-tail" in mapping.origins[6].review_reasons
+
+
+@pytest.mark.skipif(
+    LIVE_PREVIEW is None
+    or LIVE_TABLE is None
+    or not LIVE_PREVIEW.is_file()
+    or not LIVE_TABLE.is_file(),
+    reason=(
+        "banked live preview attempt is unavailable; set "
+        f"{_LIVE_PREVIEW_DIR_ENV} to its artifact directory"
+    ),
+)
+def test_banked_live_terminal_sliver_is_not_mapped_as_a_frame() -> None:
+    geometry = roll.IndexGeometry(
+        97, 4_000, 41, 3_946, 250_278, 96, 6_104, 2_048, 6_250_496
+    )
+    table, usable_rows = roll.validate_live_0x8e_bytes(
+        LIVE_TABLE.read_bytes(), geometry.height
+    )
+    rgb, known, _report = roll.decode_full_index_bytes(
+        LIVE_PREVIEW.read_bytes(), geometry, usable_rows=usable_rows
+    )
+    detection = roll.detect_roll_frames(
+        rgb, known, nominal_frame_rows=5_959 // geometry.pitch
+    )
+    scanner_frame_count = roll.scanner_addressable_interval_count(detection.intervals)
+    mapping = roll.derive_transport_mapping(
+        detection.boundaries,
+        scanner_frame_count,
+        roll.parse_live_transport_records_bytes(table, maximum_rows=geometry.height),
+    )
+
+    assert scanner_frame_count == 6
+    assert len(mapping.origins) == 6
+    assert detection.intervals[-1].coverage_fraction < 0.50
 
 
 @pytest.mark.skipif(

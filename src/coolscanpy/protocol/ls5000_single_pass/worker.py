@@ -73,6 +73,7 @@ from .roll_index import (
     derive_transport_mapping,
     detect_roll_frames,
     parse_live_transport_records_bytes,
+    scanner_addressable_interval_count,
     terminal_transport_tail_start,
     transport_native_origin,
     validate_live_0x8e_bytes,
@@ -1031,9 +1032,11 @@ def _derive_live_frame_selection(
     records = parse_live_transport_records_bytes(
         validated_table, maximum_rows=geometry.height
     )
+    scanner_frame_count = scanner_addressable_interval_count(detection.intervals)
+    scanner_intervals = detection.intervals[:scanner_frame_count]
     mapping = derive_transport_mapping(
         detection.boundaries,
-        len(detection.intervals),
+        scanner_frame_count,
         records,
     )
     fresh_fingerprint: ReviewedRollFingerprint | None = None
@@ -1042,8 +1045,7 @@ def _derive_live_frame_selection(
         fresh_fingerprint = build_reviewed_roll_fingerprint(
             rgb16,
             frame_intervals=tuple(
-                (interval.start_row, interval.end_row)
-                for interval in detection.intervals
+                (interval.start_row, interval.end_row) for interval in scanner_intervals
             ),
             frame_native_origins=tuple(
                 origin.native_origin for origin in mapping.origins
@@ -1691,12 +1693,13 @@ def _canonical_frame_table_records() -> tuple[tuple[int, int, int], ...]:
     """Read the immutable Nikon-accepted 37-record SEND(0x8f) page."""
 
     entry = next(
-        entry for entry in load_canonical_plan() if entry.get("seq") == FRAME_TABLE_SEND_SEQUENCE
+        entry
+        for entry in load_canonical_plan()
+        if entry.get("seq") == FRAME_TABLE_SEND_SEQUENCE
     )
     payload = bytes.fromhex(str(entry.get("data_out", "")))
-    if (
-        len(payload) != FRAME_TABLE_SEND_BYTES
-        or payload[:4] != bytes((0x01, 0x2A, FRAME_TABLE_SEND_RECORDS, 0x00))
+    if len(payload) != FRAME_TABLE_SEND_BYTES or payload[:4] != bytes(
+        (0x01, 0x2A, FRAME_TABLE_SEND_RECORDS, 0x00)
     ):
         raise ProtocolError("canonical SEND(0x8f) page is not the proven 37 records")
     records = tuple(
@@ -1705,8 +1708,13 @@ def _canonical_frame_table_records() -> tuple[tuple[int, int, int], ...]:
     )
     previous = -1
     for native_origin, selector, code in records:
-        if native_origin <= previous or transport_native_origin(code, selector) != native_origin:
-            raise ProtocolError("canonical SEND(0x8f) page has an invalid transport record")
+        if (
+            native_origin <= previous
+            or transport_native_origin(code, selector) != native_origin
+        ):
+            raise ProtocolError(
+                "canonical SEND(0x8f) page has an invalid transport record"
+            )
         previous = native_origin
     return records
 
@@ -1844,9 +1852,10 @@ def _bind_plan_to_live_selection(
     # Recheck the exact values that cross the unsafe hardware boundary.  Nikon
     # accepts only this fixed 300-byte page, and the CDB must declare precisely
     # those bytes.
-    if len(table_payload) != FRAME_TABLE_SEND_BYTES or int.from_bytes(
-        table_cdb[6:9], "big"
-    ) != FRAME_TABLE_SEND_BYTES:
+    if (
+        len(table_payload) != FRAME_TABLE_SEND_BYTES
+        or int.from_bytes(table_cdb[6:9], "big") != FRAME_TABLE_SEND_BYTES
+    ):
         raise ProtocolError(
             "SEND(0x8f) transfer length does not match its declared table"
         )

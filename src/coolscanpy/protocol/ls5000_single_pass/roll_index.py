@@ -1168,6 +1168,50 @@ def detect_live_boundaries(
     ).frame_starts
 
 
+def scanner_addressable_interval_count(intervals: Sequence[FrameInterval]) -> int:
+    """Exclude only an incomplete terminal sliver from transport mapping.
+
+    The whole-roll lattice deliberately retains a trailing partial cell as
+    diagnostic evidence.  It has no end boundary in the live ``0x8e`` table,
+    so treating it as another physical frame makes a valid six-frame strip
+    fail while resolving a nonexistent seventh origin.  Interior or fully
+    covered manual-review cells remain visible; this trims only a contiguous
+    suffix that explicitly ends outside the captured preview raster.
+    """
+
+    # Some boundary consumers use deliberately minimal structural doubles in
+    # their tests (or carry only the two row coordinates in a persisted
+    # compatibility view).  Those objects have no diagnostic basis on which
+    # to distinguish a terminal sliver, so retain their complete count rather
+    # than silently reinterpreting them as one.
+    if any(
+        not all(
+            hasattr(interval, attribute)
+            for attribute in (
+                "count_supported",
+                "coverage_fraction",
+                "review_reasons",
+            )
+        )
+        for interval in intervals
+    ):
+        return len(intervals)
+
+    count = len(intervals)
+    while count:
+        interval = intervals[count - 1]
+        if (
+            interval.count_supported
+            or interval.coverage_fraction >= 1.0
+            or "end-outside-index-raster" not in interval.review_reasons
+        ):
+            break
+        count -= 1
+    if count < 1:
+        raise IndexDecodeError("roll index has no scanner-addressable frame interval")
+    return count
+
+
 def derive_transport_mapping(
     boundaries: Sequence[GapBoundary],
     frame_count: int,
