@@ -62,7 +62,7 @@ from .meter import (
     propose_next_exposures,
     verify_final_convergence,
 )
-from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes
+from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes, load_canonical_plan
 from .roll_index import (
     IndexGeometry,
     NativeFrameOrigin,
@@ -1217,7 +1217,7 @@ def _derive_live_batch_selections(
     # the live table cannot address. So the only direction left for this
     # comparison to refuse on its own is the one with no legitimate cause at
     # all: more addressable live records than the reviewed roll described.
-    live_signable_frame_count = build_live_frame_table_payload(combined)[2]
+    live_signable_frame_count = len(_addressable_frame_origins(combined))
     reviewed_frame_count = len(reviewed_fingerprint.frame_start_rows)
     if live_signable_frame_count > reviewed_frame_count + 1:
         raise ProtocolError(
@@ -1225,7 +1225,7 @@ def _derive_live_batch_selections(
             f"frame records, more than one above the {reviewed_frame_count} "
             "the reviewed roll fingerprint described"
         )
-    for origin in combined.origins[:FRAME_TABLE_SEND_RECORDS]:
+    for origin in _addressable_frame_origins(combined):
         if origin.native_origin + FINE_NATIVE_HEIGHT > context.geometry.native_height:
             raise ProtocolError(
                 f"frame {origin.frame} fine window exceeds native transport height"
@@ -1635,10 +1635,12 @@ def apply_batch_boundary_offsets(
         )
         resolved.append((base, selected))
 
-    # Validate the exact fixed-size payload now, before any selected frame is
-    # scanned.  This also catches offsets that would make origins overlap.
-    table = build_live_frame_table_payload(combined)
-    table_count = table[2]
+    # Validate the fixed-size Nikon page now, before any selected frame is
+    # scanned.  Its 37 entries are a firmware configuration page, rather than
+    # a count of detected film frames.  Selection legality must therefore use
+    # the separately derived physical prefix, not the page header.
+    build_live_frame_table_payload(combined)
+    table_count = len(_addressable_frame_origins(combined))
     for frame in ordered_slots:
         if frame > table_count:
             raise ProtocolError(
@@ -1648,8 +1650,15 @@ def apply_batch_boundary_offsets(
     return combined, tuple(resolved)
 
 
-def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
-    """Encode Nikon SEND(0x8f) records from this traversal's raw 0x8e fields."""
+def _addressable_frame_origins(
+    mapping: TransportMapping,
+) -> tuple[NativeFrameOrigin, ...]:
+    """Return the proven physical prefix of a preview traversal.
+
+    This count is deliberately independent of the 37 entries in Nikon's
+    SEND(0x8f) configuration page.  A preview may expose an advisory terminal
+    cell, while the firmware page remains fixed-size even for a short strip.
+    """
 
     # The preview UI deliberately exposes every aligned candidate cell, including
     # a partial final cell when the index raster ends mid-frame.  That advisory
@@ -1663,7 +1672,7 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
         "spacing-outlier",
         "terminal-transport-tail",
     }
-    origins = []
+    origins: list[NativeFrameOrigin] = []
     for origin in mapping.origins:
         if (
             non_addressable_reasons.intersection(origin.review_reasons)
@@ -1671,25 +1680,50 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
         ):
             break
         origins.append(origin)
-    # Every full-roll Nikon host SEND observed on this firmware used exactly
-    # 37 records / 300 bytes, so this function used to require at least 37
-    # origins before building anything and always truncated to exactly 37.
-    # That was a full-roll-era tripwire against truncated indexes, not a
-    # hardware minimum: roll identity is guarded by the reviewed-fingerprint
-    # comparison that runs immediately after, and addressing safety only
-    # requires that every requested slot actually exist in the table this
-    # function returns. apply_batch_boundary_offsets and
-    # _bind_plan_to_live_selection both already refuse a requested frame
-    # beyond the table they receive, so the only floor this function needs
-    # to hold on its own is unconditional: fewer than 2 records cannot
-    # describe an addressable roll or strip at all. The preview UI's own
-    # advisory ceiling above stays capped at the proven 37, since nothing
-    # bigger than a full roll has ever been sent.
     if len(origins) < 2:
         raise ProtocolError(
             "live mapping has fewer than 2 scanner-addressable frame records"
         )
-    origins = tuple(origins[:FRAME_TABLE_SEND_RECORDS])
+    return tuple(origins[:FRAME_TABLE_SEND_RECORDS])
+
+
+def _canonical_frame_table_records() -> tuple[tuple[int, int, int], ...]:
+    """Read the immutable Nikon-accepted 37-record SEND(0x8f) page."""
+
+    entry = next(
+        entry for entry in load_canonical_plan() if entry.get("seq") == FRAME_TABLE_SEND_SEQUENCE
+    )
+    payload = bytes.fromhex(str(entry.get("data_out", "")))
+    if (
+        len(payload) != FRAME_TABLE_SEND_BYTES
+        or payload[:4] != bytes((0x01, 0x2A, FRAME_TABLE_SEND_RECORDS, 0x00))
+    ):
+        raise ProtocolError("canonical SEND(0x8f) page is not the proven 37 records")
+    records = tuple(
+        struct.unpack_from(">IHH", payload, 4 + record * 8)
+        for record in range(FRAME_TABLE_SEND_RECORDS)
+    )
+    previous = -1
+    for native_origin, selector, code in records:
+        if native_origin <= previous or transport_native_origin(code, selector) != native_origin:
+            raise ProtocolError("canonical SEND(0x8f) page has an invalid transport record")
+        previous = native_origin
+    return records
+
+
+def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
+    """Build the fixed 37-record Nikon SEND(0x8f) configuration page.
+
+    The physical prefix belongs to this traversal; the unused suffix comes
+    from the captured Nikon page.  On a short strip the latter is not a
+    candidate for capture -- only the physical prefix can be selected -- but
+    it preserves the firmware-required 300-byte page shape.  The canonical
+    tail was accepted by this firmware on the retained short-strip preview;
+    the live prefix remains guarded by its exact transport identity and every
+    selected-frame geometry check.
+    """
+
+    origins = _addressable_frame_origins(mapping)
     payload = bytearray((0x01, 0x2A, len(origins), 0x00))
     previous = -1
     for expected_frame, origin in enumerate(origins, start=1):
@@ -1708,6 +1742,20 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
             struct.pack(">IHH", origin.native_origin, origin.selector, origin.code)
         )
         previous = origin.native_origin
+
+    if len(origins) < FRAME_TABLE_SEND_RECORDS:
+        canonical_records = _canonical_frame_table_records()
+        for native_origin, selector, code in canonical_records[len(origins) :]:
+            if native_origin <= previous:
+                raise ProtocolError(
+                    "canonical SEND(0x8f) tail does not continue after the live mapping"
+                )
+            payload.extend(struct.pack(">IHH", native_origin, selector, code))
+            previous = native_origin
+
+    payload[2] = FRAME_TABLE_SEND_RECORDS
+    if len(payload) != FRAME_TABLE_SEND_BYTES:
+        raise ProtocolError("SEND(0x8f) frame table is not the proven 37 records")
     return bytes(payload)
 
 
@@ -1733,14 +1781,15 @@ def _bind_plan_to_live_selection(
     bound = [dict(entry) for entry in plan]
     native_origin = selection.selected.native_origin
 
+    addressable_origins = _addressable_frame_origins(selection.mapping)
     table_payload = build_live_frame_table_payload(selection.mapping)
-    table_count = table_payload[2]
-    if selection.frame > table_count:
+    addressable_count = len(addressable_origins)
+    if selection.frame > addressable_count:
         raise ProtocolError(
             f"requested frame {selection.frame} is outside the scanner-addressable "
-            f"table 1..{table_count}"
+            f"table 1..{addressable_count}"
         )
-    for origin in selection.mapping.origins[:table_count]:
+    for origin in addressable_origins:
         if origin.native_origin + FINE_NATIVE_HEIGHT > selection.geometry.native_height:
             raise ProtocolError(
                 f"frame {origin.frame} fine window exceeds native transport height"
@@ -1792,15 +1841,12 @@ def _bind_plan_to_live_selection(
         expected[18:22] = native_origin.to_bytes(4, "big")
         entry["expected_data_in"] = expected.hex()
 
-    # Recheck the exact values that cross the unsafe hardware boundary. The
-    # table's byte length is no longer pinned to the full-roll 300-byte shape
-    # (build_live_frame_table_payload now sizes it from the live mapping); what
-    # still has to hold, unconditionally, is that the bytes the CDB declares
-    # are exactly the bytes being transferred, so a short or long USB transfer
-    # can never desynchronize the device.
-    if len(table_payload) != 4 + table_count * 8 or int.from_bytes(
+    # Recheck the exact values that cross the unsafe hardware boundary.  Nikon
+    # accepts only this fixed 300-byte page, and the CDB must declare precisely
+    # those bytes.
+    if len(table_payload) != FRAME_TABLE_SEND_BYTES or int.from_bytes(
         table_cdb[6:9], "big"
-    ) != len(table_payload):
+    ) != FRAME_TABLE_SEND_BYTES:
         raise ProtocolError(
             "SEND(0x8f) transfer length does not match its declared table"
         )

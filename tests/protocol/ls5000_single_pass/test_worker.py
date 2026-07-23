@@ -859,11 +859,30 @@ def test_frame_table_refuses_fewer_than_two_origins() -> None:
         build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:1]))
 
 
-def test_frame_table_accepts_a_short_strip_mapping_below_37_origins() -> None:
-    payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:6]))
+def test_frame_table_keeps_short_strip_prefix_in_the_fixed_nikon_page() -> None:
+    """A short strip keeps its live entries but never shortens SEND(0x8f).
 
-    assert payload[2] == 6
-    assert len(payload) == 4 + 6 * 8
+    The 2026-07-22 LS-5000 receipt proves that the firmware rejects the
+    otherwise well-formed six-record / 52-byte transfer with 05/26/00.  The
+    short-strip preview trace proves that the canonical unused tail is accepted
+    with the same physical media.  Retain the six live records used by the
+    later autofocus/window commands and fill the remaining page positions from
+    that Nikon-accepted tail.
+    """
+
+    payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS[:6]))
+    canonical = bytes.fromhex(
+        next(entry for entry in load_canonical_plan() if entry["seq"] == 174)[
+            "data_out"
+        ]
+    )
+
+    assert payload[:4] == bytes.fromhex("012a2500")
+    assert len(payload) == FRAME_TABLE_SEND_BYTES
+    assert payload[4 : 4 + 6 * 8] == b"".join(
+        struct.pack(">IHH", *field) for field in LIVE8_TRANSPORT_FIELDS[:6]
+    )
+    assert payload[4 + 6 * 8 :] == canonical[4 + 6 * 8 :]
 
 
 def _with_terminal_sixth_origin(
@@ -885,9 +904,15 @@ def test_frame_table_stops_before_terminal_transport_tail() -> None:
     mapping, _records = _short_strip_mapping(6)
 
     payload = build_live_frame_table_payload(_with_terminal_sixth_origin(mapping))
+    canonical = bytes.fromhex(
+        next(entry for entry in load_canonical_plan() if entry["seq"] == 174)[
+            "data_out"
+        ]
+    )
 
-    assert payload[2] == 5
-    assert len(payload) == 4 + 5 * 8
+    assert payload[:4] == bytes.fromhex("012a2500")
+    assert len(payload) == FRAME_TABLE_SEND_BYTES
+    assert payload[4 + 5 * 8 :] == canonical[4 + 5 * 8 :]
 
 
 def test_manual_approval_cannot_address_terminal_transport_tail() -> None:
@@ -1257,7 +1282,36 @@ def test_batch_offsets_accept_every_requested_slot_in_a_short_strip_mapping() ->
             mapping=combined,
             selected=combined.origins[slot - 1],
         )
-        _bind_plan_to_live_selection(bound_plan, selection)
+        bound = _bind_plan_to_live_selection(bound_plan, selection)
+
+        # The logical six-frame strip must still transmit Nikon's full page;
+        # only the first six records are physical and selectable.
+        assert bound[173]["cdb"] == "2a008f00000300012c00"
+        assert len(bytes.fromhex(bound[173]["data_out"])) == FRAME_TABLE_SEND_BYTES
+
+
+def test_short_strip_offset_replaces_its_prefix_record_not_the_nikon_tail() -> None:
+    mapping, records = _short_strip_mapping(6)
+
+    adjusted, selected = apply_boundary_offset(
+        mapping,
+        records,
+        frame=6,
+        offset_rows=-1,
+    )
+    payload = build_live_frame_table_payload(adjusted)
+    canonical = bytes.fromhex(
+        next(entry for entry in load_canonical_plan() if entry["seq"] == 174)[
+            "data_out"
+        ]
+    )
+
+    assert struct.unpack_from(">IHH", payload, 4 + 5 * 8) == (
+        selected.native_origin,
+        selected.selector,
+        selected.code,
+    )
+    assert payload[4 + 6 * 8 :] == canonical[4 + 6 * 8 :]
 
 
 def test_batch_offsets_refuse_a_requested_slot_beyond_the_addressable_short_table() -> (
