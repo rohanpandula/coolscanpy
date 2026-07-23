@@ -56,7 +56,6 @@ from coolscanpy.exceptions import (
     GeometryValidationError,
     ManualReviewRequired,
     PyCoolscanError,
-    RefeedRequired,
     RollMismatch,
     SafeStopRequested,
     TransportSmearDetected,
@@ -894,26 +893,6 @@ class Roll:
                             ("error", ManualReviewRequired(message, slot=slots[0]))
                         )
                         return
-                    if (
-                        "command 64 status" in message
-                        and "!= 0000000000000000" in message
-                    ):
-                        # The fine-scan fresh index read's startup status came
-                        # back non-zero: the transport is parked at its
-                        # end-stop, most often left there by a preview
-                        # traversal of a strip shorter than a full roll.
-                        frame_queue.put(
-                            (
-                                "error",
-                                RefeedRequired(
-                                    "the fine-scan fresh index read failed because the "
-                                    "transport is parked at the end-stop from an earlier "
-                                    "preview; pull the strip fully out, reinsert it until "
-                                    "the feeder grips, then retry the batch"
-                                ),
-                            )
-                        )
-                        return
                     frame_queue.put(("error", RollMismatch(message)))
                     return
 
@@ -1163,12 +1142,6 @@ def _journal_error(attempt: Any) -> str | None:
         if isinstance(error, str):
             return error
     return None
-
-
-def _is_command_64_end_stop(message: str | None) -> bool:
-    return bool(
-        message and "command 64 status" in message and "!= 0000000000000000" in message
-    )
 
 
 def _translate_finalization_error(error: SinglePassWorkflowError) -> PyCoolscanError:

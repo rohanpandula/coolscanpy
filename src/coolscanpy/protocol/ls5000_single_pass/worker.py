@@ -147,6 +147,7 @@ EXPECTED_PREVIEW_BYTES = 6_250_496
 VARIABLE_FRAME_TABLE_SEQUENCE = 64
 VARIABLE_FRAME_TABLE_CDB = "28008f00000300014a80"
 VARIABLE_FRAME_TABLE_MAX_BYTES = 330
+VARIABLE_FRAME_TABLE_SHORT_STATUS = bytes.fromhex("022b4b0000000000")
 
 
 def _meter_layout_receipt() -> dict[str, object]:
@@ -2431,7 +2432,7 @@ def _perform_variable_frame_table_transaction(
     *,
     data_timeout_ms: int,
 ) -> TransactionResult:
-    """Accept sequence 64's positive short response only if it is complete."""
+    """Accept a complete short 0x8f table despite Nikon's underrun status."""
 
     checks = {
         "seq": VARIABLE_FRAME_TABLE_SEQUENCE,
@@ -2488,7 +2489,12 @@ def _perform_variable_frame_table_transaction(
         raise DesynchronizedProtocolError(
             f"command 64 status length {len(status)} != 8"
         )
-    if status.hex() != entry["expected_status"]:
+    expected_status = bytes.fromhex(entry["expected_status"])
+    short_table_underrun = (
+        status == VARIABLE_FRAME_TABLE_SHORT_STATUS
+        and len(payload) < VARIABLE_FRAME_TABLE_MAX_BYTES
+    )
+    if status != expected_status and not short_table_underrun:
         raise SynchronizedProtocolError(
             f"command 64 status {status.hex()} != {entry['expected_status']}"
         )
@@ -3898,6 +3904,10 @@ def run_live_capture(
                         result.payload
                     )
                     journal["live_startup_0x8f"] = startup_table
+                    journal["live_startup_0x8f_status"] = result.status.hex()
+                    journal["live_startup_0x8f_short_underrun_accepted"] = (
+                        result.status == VARIABLE_FRAME_TABLE_SHORT_STATUS
+                    )
                     _write_journal(journal_path, journal)
                 if entry["seq"] in (115, 116, 117):
                     preview_window_payloads.append(result.payload)

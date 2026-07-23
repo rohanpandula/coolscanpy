@@ -186,13 +186,16 @@ against other bodies are welcome, and an LS-50 test is particularly wanted:
 its transport and optics differ from the LS-5000, and none of those
 differences are covered here yet.
 
-Strips shorter than a full roll can park at the transport end-stop after a
-whole-strip traversal. A subsequent operation can therefore raise
-`RefeedRequired`. Do not retry that insertion or pull against the feeder's
-grip; first establish that the strip is fully out, then physically refeed it
-and open a fresh `Roll`. If the live transport table has already entered its
-terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain visible for
-review but are deliberately not scanner-addressable on that insertion.
+On the tested LS-5000/SA-21, startup `READ(0x8f)` can return a complete
+self-declared shorter frame-table envelope with the observed `022b4b`
+data-underrun status. coolscanpy accepts that status only when the envelope is
+valid and shorter than the requested 40-slot maximum; every malformed,
+full-length, or differently failed response still refuses before motion. The
+later live `0x8e` index and preview independently validate roll identity and
+frame addressability before any fine scan. If the live transport table has
+already entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots
+remain visible for review but are deliberately not scanner-addressable on that
+insertion.
 
 The converted SA-21 can park or eject a strip after an uncharacterized idle
 interval. Start the intended capture promptly after feeding. A transport-index

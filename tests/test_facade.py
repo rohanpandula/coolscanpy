@@ -3044,13 +3044,9 @@ class TestRollBatchRefusal:
             roll.close()
             dev.close()
 
-    def test_command_64_end_stop_status_raises_refeed_required(
+    def test_command_64_nonzero_status_is_not_misreported_as_refeed_required(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
-        # This is the sense-failure signature a short-strip preview leaves
-        # behind: the fine-scan fresh index read's command 64 comes back
-        # with a non-zero status because the transport is parked at its
-        # end-stop.
         message = (
             "SynchronizedProtocolError: command 64 status 022b4b0000000000 "
             "!= 0000000000000000"
@@ -3063,10 +3059,10 @@ class TestRollBatchRefusal:
             roll.preview()
             if roll.needs_approval(1):
                 roll.approve(1)
-            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+            with pytest.raises(coolscanpy.RollMismatch) as excinfo:
                 next(iter(roll.scan_many([1])))
-            assert "refeed" in str(excinfo.value) or "reinsert" in str(excinfo.value)
-            assert isinstance(excinfo.value, coolscanpy.RollMismatch)
+            assert not isinstance(excinfo.value, coolscanpy.RefeedRequired)
+            assert str(excinfo.value) == message
         finally:
             roll.close()
             dev.close()

@@ -141,6 +141,148 @@ def _reviewed_fingerprint_with_count(count: int) -> ReviewedRollFingerprint:
     )
 
 
+def _startup_frame_table(count: int) -> bytes:
+    length = 10 + count * 8
+    return (
+        b"\x8f\x00\x00\x00"
+        + (length - 6).to_bytes(2, "big")
+        + (length - 8).to_bytes(2, "big")
+        + bytes((count, 0))
+        + bytes(count * 8)
+    )
+
+
+def test_startup_frame_table_accepts_complete_short_payload_underrun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _startup_frame_table(36)
+    reads = iter(
+        (
+            (b"\x03", 0),
+            (payload, 0),
+            (worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS, 0),
+        )
+    )
+    writes: list[bytes] = []
+    monkeypatch.setattr(
+        worker_module,
+        "_read_with_one_stall_recovery",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_write_exact",
+        lambda _endpoint, data, _timeout: writes.append(data),
+    )
+    entry = load_canonical_plan()[worker_module.VARIABLE_FRAME_TABLE_SEQUENCE - 1]
+
+    result = worker_module._perform_variable_frame_table_transaction(
+        object(),
+        object(),
+        entry,
+        data_timeout_ms=30_000,
+    )
+
+    assert result.payload == payload
+    assert result.status == worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS
+    assert writes == [
+        bytes.fromhex(worker_module.VARIABLE_FRAME_TABLE_CDB),
+        b"\xd0",
+        b"\x06",
+    ]
+
+
+def test_startup_frame_table_rejects_nonzero_status_without_a_short_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _startup_frame_table(40)
+    reads = iter(
+        (
+            (b"\x03", 0),
+            (payload, 0),
+            (worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS, 0),
+        )
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_read_with_one_stall_recovery",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_write_exact",
+        lambda *_args, **_kwargs: None,
+    )
+    entry = load_canonical_plan()[worker_module.VARIABLE_FRAME_TABLE_SEQUENCE - 1]
+
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="command 64 status 022b4b",
+    ):
+        worker_module._perform_variable_frame_table_transaction(
+            object(),
+            object(),
+            entry,
+            data_timeout_ms=30_000,
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        bytes.fromhex("022b4a0000000000"),
+        bytes.fromhex("012b4b0000000000"),
+        bytes.fromhex("022b4b0000000001"),
+    ),
+)
+def test_startup_frame_table_rejects_other_statuses_for_a_short_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    status: bytes,
+) -> None:
+    reads = iter(((b"\x03", 0), (_startup_frame_table(36), 0), (status, 0)))
+    monkeypatch.setattr(
+        worker_module,
+        "_read_with_one_stall_recovery",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(worker_module, "_write_exact", lambda *_args: None)
+    entry = load_canonical_plan()[worker_module.VARIABLE_FRAME_TABLE_SEQUENCE - 1]
+
+    with pytest.raises(worker_module.SynchronizedProtocolError):
+        worker_module._perform_variable_frame_table_transaction(
+            object(),
+            object(),
+            entry,
+            data_timeout_ms=30_000,
+        )
+
+
+def test_startup_frame_table_status_cannot_bypass_a_malformed_short_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed = bytearray(_startup_frame_table(36))
+    malformed[8] = 0
+    reads = iter(((b"\x03", 0), (bytes(malformed), 0)))
+    monkeypatch.setattr(
+        worker_module,
+        "_read_with_one_stall_recovery",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(worker_module, "_write_exact", lambda *_args: None)
+    entry = load_canonical_plan()[worker_module.VARIABLE_FRAME_TABLE_SEQUENCE - 1]
+
+    with pytest.raises(
+        worker_module.DesynchronizedProtocolError,
+        match="malformed bounded 0x8f response",
+    ):
+        worker_module._perform_variable_frame_table_transaction(
+            object(),
+            object(),
+            entry,
+            data_timeout_ms=30_000,
+        )
+
+
 def test_frozen_worker_uses_pinned_meter_identity_without_loose_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2117,11 +2259,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         encoding="utf-8",
     )
 
-    startup = bytearray(10 + 37 * 8)
-    startup[:4] = b"\x8f\0\0\0"
-    startup[4:6] = (len(startup) - 6).to_bytes(2, "big")
-    startup[6:8] = (len(startup) - 8).to_bytes(2, "big")
-    startup[8] = 37
+    startup = _startup_frame_table(36)
     header_8e = b"\0\x8e\0\0\0\x06"
     prevalidated = False
     reserves: list[int] = []
@@ -2212,9 +2350,9 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         assert entry["seq"] == worker_module.VARIABLE_FRAME_TABLE_SEQUENCE
         return TransactionResult(
             phase=3,
-            payload=bytes(startup),
-            status=bytes(8),
-            sense="000000",
+            payload=startup,
+            status=worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            sense="2b4b00",
             stall_recoveries=0,
         )
 
@@ -2402,6 +2540,9 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     assert releases == [(ep_out, ep_in)]
     first_receipt = json.loads(first.journal.read_text(encoding="utf-8"))
     assert first_receipt["status"] == "frame-complete"
+    assert first_receipt["live_startup_0x8f"]["count"] == 36
+    assert first_receipt["live_startup_0x8f_status"] == "022b4b0000000000"
+    assert first_receipt["live_startup_0x8f_short_underrun_accepted"] is True
     assert first_receipt["session_reservation_retained"] is True
     assert first_receipt["unit_released"] is False
     assert first_receipt["nikon_density_calibration"]["numerators_rgb"] == [
