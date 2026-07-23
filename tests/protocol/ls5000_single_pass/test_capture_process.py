@@ -138,6 +138,36 @@ def _batch_density_frame_provenance(
     return provenance, evidence.source_binding.wire_sha256, table_sha
 
 
+def test_capture_process_replays_37_record_density_geometry(tmp_path: Path) -> None:
+    session_id = "reservation-preview-37"
+    output = tmp_path / "frame-001" / "capture.bin"
+    output.parent.mkdir()
+    source = _density_source_fixture()[: 5_668 * 1_024]
+    calibration = single_pass.DensityCalibration.from_dict(
+        _density_calibration_provenance(session_id)["nikon_density_calibration"]
+    )
+    evidence = single_pass.build_nikon_density_evidence(
+        source,
+        calibration=calibration,
+        density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
+        session_id=session_id,
+        capture_attempt_id=output.parent.name,
+        scan_identity=f"{session_id}:density-97dpi:{hashlib.sha256(source).hexdigest()}",
+        source_native_height=232_401,
+        source_height=5_668,
+    )
+    output.with_name(f"{output.stem}-preview.bin").write_bytes(source)
+
+    rebuilt = capture._validated_density_evidence(
+        {"nikon_density_evidence": evidence.to_dict()},
+        output_path=output,
+    )
+
+    assert rebuilt == evidence
+    assert rebuilt.source_binding.native_height == 232_401
+    assert rebuilt.source_binding.height == 5_668
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

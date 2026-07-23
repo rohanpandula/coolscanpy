@@ -189,12 +189,15 @@ differences are covered here yet.
 On the tested LS-5000/SA-21, startup `READ(0x8f)` can return a complete
 self-declared shorter frame-table envelope with the observed `022b4b`
 data-underrun status. coolscanpy accepts that status only when the envelope is
-valid and shorter than the requested 40-slot maximum; every malformed,
-full-length, or differently failed response still refuses before motion. The
-later live `0x8e` index and preview independently validate roll identity and
-frame addressability before any fine scan. If the live transport table has
-already entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots
-remain visible for review but are deliberately not scanner-addressable on that
+valid and shorter than the requested 40-slot maximum. The observed exact
+37-record canonical prefix is also bound to a matching shorter preview window
+and read allocation; the canonical 40-record path is unchanged. Every other
+short count, changed record prefix, malformed envelope, full-length underrun,
+or differently failed response still refuses before motion. The later live
+`0x8e` index and preview independently validate roll identity and frame
+addressability before any fine scan. If the live transport table has already
+entered its terminal `0x81xx`/`0x83xx` suffix, affected trailing slots remain
+visible for review but are deliberately not scanner-addressable on that
 insertion.
 
 The converted SA-21 can park or eject a strip after an uncharacterized idle

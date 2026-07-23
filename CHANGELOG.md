@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Whole-roll preview now binds its motion window and USB read allocation to the
+observed complete 37-record startup-table prefix. The Nikon 40-record trace
+uses a native height of `42 * 5959`; the observed full-roll response omits the
+last three canonical records, so the bound preview uses `39 * 5959`, decodes
+5,668 complete rows, reads exactly 5,804,032 bytes, and marks that shorter
+final read as the scan drain boundary. The original 40-record plan remains
+byte-for-byte unchanged. Any other short count, status, record contents, odd
+row geometry, or non-contiguous read allocation still refuses before the first
+preview `SET_WINDOW`. Nikon-density evidence, offline replay, and the durable
+preview/frame mapping receipt now carry the exact whitelisted preview geometry,
+so a 37-record traversal remains independently size- and identity-verifiable.
+
 `Device.roll()` now accepts an optional caller-owned `attempts_root`. Evidence
 written below that directory survives `Roll.close()`, including failed-preview
 rasters, live `0x8e` transport tables, and journals needed for offline

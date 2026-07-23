@@ -109,6 +109,20 @@ def _preview_fixture(
     content_frames: int = 40,
     slot_capacity_hint: int = 40,
 ) -> PreviewFixture:
+    dynamic_37 = slot_capacity_hint == 37
+    native_height = 232_401 if dynamic_37 else 250_278
+    decoded_height = 5_668 if dynamic_37 else 6_104
+    startup_status = "022b4b0000000000" if dynamic_37 else "0000000000000000"
+    preview_binding = {
+        "mode": ("canonical-prefix-37-record" if dynamic_37 else "canonical-40-record"),
+        "startup_records": 37 if dynamic_37 else 40,
+        "native_height": native_height,
+        "decoded_height": decoded_height,
+        "expected_stream_bytes": decoded_height * 1_024,
+        "read_count": 45 if dynamic_37 else 48,
+        "active_read_sequence_range": [118, 162] if dynamic_37 else [118, 165],
+        "skipped_read_sequence_range": [163, 165] if dynamic_37 else None,
+    }
     attempt = tmp_path / "preview-attempt"
     attempt.mkdir()
     output = attempt / "capture.bin"
@@ -116,7 +130,10 @@ def _preview_fixture(
     preview_path = attempt / "capture-preview.bin"
     table_path = attempt / "capture-008e.bin"
     mapping_path = attempt / "capture-frame-map.json"
-    rgb = _synthetic_index(content_frames=content_frames)
+    rgb = _synthetic_index(
+        height=decoded_height,
+        content_frames=content_frames,
+    )
     preview = _encode_index(rgb)
     table = _transport_table(len(rgb))
     preview_path.write_bytes(preview)
@@ -132,6 +149,12 @@ def _preview_fixture(
         "table_bytes": len(table),
         "table_sha256": _sha256(table),
         "frame_detection": "deferred-offline",
+        "startup_table": {
+            "count": slot_capacity_hint,
+            "sha256": "a" * 64,
+            "status": startup_status,
+        },
+        "preview_binding": preview_binding,
     }
     mapping_path.write_text(json.dumps(receipt), encoding="utf-8")
     journal_path = attempt / "journal.json"
@@ -165,7 +188,7 @@ def _preview_fixture(
                 "color_id": color,
                 "resolution": [97, 97],
                 "origin": [0, 0],
-                "size": [3_946, 250_278],
+                "size": [3_946, native_height],
                 "bit_depth": 16,
                 "density_f03_exposure_raw_10ns": exposure,
             }
@@ -184,7 +207,12 @@ def _preview_fixture(
                 "density_f03_exposures_raw_10ns_rgb": density_exposures,
             }
         },
-        "live_startup_0x8f": {"count": slot_capacity_hint},
+        "live_startup_0x8f": {
+            "count": slot_capacity_hint,
+            "sha256": "a" * 64,
+        },
+        "live_startup_0x8f_status": startup_status,
+        "live_preview_binding": preview_binding,
         "live_index_artifacts": {
             "mapping": str(mapping_path.resolve()),
             "preview": str(preview_path.resolve()),
@@ -252,6 +280,33 @@ def test_complete_preview_builds_fixed_order_session_with_exact_transport_origin
     origin = session.resolve_origin(18, 0)
     assert origin.native_origin == 42 * origin.lookup_row
     assert origin is session.slots[17].base_origin
+
+
+def test_37_record_preview_builds_dynamic_geometry_and_slots(tmp_path: Path) -> None:
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=37,
+        slot_capacity_hint=37,
+    )
+
+    session = build_roll_preview_session(
+        fixture.result,
+        material=ScanMaterial.COLOR_NEGATIVE,
+    )
+
+    assert session.geometry == roll_index.IndexGeometry(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=232_401,
+        width=96,
+        height=5_668,
+        block_bytes=2_048,
+        expected_stream_bytes=5_804_032,
+    )
+    assert [slot.slot_id for slot in session.slots] == list(range(1, 38))
+    assert session.preview.preview_artifact.byte_length == 5_804_032
 
 
 @pytest.mark.parametrize(
@@ -357,14 +412,14 @@ def test_preview_refuses_malformed_density_exposure_evidence(
         build_roll_preview_session(replace(fixture.result, journal=journal))
 
 
-def test_preview_refuses_a_live_startup_table_that_is_not_40_slots(
+def test_preview_refuses_a_live_startup_table_outside_proven_counts(
     tmp_path: Path,
 ) -> None:
     fixture = _preview_fixture(tmp_path, slot_capacity_hint=6)
 
     with pytest.raises(
         RollSessionIntegrityError,
-        match="40-slot|SA-30",
+        match="40- or 37-record",
     ):
         build_roll_preview_session(fixture.result)
 

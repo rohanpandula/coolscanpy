@@ -61,6 +61,41 @@ LS5000_FINE_NATIVE_HEIGHT = 5_959
 SA30_ADAPTER_FRAME_CAPACITY = 40
 SESSION_VERSION = 1
 _PREVIEW_SLOT_SEMANTICS = "scanner-addressable preview slots; not an exposure count"
+_PREVIEW_BINDING_CONTRACTS: dict[int, dict[str, object]] = {
+    40: {
+        "mode": "canonical-40-record",
+        "startup_records": 40,
+        "native_height": 250_278,
+        "decoded_height": 6_104,
+        "expected_stream_bytes": 6_250_496,
+        "read_count": 48,
+        "active_read_sequence_range": [118, 165],
+        "skipped_read_sequence_range": None,
+        "startup_status": "0000000000000000",
+    },
+    37: {
+        "mode": "canonical-prefix-37-record",
+        "startup_records": 37,
+        "native_height": 232_401,
+        "decoded_height": 5_668,
+        "expected_stream_bytes": 5_804_032,
+        "read_count": 45,
+        "active_read_sequence_range": [118, 162],
+        "skipped_read_sequence_range": [163, 165],
+        "startup_status": "022b4b0000000000",
+    },
+}
+
+
+def _preview_binding_contract(slot_capacity: object) -> dict[str, object]:
+    if type(slot_capacity) is not int:
+        raise RollSessionIntegrityError("preview slot capacity is not an integer")
+    contract = _PREVIEW_BINDING_CONTRACTS.get(slot_capacity)
+    if contract is None:
+        raise RollSessionIntegrityError(
+            "preview startup count is not a proven 40- or 37-record contract"
+        )
+    return contract
 
 
 def _immutable_array(value: np.ndarray) -> np.ndarray:
@@ -608,15 +643,40 @@ def _validate_preview_result(
         )
     preview_sha256 = hashlib.sha256(preview).hexdigest()
     table_sha256 = hashlib.sha256(table).hexdigest()
+    slot_capacity = journal_receipt.get("slot_capacity_hint")
+    startup = _require_mapping(journal, "live_startup_0x8f")
+    preview_binding = _require_mapping(journal, "live_preview_binding")
+    contract = _preview_binding_contract(slot_capacity)
+    expected_binding = {
+        key: value for key, value in contract.items() if key != "startup_status"
+    }
+    startup_status = journal.get("live_startup_0x8f_status")
+    if (
+        startup.get("count") != slot_capacity
+        or not _is_sha256(startup.get("sha256"))
+        or startup_status != contract["startup_status"]
+        or preview_binding != expected_binding
+        or len(preview) != contract["expected_stream_bytes"]
+    ):
+        raise RollSessionIntegrityError(
+            "preview startup table, binding, and artifact length disagree"
+        )
+    startup_receipt = {
+        "count": slot_capacity,
+        "sha256": startup["sha256"],
+        "status": startup_status,
+    }
     expected_receipt = {
         "status": "preview-only-complete",
-        "slot_capacity_hint": journal_receipt.get("slot_capacity_hint"),
+        "slot_capacity_hint": slot_capacity,
         "slot_capacity_semantics": _PREVIEW_SLOT_SEMANTICS,
         "preview_bytes": len(preview),
         "preview_sha256": preview_sha256,
         "table_bytes": len(table),
         "table_sha256": table_sha256,
         "frame_detection": "deferred-offline",
+        "startup_table": startup_receipt,
+        "preview_binding": expected_binding,
     }
     if receipt != expected_receipt:
         raise RollSessionIntegrityError(
@@ -632,18 +692,6 @@ def _validate_preview_result(
         raise RollSessionIntegrityError(
             "preview journal evidence does not bind the saved artifacts"
         )
-    slot_capacity = journal_receipt.get("slot_capacity_hint")
-    startup = _require_mapping(journal, "live_startup_0x8f")
-    if (
-        type(slot_capacity) is not int
-        or slot_capacity != SA30_ADAPTER_FRAME_CAPACITY
-        or startup.get("count") != SA30_ADAPTER_FRAME_CAPACITY
-    ):
-        raise RollSessionIntegrityError(
-            "preview does not contain matching live proof of an "
-            "SA-30-compatible 40-slot adapter"
-        )
-
     return (
         journal,
         ArtifactIdentity(preview_path, len(preview), preview_sha256),
@@ -659,6 +707,18 @@ def _validate_preview_result(
 
 
 def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeometry:
+    startup = _require_mapping(journal, "live_startup_0x8f")
+    contract = _preview_binding_contract(startup.get("count"))
+    expected_binding = {
+        key: value for key, value in contract.items() if key != "startup_status"
+    }
+    if (
+        _require_mapping(journal, "live_preview_binding") != expected_binding
+        or preview_bytes != contract["expected_stream_bytes"]
+    ):
+        raise RollSessionIntegrityError(
+            "preview geometry does not match its startup-bound receipt"
+        )
     windows = journal.get("preview_windows")
     if type(windows) is not list or len(windows) != 3:
         raise RollSessionIntegrityError(
@@ -718,7 +778,7 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
     if (
         first["resolution"] != [97, 97]
         or first["origin"] != [0, 0]
-        or first["size"] != [3_946, 250_278]
+        or first["size"] != [3_946, contract["native_height"]]
         or first["bit_depth"] != 16
     ):
         raise RollSessionIntegrityError(
@@ -748,6 +808,9 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
         geometry.width != 96
         or geometry.height != geometry.native_height // geometry.pitch
         or geometry.height % 2
+        or geometry.native_height != contract["native_height"]
+        or geometry.height != contract["decoded_height"]
+        or geometry.expected_stream_bytes != contract["expected_stream_bytes"]
     ):
         raise RollSessionIntegrityError(
             "preview geometry does not match the LS-5000 RGB96 allocation"

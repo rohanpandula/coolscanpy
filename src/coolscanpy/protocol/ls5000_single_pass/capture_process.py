@@ -53,10 +53,10 @@ from .continuation_plan import (
     canonical_continuation_plan_bytes,
 )
 from .density import (
-    DENSITY_SOURCE_WIRE_BYTES,
     DensityCalibration,
     NikonDensityEvidence,
     NikonDensityFrameOwnershipReceipt,
+    NikonDensitySourceBinding,
     build_nikon_density_evidence,
 )
 from .plan import (
@@ -132,12 +132,6 @@ def _validated_density_evidence(
         raise ValueError("Nikon density source artifact is missing") from error
     if source_path.is_symlink() or not source_path.is_file():
         raise ValueError("Nikon density source artifact is not a regular file")
-    if stat.st_size != DENSITY_SOURCE_WIRE_BYTES:
-        raise ValueError("Nikon density source artifact has the wrong byte length")
-    try:
-        source_payload = source_path.read_bytes()
-    except OSError as error:
-        raise ValueError("Nikon density source artifact could not be read") from error
 
     calibration_binding = receipt.get("calibration_binding")
     exposure_binding = receipt.get("exposure_binding")
@@ -151,13 +145,25 @@ def _validated_density_evidence(
     exposures = exposure_binding.get("density_f03_exposures_raw_10ns_rgb")
     if type(exposures) is not list:
         raise ValueError("Nikon density f03 exposures are malformed")
+    parsed_source_binding = NikonDensitySourceBinding.from_dict(source_binding)
+    expected_source_bytes = (
+        parsed_source_binding.height * parsed_source_binding.row_stride_bytes
+    )
+    if stat.st_size != expected_source_bytes:
+        raise ValueError("Nikon density source artifact has the wrong byte length")
+    try:
+        source_payload = source_path.read_bytes()
+    except OSError as error:
+        raise ValueError("Nikon density source artifact could not be read") from error
     evidence = build_nikon_density_evidence(
         source_payload,
         calibration=calibration,
         density_f03_exposures_raw_10ns=tuple(exposures),
-        session_id=source_binding.get("session_id"),
-        capture_attempt_id=source_binding.get("capture_attempt_id"),
-        scan_identity=source_binding.get("scan_identity"),
+        session_id=parsed_source_binding.session_id,
+        capture_attempt_id=parsed_source_binding.capture_attempt_id,
+        scan_identity=parsed_source_binding.scan_identity,
+        source_native_height=parsed_source_binding.native_height,
+        source_height=parsed_source_binding.height,
     )
     if evidence.to_dict() != receipt:
         raise ValueError("Nikon density evidence does not reproduce its receipt")

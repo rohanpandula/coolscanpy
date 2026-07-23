@@ -99,10 +99,10 @@ def _calibration_binding(
     )
 
 
-def _source_image() -> np.ndarray:
+def _source_image(*, height: int = DENSITY_SOURCE_HEIGHT) -> np.ndarray:
     image = np.zeros(
         (
-            DENSITY_SOURCE_HEIGHT,
+            height,
             DENSITY_SOURCE_WIDTH,
             DENSITY_SOURCE_DENSITY_CHANNELS,
         ),
@@ -139,7 +139,7 @@ def _archived_means_source_image() -> np.ndarray:
 
 def _wire_from_image(image: np.ndarray) -> bytes:
     rows: list[bytes] = []
-    for row_index in range(DENSITY_SOURCE_HEIGHT):
+    for row_index in range(image.shape[0]):
         row_planar = np.transpose(image[row_index], (1, 0)).astype(">u2").tobytes()
         assert len(row_planar) == DENSITY_SOURCE_RGB_ROW_BYTES
         # The opaque suffix is nonzero and row-varying so treating it as image
@@ -149,13 +149,13 @@ def _wire_from_image(image: np.ndarray) -> bytes:
         )
         rows.append(row_planar + opaque_tail)
     wire = b"".join(rows)
-    assert len(wire) == DENSITY_SOURCE_WIRE_BYTES
+    assert len(wire) == image.shape[0] * DENSITY_SOURCE_ROW_STRIDE_BYTES
     return wire
 
 
 def _child_bytes(image: np.ndarray) -> bytes:
     child = np.transpose(image, (0, 2, 1)).astype("<u2").tobytes()
-    assert len(child) == DENSITY_SOURCE_CHILD_BYTES
+    assert len(child) == image.shape[0] * DENSITY_SOURCE_RGB_ROW_BYTES
     return child
 
 
@@ -166,12 +166,15 @@ def _source_binding(
     session_id: str = "reservation-7",
     capture_attempt_id: str = "slot-4-attempt-1",
     scan_identity: str = "slot-4-attempt-1-density-97dpi-preview",
+    native_height: int = DENSITY_SOURCE_NATIVE_HEIGHT,
 ) -> NikonDensitySourceBinding:
     binding = bind_nikon_density_source(
         wire,
         session_id=session_id,
         capture_attempt_id=capture_attempt_id,
         scan_identity=scan_identity,
+        native_height=native_height,
+        height=image.shape[0],
     )
     assert (
         binding.child_buffer_sha256 == hashlib.sha256(_child_bytes(image)).hexdigest()
@@ -295,6 +298,39 @@ def test_proven_source_contract_discards_tail_and_preserves_planar_rgb() -> None
     assert decoded.shape == (6_104, 96, 3)
     assert np.array_equal(decoded, image)
     assert NikonDensitySourceBinding.from_dict(binding.to_dict()) == binding
+
+
+def test_37_record_source_geometry_replays_with_truthful_receipt() -> None:
+    image = _source_image(height=5_668)
+    wire = _wire_from_image(image)
+    binding = _source_binding(
+        wire,
+        image,
+        native_height=232_401,
+    )
+
+    decoded = decode_nikon_density_source(wire, binding=binding)
+    evidence = build_nikon_density_evidence(
+        wire,
+        calibration=_calibration(),
+        density_f03_exposures_raw_10ns=_DENSITY_F03_DENOMINATORS,
+        session_id="reservation-7",
+        capture_attempt_id="slot-4-attempt-1",
+        scan_identity="slot-4-attempt-1-density-97dpi-preview",
+        source_native_height=232_401,
+        source_height=5_668,
+    )
+
+    assert len(wire) == 5_804_032
+    assert decoded.shape == (5_668, 96, 3)
+    assert np.array_equal(decoded, image)
+    assert binding.native_height == 232_401
+    assert binding.height == 5_668
+    assert NikonDensitySourceBinding.from_dict(binding.to_dict()) == binding
+    assert evidence.source_binding == binding
+    assert evidence.to_dict()["source_payload_bytes"] == 5_804_032
+    assert evidence.result.to_dict()["source_native_height"] == 232_401
+    assert evidence.result.to_dict()["source_geometry"] == [5_668, 96, 3]
 
 
 def test_density_evaluator_uses_first_maximum_and_skips_saturated_rows() -> None:
@@ -779,6 +815,31 @@ def test_source_binding_refuses_any_nonvendor_geometry_or_identity(
 
     with pytest.raises(ValueError, match=message):
         replace(_source_binding(wire, image), **changes)
+
+
+@pytest.mark.parametrize(
+    ("native_height", "height"),
+    (
+        (232_401, 6_104),
+        (250_278, 5_668),
+        (232_400, 5_668),
+    ),
+)
+def test_source_binding_refuses_unproven_height_pairs(
+    native_height: int,
+    height: int,
+) -> None:
+    wire = _wire_from_image(_source_image())
+
+    with pytest.raises(ValueError, match="proven preview geometry"):
+        bind_nikon_density_source(
+            wire,
+            session_id="reservation-7",
+            capture_attempt_id="slot-4-attempt-1",
+            scan_identity="slot-4-attempt-1-density-97dpi-preview",
+            native_height=native_height,
+            height=height,
+        )
 
 
 def test_density_evaluator_refuses_a_zero_signal_source() -> None:

@@ -100,6 +100,7 @@ CANONICAL_BUSY_STATUS = bytes.fromhex("0002040100000000")
 STARTUP_UNIT_ATTENTION_SENSES = {"062800", "062900", "063f03"}
 FINE_GET_WINDOW_SEQUENCES = (603, 604, 605, 606)
 PREVIEW_SET_WINDOW_SEQUENCES = (88, 89, 90)
+PREVIEW_GET_WINDOW_SEQUENCES = (115, 116, 117)
 PREVIEW_READ_SEQUENCES = tuple(range(118, 166))
 DENSITY_CALIBRATION_SEQUENCES = (81, 82, 83)
 # Nikon Scan does not treat these final all-ready TUR runs as ordinary
@@ -162,11 +163,13 @@ DRAINED_SCAN_READ_SEQUENCES = (
 FINE_NATIVE_WIDTH = 3_946
 FINE_NATIVE_HEIGHT = 5_959
 EXPECTED_PREVIEW_BYTES = 6_250_496
+PREVIEW_READ_MAX_BYTES = 131_072
 VARIABLE_FRAME_TABLE_SEQUENCE = 64
 VARIABLE_FRAME_TABLE_CDB = "28008f00000300014a80"
 VARIABLE_FRAME_TABLE_MAX_BYTES = 330
 VARIABLE_FRAME_TABLE_SHORT_STATUS = bytes.fromhex("022b4b0000000000")
 FIXED_PREVIEW_FRAME_TABLE_RECORDS = 40
+SHORT_FULL_ROLL_FRAME_TABLE_RECORDS = 37
 
 
 def _meter_layout_receipt() -> dict[str, object]:
@@ -216,6 +219,39 @@ class StartupFrameTable(TypedDict):
     count: int
     header: str
     sha256: str
+
+
+@dataclass(frozen=True)
+class PreviewTraversalBinding:
+    """One startup-table-bound whole-roll preview command contract."""
+
+    geometry: IndexGeometry
+    active_read_sequences: tuple[int, ...]
+    skipped_read_sequences: tuple[int, ...]
+    startup_records: int
+    mode: str
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "startup_records": self.startup_records,
+            "native_height": self.geometry.native_height,
+            "decoded_height": self.geometry.height,
+            "expected_stream_bytes": self.geometry.expected_stream_bytes,
+            "read_count": len(self.active_read_sequences),
+            "active_read_sequence_range": [
+                self.active_read_sequences[0],
+                self.active_read_sequences[-1],
+            ],
+            "skipped_read_sequence_range": (
+                None
+                if not self.skipped_read_sequences
+                else [
+                    self.skipped_read_sequences[0],
+                    self.skipped_read_sequences[-1],
+                ]
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -936,7 +972,7 @@ def compile_continuation_steps(
 
 
 def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
-    """Derive the guarded preview raster geometry from the canonical plan."""
+    """Derive the guarded preview raster geometry from the bound plan."""
 
     windows = []
     all_resolutions = []
@@ -979,7 +1015,11 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
         or first["upper_left_x"] != 0
         or first["upper_left_y"] != 0
         or first["width"] != FINE_NATIVE_WIDTH
-        or first["height"] != 250_278
+        or first["height"]
+        not in {
+            (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
+            (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
+        }
         or first["bit_depth"] != 16
     ):
         raise ProtocolError("preview SET_WINDOW geometry is not the proven roll index")
@@ -992,17 +1032,38 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
     pitch = native_resolution // first["resy"]
     width = first["width"] // pitch
     height = first["height"] // pitch
-    expected_stream_bytes = sum(
+    read_requests = [
         _entry(plan, sequence).get("request_len", 0)
         for sequence in PREVIEW_READ_SEQUENCES
+    ]
+    first_skipped = next(
+        (index for index, request in enumerate(read_requests) if request == 0),
+        len(read_requests),
+    )
+    if any(request != 0 for request in read_requests[first_skipped:]):
+        raise ProtocolError("preview READ allocation has a non-contiguous suffix")
+    active_requests = read_requests[:first_skipped]
+    if (
+        not active_requests
+        or any(request != PREVIEW_READ_MAX_BYTES for request in active_requests[:-1])
+        or not 1 <= active_requests[-1] <= PREVIEW_READ_MAX_BYTES
+    ):
+        raise ProtocolError(
+            "preview READ allocation is not a bounded contiguous prefix"
+        )
+    expected_stream_bytes = sum(active_requests)
+    canonical_height = (
+        first["height"] == (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
     )
     if (
         pitch != 41
         or width != 96
-        or height != 6_104
-        or expected_stream_bytes != EXPECTED_PREVIEW_BYTES
         or height % 2
         or (height // 2) * 2_048 != expected_stream_bytes
+        or (
+            canonical_height
+            and (height != 6_104 or expected_stream_bytes != EXPECTED_PREVIEW_BYTES)
+        )
     ):
         raise ProtocolError(
             "preview stream geometry does not match its READ allocation"
@@ -2526,11 +2587,67 @@ def _perform_variable_frame_table_transaction(
     )
 
 
-def _require_fixed_preview_startup_table(
+def _patched_preview_window_height(
+    payload: bytes,
+    *,
+    native_height: int,
+    sequence: int,
+) -> bytes:
+    decoded = decode_window_block(payload)
+    canonical_height = (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    if decoded is None or decoded["height"] != canonical_height:
+        raise ProtocolError(
+            f"command {sequence}: preview window is not the canonical template"
+        )
+    mutable = bytearray(payload)
+    mutable[26:30] = native_height.to_bytes(4, "big")
+    patched = bytes(mutable)
+    verified = decode_window_block(patched)
+    if verified is None or verified["height"] != native_height:
+        raise ProtocolError(f"command {sequence}: preview height patch did not verify")
+    return patched
+
+
+def _patch_preview_read_allocation(
+    entry: dict,
+    *,
+    request_len: int,
+    drains_scan: bool,
+) -> None:
+    cdb = bytearray.fromhex(entry.get("cdb", ""))
+    if (
+        entry.get("name") != "READ"
+        or len(cdb) != 10
+        or cdb[0] != 0x28
+        or cdb[9] != 0x80
+        or not 0 <= request_len <= PREVIEW_READ_MAX_BYTES
+    ):
+        raise ProtocolError(
+            f"command {entry.get('seq')}: invalid preview READ template"
+        )
+    if request_len:
+        cdb[6:9] = request_len.to_bytes(3, "big")
+        entry["cdb"] = cdb.hex()
+        entry["request_len"] = request_len
+        entry["request_parts"] = [request_len]
+        entry["live_bound_request_len"] = request_len
+        entry["drains_scan"] = drains_scan
+        entry.pop("preview_skipped", None)
+        return
+    entry["request_len"] = 0
+    entry["request_parts"] = []
+    entry["live_bound_request_len"] = 0
+    entry["preview_skipped"] = True
+    entry.pop("drains_scan", None)
+
+
+def _bind_preview_to_startup_table(
+    plan: list[dict],
     payload: bytes,
     status: bytes,
-) -> dict[str, object]:
-    """Refuse the fixed 40-slot preview path when the scanner reports less."""
+    canonical_geometry: IndexGeometry,
+) -> PreviewTraversalBinding:
+    """Bind preview motion and reads to the validated startup-table prefix."""
 
     table = _validate_variable_frame_table_payload(payload)
     if (
@@ -2538,13 +2655,102 @@ def _require_fixed_preview_startup_table(
         or table["count"] != FIXED_PREVIEW_FRAME_TABLE_RECORDS
         or status != bytes(8)
     ):
-        raise SynchronizedProtocolError(
-            "command 64: scanner returned a "
-            f"{len(payload)}-byte/{table['count']}-record startup table with "
-            f"status {status.hex()}; the fixed "
-            f"{FIXED_PREVIEW_FRAME_TABLE_RECORDS}-slot preview window was not sent"
+        if (
+            table["count"] != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS
+            or status != VARIABLE_FRAME_TABLE_SHORT_STATUS
+        ):
+            raise SynchronizedProtocolError(
+                "command 64: scanner returned a "
+                f"{len(payload)}-byte/{table['count']}-record startup table with "
+                f"status {status.hex()}; supported preview bindings require "
+                f"{FIXED_PREVIEW_FRAME_TABLE_RECORDS} canonical records or the "
+                f"observed {SHORT_FULL_ROLL_FRAME_TABLE_RECORDS}-record full-roll "
+                "prefix"
+            )
+    else:
+        return PreviewTraversalBinding(
+            geometry=canonical_geometry,
+            active_read_sequences=PREVIEW_READ_SEQUENCES,
+            skipped_read_sequences=(),
+            startup_records=FIXED_PREVIEW_FRAME_TABLE_RECORDS,
+            mode="canonical-40-record",
         )
-    return table
+
+    canonical_payload = bytes.fromhex(
+        _entry(plan, VARIABLE_FRAME_TABLE_SEQUENCE).get("expected_data_in", "")
+    )
+    if (
+        len(canonical_payload) != VARIABLE_FRAME_TABLE_MAX_BYTES
+        or payload[10:] != canonical_payload[10 : len(payload)]
+    ):
+        raise SynchronizedProtocolError(
+            "command 64: short startup table is not the exact canonical Nikon "
+            "record prefix; no preview window was sent"
+        )
+
+    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    for sequence in PREVIEW_SET_WINDOW_SEQUENCES:
+        entry = _entry(plan, sequence)
+        entry["data_out"] = _patched_preview_window_height(
+            bytes.fromhex(entry.get("data_out", "")),
+            native_height=native_height,
+            sequence=sequence,
+        ).hex()
+    for sequence in PREVIEW_GET_WINDOW_SEQUENCES:
+        entry = _entry(plan, sequence)
+        entry["expected_data_in"] = _patched_preview_window_height(
+            bytes.fromhex(entry.get("expected_data_in", "")),
+            native_height=native_height,
+            sequence=sequence,
+        ).hex()
+
+    decoded_height = native_height // canonical_geometry.pitch
+    if decoded_height % 2:
+        raise ProtocolError(
+            "37-record preview height does not end on a two-row index block"
+        )
+    expected_stream_bytes = (decoded_height // 2) * canonical_geometry.block_bytes
+    full_reads, final_bytes = divmod(
+        expected_stream_bytes,
+        PREVIEW_READ_MAX_BYTES,
+    )
+    active_read_count = full_reads + (1 if final_bytes else 0)
+    if not 1 <= active_read_count <= len(PREVIEW_READ_SEQUENCES):
+        raise ProtocolError("37-record preview READ allocation is out of bounds")
+    active_read_sequences = PREVIEW_READ_SEQUENCES[:active_read_count]
+    skipped_read_sequences = PREVIEW_READ_SEQUENCES[active_read_count:]
+    for index, sequence in enumerate(active_read_sequences):
+        request_len = (
+            final_bytes
+            if final_bytes and index == active_read_count - 1
+            else PREVIEW_READ_MAX_BYTES
+        )
+        _patch_preview_read_allocation(
+            _entry(plan, sequence),
+            request_len=request_len,
+            drains_scan=index == active_read_count - 1,
+        )
+    for sequence in skipped_read_sequences:
+        _patch_preview_read_allocation(
+            _entry(plan, sequence),
+            request_len=0,
+            drains_scan=False,
+        )
+
+    geometry = _derive_index_geometry(plan)
+    if (
+        geometry.native_height != native_height
+        or geometry.height != decoded_height
+        or geometry.expected_stream_bytes != expected_stream_bytes
+    ):
+        raise ProtocolError("37-record preview binding failed geometry verification")
+    return PreviewTraversalBinding(
+        geometry=geometry,
+        active_read_sequences=active_read_sequences,
+        skipped_read_sequences=skipped_read_sequences,
+        startup_records=SHORT_FULL_ROLL_FRAME_TABLE_RECORDS,
+        mode="canonical-prefix-37-record",
+    )
 
 
 def _perform_with_busy_retry(
@@ -2789,7 +2995,10 @@ def _scan_lifecycle_after_transaction(
         if result.sense == "000000":
             return True, False
         return False, ready_required
-    if entry.get("seq") in DRAINED_SCAN_READ_SEQUENCES:
+    if (
+        entry.get("seq") in DRAINED_SCAN_READ_SEQUENCES
+        or entry.get("drains_scan") is True
+    ):
         # The scan data phase is fully drained.  Cleanup must wait for READY
         # and RELEASE, never send an idle CANCEL that could prevent release.
         return False, True
@@ -3794,6 +4003,13 @@ def run_live_capture(
             active_plan = [dict(entry) for entry in plan]
             preamble = active_plan[:-1]
             geometry = _derive_index_geometry(active_plan)
+            preview_binding = PreviewTraversalBinding(
+                geometry=geometry,
+                active_read_sequences=PREVIEW_READ_SEQUENCES,
+                skipped_read_sequences=(),
+                startup_records=FIXED_PREVIEW_FRAME_TABLE_RECORDS,
+                mode="pending-startup-table",
+            )
             entry_index = 0
             fine_window_payloads: list[bytes] = []
             preview_window_payloads: list[bytes] = []
@@ -3821,6 +4037,9 @@ def run_live_capture(
             output_sha256 = hashlib.sha256()
             while entry_index < len(preamble):
                 entry = preamble[entry_index]
+                if entry.get("preview_skipped") is True:
+                    entry_index += 1
+                    continue
                 if entry["seq"] == DYNAMIC_WINDOW_GROUPS[-1][0]:
                     if not final_controller_accepted:
                         raise SynchronizedProtocolError(
@@ -3961,12 +4180,16 @@ def run_live_capture(
                     journal["live_startup_0x8f_short_underrun_accepted"] = (
                         result.status == VARIABLE_FRAME_TABLE_SHORT_STATUS
                     )
-                    _write_journal(journal_path, journal)
-                    _require_fixed_preview_startup_table(
+                    preview_binding = _bind_preview_to_startup_table(
+                        active_plan,
                         result.payload,
                         result.status,
+                        geometry,
                     )
-                if entry["seq"] in (115, 116, 117):
+                    geometry = preview_binding.geometry
+                    journal["live_preview_binding"] = preview_binding.receipt()
+                    _write_journal(journal_path, journal)
+                if entry["seq"] in PREVIEW_GET_WINDOW_SEQUENCES:
                     preview_window_payloads.append(result.payload)
                     if entry["seq"] == 117:
                         preview_windows = _validate_live_preview_windows(
@@ -4015,10 +4238,10 @@ def run_live_capture(
                         raise SynchronizedProtocolError(
                             "command 172 completed without a live 0x8e table"
                         )
-                    if len(preview_data) != EXPECTED_PREVIEW_BYTES:
+                    if len(preview_data) != geometry.expected_stream_bytes:
                         raise SynchronizedProtocolError(
                             f"live preview has {len(preview_data)} bytes, expected "
-                            f"{EXPECTED_PREVIEW_BYTES}"
+                            f"{geometry.expected_stream_bytes}"
                         )
                     preview_bytes = bytes(preview_data)
                     preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
@@ -4041,6 +4264,8 @@ def run_live_capture(
                         session_id=calibration_session_id,
                         capture_attempt_id=output_path.parent.name,
                         scan_identity=density_scan_identity,
+                        source_native_height=geometry.native_height,
+                        source_height=geometry.height,
                     )
                     density_receipt = density_evidence.to_dict()
                     journal["live_index_evidence"] = {
@@ -4079,6 +4304,12 @@ def run_live_capture(
                             "table_bytes": len(live_sub_8e_table),
                             "table_sha256": table_sha256,
                             "frame_detection": "deferred-offline",
+                            "startup_table": {
+                                "count": startup_table["count"],
+                                "sha256": startup_table["sha256"],
+                                "status": journal["live_startup_0x8f_status"],
+                            },
+                            "preview_binding": preview_binding.receipt(),
                         }
                         _write_json_exclusive(
                             artifact_paths["mapping"], preview_receipt
@@ -4161,10 +4392,18 @@ def run_live_capture(
                     for sequence in range(FRAME_TABLE_SEND_SEQUENCE, 608):
                         active_plan[sequence - 1].clear()
                         active_plan[sequence - 1].update(bound_plan[sequence - 1])
+                    selection_receipt = live_selection.diagnostics()
+                    selection_receipt["startup_table"] = {
+                        "count": startup_table["count"],
+                        "sha256": startup_table["sha256"],
+                        "status": journal["live_startup_0x8f_status"],
+                    }
+                    selection_receipt["preview_binding"] = preview_binding.receipt()
                     _write_json_exclusive(
-                        artifact_paths["mapping"], live_selection.diagnostics()
+                        artifact_paths["mapping"],
+                        selection_receipt,
                     )
-                    journal["live_frame_selection"] = live_selection.diagnostics()
+                    journal["live_frame_selection"] = selection_receipt
                     if batch_mode:
                         assert batch_job is not None
                         journal["nikon_density_frame_ownership"] = (
@@ -4564,7 +4803,7 @@ def run_live_capture(
             assert session_journal_path is not None
             if (
                 live_sub_8e_table is None
-                or len(preview_data) != EXPECTED_PREVIEW_BYTES
+                or len(preview_data) != geometry.expected_stream_bytes
                 or batch_selections is None
                 or density_evidence is None
             ):

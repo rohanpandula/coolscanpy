@@ -86,6 +86,12 @@ DENSITY_SOURCE_ROW_STRIDE_BYTES = (
 DENSITY_SOURCE_DISCARDED_ROW_BYTES = DENSITY_SOURCE_OPAQUE_ROW_TAIL_BYTES
 DENSITY_SOURCE_WIRE_BYTES = DENSITY_SOURCE_HEIGHT * DENSITY_SOURCE_ROW_STRIDE_BYTES
 DENSITY_SOURCE_CHILD_BYTES = DENSITY_SOURCE_HEIGHT * DENSITY_SOURCE_RGB_ROW_BYTES
+DENSITY_SOURCE_SUPPORTED_HEIGHTS = frozenset(
+    {
+        (DENSITY_SOURCE_NATIVE_HEIGHT, DENSITY_SOURCE_HEIGHT),
+        (232_401, 5_668),
+    }
+)
 DENSITY_SOURCE_LAYOUT = "row-planar-rgb-plus-opaque-tail"
 DENSITY_SOURCE_BYTE_ORDER = "big"
 ARCHIVED_DENSITY_SOURCE_WIRE_SHA256 = (
@@ -438,14 +444,12 @@ class NikonDensitySourceBinding:
                 DENSITY_SOURCE_NATIVE_RESOLUTION_DPI,
             ),
             ("native_width", self.native_width, DENSITY_SOURCE_NATIVE_WIDTH),
-            ("native_height", self.native_height, DENSITY_SOURCE_NATIVE_HEIGHT),
             (
                 "scale_divisor",
                 self.scale_divisor,
                 DENSITY_SOURCE_SCALE_DIVISOR,
             ),
             ("width", self.width, DENSITY_SOURCE_WIDTH),
-            ("height", self.height, DENSITY_SOURCE_HEIGHT),
             (
                 "input_channels",
                 self.input_channels,
@@ -481,6 +485,14 @@ class NikonDensitySourceBinding:
         for name, value, expected in exact_fields:
             if type(value) is not int or value != expected:
                 raise ValueError(f"density source {name} must be exactly {expected}")
+        if (
+            type(self.native_height) is not int
+            or type(self.height) is not int
+            or (self.native_height, self.height) not in DENSITY_SOURCE_SUPPORTED_HEIGHTS
+        ):
+            raise ValueError(
+                "density source native_height/height must be a proven preview geometry"
+            )
         if self.layout != DENSITY_SOURCE_LAYOUT:
             raise ValueError(f"density source layout must be {DENSITY_SOURCE_LAYOUT}")
         if self.byte_order != DENSITY_SOURCE_BYTE_ORDER:
@@ -622,6 +634,8 @@ class NikonDensityResult:
     source_wire_sha256: str
     source_compact_buffer_be_sha256: str
     source_child_buffer_sha256: str
+    source_native_height: int
+    source_height: int
     calibration_payload_sha256: tuple[str, str, str]
     numerators: tuple[int, int, int]
     density_f03_denominators: tuple[int, int, int]
@@ -669,8 +683,9 @@ class NikonDensityResult:
             "source_child_buffer_sha256": self.source_child_buffer_sha256,
             "calibration_payload_sha256_rgb": list(self.calibration_payload_sha256),
             "source_resolution_dpi": DENSITY_SOURCE_RESOLUTION_DPI,
+            "source_native_height": self.source_native_height,
             "source_geometry": [
-                DENSITY_SOURCE_HEIGHT,
+                self.source_height,
                 DENSITY_SOURCE_WIDTH,
                 DENSITY_SOURCE_INPUT_CHANNELS,
             ],
@@ -1301,14 +1316,19 @@ def build_nikon_exact_builder_evidence(
     return result
 
 
-def _density_source_buffers(payload: bytes) -> tuple[np.ndarray, bytes, bytes]:
-    if len(payload) != DENSITY_SOURCE_WIRE_BYTES:
+def _density_source_buffers(
+    payload: bytes,
+    *,
+    height: int,
+) -> tuple[np.ndarray, bytes, bytes]:
+    expected_wire_bytes = height * DENSITY_SOURCE_ROW_STRIDE_BYTES
+    if len(payload) != expected_wire_bytes:
         raise ValueError(
             "density source meter payload must contain exactly "
-            f"{DENSITY_SOURCE_WIRE_BYTES} bytes"
+            f"{expected_wire_bytes} bytes"
         )
     padded_rows = np.frombuffer(payload, dtype=np.uint8).reshape(
-        DENSITY_SOURCE_HEIGHT,
+        height,
         DENSITY_SOURCE_ROW_STRIDE_BYTES,
     )
     compact_big_endian = np.ascontiguousarray(
@@ -1316,13 +1336,13 @@ def _density_source_buffers(payload: bytes) -> tuple[np.ndarray, bytes, bytes]:
     )
     compact_buffer_be = compact_big_endian.tobytes(order="C")
     row_planar = compact_big_endian.view(">u2").reshape(
-        DENSITY_SOURCE_HEIGHT,
+        height,
         DENSITY_SOURCE_DENSITY_CHANNELS,
         DENSITY_SOURCE_WIDTH,
     )
     native_row_planar = row_planar.astype(np.uint16)
     child_buffer = native_row_planar.astype("<u2", copy=False).tobytes(order="C")
-    if len(child_buffer) != DENSITY_SOURCE_CHILD_BYTES:
+    if len(child_buffer) != height * DENSITY_SOURCE_RGB_ROW_BYTES:
         raise AssertionError("internal density source child-buffer size mismatch")
     return native_row_planar, compact_buffer_be, child_buffer
 
@@ -1333,6 +1353,8 @@ def bind_nikon_density_source(
     session_id: str,
     capture_attempt_id: str,
     scan_identity: str,
+    native_height: int = DENSITY_SOURCE_NATIVE_HEIGHT,
+    height: int = DENSITY_SOURCE_HEIGHT,
 ) -> NikonDensitySourceBinding:
     """Create immutable evidence for one in-memory 97-dpi density source.
 
@@ -1343,7 +1365,18 @@ def bind_nikon_density_source(
     if not isinstance(meter_payload, (bytes, bytearray, memoryview)):
         raise TypeError("density source meter_payload must be bytes-like")
     payload = bytes(meter_payload)
-    _, compact_buffer_be, child_buffer = _density_source_buffers(payload)
+    if (
+        type(native_height) is not int
+        or type(height) is not int
+        or (native_height, height) not in DENSITY_SOURCE_SUPPORTED_HEIGHTS
+    ):
+        raise ValueError(
+            "density source native_height/height must be a proven preview geometry"
+        )
+    _, compact_buffer_be, child_buffer = _density_source_buffers(
+        payload,
+        height=height,
+    )
     return NikonDensitySourceBinding(
         session_id=session_id,
         capture_attempt_id=capture_attempt_id,
@@ -1351,10 +1384,10 @@ def bind_nikon_density_source(
         resolution_dpi=DENSITY_SOURCE_RESOLUTION_DPI,
         native_resolution_dpi=DENSITY_SOURCE_NATIVE_RESOLUTION_DPI,
         native_width=DENSITY_SOURCE_NATIVE_WIDTH,
-        native_height=DENSITY_SOURCE_NATIVE_HEIGHT,
+        native_height=native_height,
         scale_divisor=DENSITY_SOURCE_SCALE_DIVISOR,
         width=DENSITY_SOURCE_WIDTH,
-        height=DENSITY_SOURCE_HEIGHT,
+        height=height,
         input_channels=DENSITY_SOURCE_INPUT_CHANNELS,
         density_channels=DENSITY_SOURCE_DENSITY_CHANNELS,
         sample_bits=DENSITY_SOURCE_SAMPLE_BITS,
@@ -1377,10 +1410,11 @@ def decode_nikon_density_source(
 ) -> np.ndarray:
     """Extract Nikon's density RGB planes from the raw 97-dpi source pass.
 
-    The returned convenience view is ``(6104, 96, 3)`` native-endian uint16,
-    but the validated child-buffer digest is calculated over Nikon's actual
-    little-endian row-planar order: R[96], G[96], B[96] for each row.  Each raw
-    1,024-byte row has a 448-byte physical tail that is discarded.
+    The returned convenience view is ``(height, 96, 3)`` native-endian uint16,
+    where height is the proven startup-bound preview height carried by
+    ``binding``. The validated child-buffer digest is calculated over Nikon's
+    actual little-endian row-planar order: R[96], G[96], B[96] for each row.
+    Each raw 1,024-byte row has a 448-byte physical tail that is discarded.
     """
 
     if not isinstance(binding, NikonDensitySourceBinding):
@@ -1388,10 +1422,11 @@ def decode_nikon_density_source(
     if not isinstance(meter_payload, (bytes, bytearray, memoryview)):
         raise TypeError("density source meter_payload must be bytes-like")
     payload = bytes(meter_payload)
-    if len(payload) != DENSITY_SOURCE_WIRE_BYTES:
+    expected_wire_bytes = binding.height * binding.row_stride_bytes
+    if len(payload) != expected_wire_bytes:
         raise ValueError(
             "density source meter payload must contain exactly "
-            f"{DENSITY_SOURCE_WIRE_BYTES} bytes"
+            f"{expected_wire_bytes} bytes"
         )
     wire_sha256 = hashlib.sha256(payload).hexdigest()
     if wire_sha256 != binding.wire_sha256:
@@ -1400,7 +1435,8 @@ def decode_nikon_density_source(
         )
 
     native_row_planar, compact_buffer_be, child_buffer = _density_source_buffers(
-        payload
+        payload,
+        height=binding.height,
     )
     compact_be_sha256 = hashlib.sha256(compact_buffer_be).hexdigest()
     if compact_be_sha256 != binding.compact_buffer_be_sha256:
@@ -1529,6 +1565,8 @@ def evaluate_nikon_density(
         source_wire_sha256=source_binding.wire_sha256,
         source_compact_buffer_be_sha256=(source_binding.compact_buffer_be_sha256),
         source_child_buffer_sha256=source_binding.child_buffer_sha256,
+        source_native_height=source_binding.native_height,
+        source_height=source_binding.height,
         calibration_payload_sha256=calibration_binding.calibration.payload_sha256,
         numerators=calibration_binding.calibration.numerators,
         density_f03_denominators=denominators,
@@ -1548,6 +1586,8 @@ def build_nikon_density_evidence(
     session_id: str,
     capture_attempt_id: str,
     scan_identity: str,
+    source_native_height: int = DENSITY_SOURCE_NATIVE_HEIGHT,
+    source_height: int = DENSITY_SOURCE_HEIGHT,
 ) -> NikonDensityEvidence:
     """Build and replay-check one immutable session-level evidence bundle."""
 
@@ -1566,6 +1606,8 @@ def build_nikon_density_evidence(
         session_id=session_id,
         capture_attempt_id=capture_attempt_id,
         scan_identity=scan_identity,
+        native_height=source_native_height,
+        height=source_height,
     )
     exposure_binding = NikonDensityExposureBinding(
         session_id=session_id,

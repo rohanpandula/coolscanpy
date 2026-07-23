@@ -152,6 +152,22 @@ def _startup_frame_table(count: int) -> bytes:
     )
 
 
+def _canonical_startup_frame_table(count: int) -> bytes:
+    canonical = bytes.fromhex(
+        load_canonical_plan()[worker_module.VARIABLE_FRAME_TABLE_SEQUENCE - 1][
+            "expected_data_in"
+        ]
+    )
+    length = 10 + count * 8
+    return (
+        canonical[:4]
+        + (length - 6).to_bytes(2, "big")
+        + (length - 8).to_bytes(2, "big")
+        + bytes((count, 0))
+        + canonical[10:length]
+    )
+
+
 @pytest.mark.parametrize(
     "sequences",
     worker_module.PREVIEW_READY_CONFIRMATION_GROUPS,
@@ -267,31 +283,106 @@ def test_startup_frame_table_accepts_complete_short_payload_underrun(
     ]
 
 
-def test_fixed_preview_refuses_short_startup_table_before_set_window() -> None:
-    payload = _startup_frame_table(37)
+def test_preview_binds_37_record_canonical_prefix_before_set_window() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = _canonical_startup_frame_table(37)
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        payload,
+        worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+        canonical_geometry,
+    )
+
+    assert binding.mode == "canonical-prefix-37-record"
+    assert binding.active_read_sequences == tuple(range(118, 163))
+    assert binding.skipped_read_sequences == (163, 164, 165)
+    assert binding.geometry.native_height == 232_401
+    assert binding.geometry.height == 5_668
+    assert binding.geometry.expected_stream_bytes == 5_804_032
+    assert worker_module._derive_index_geometry(plan) == binding.geometry
+    for sequence in worker_module.PREVIEW_SET_WINDOW_SEQUENCES:
+        window = decode_window_block(bytes.fromhex(plan[sequence - 1]["data_out"]))
+        assert window is not None
+        assert window["height"] == 232_401
+    for sequence in worker_module.PREVIEW_GET_WINDOW_SEQUENCES:
+        window = decode_window_block(
+            bytes.fromhex(plan[sequence - 1]["expected_data_in"])
+        )
+        assert window is not None
+        assert window["height"] == 232_401
+    assert plan[161]["cdb"] == "28000000000000900080"
+    assert plan[161]["request_len"] == 36_864
+    assert plan[161]["drains_scan"] is True
+    assert [plan[index - 1]["request_len"] for index in (163, 164, 165)] == [
+        0,
+        0,
+        0,
+    ]
+
+
+def test_preview_refuses_37_record_noncanonical_prefix_before_set_window() -> None:
+    plan = load_canonical_plan()
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = bytearray(_canonical_startup_frame_table(37))
+    payload[-1] ^= 1
 
     with pytest.raises(
         worker_module.SynchronizedProtocolError,
-        match=(
-            "306-byte/37-record startup table.*"
-            "fixed 40-slot preview window was not sent"
-        ),
+        match="not the exact canonical Nikon record prefix",
     ):
-        worker_module._require_fixed_preview_startup_table(
-            payload,
+        worker_module._bind_preview_to_startup_table(
+            plan,
+            bytes(payload),
             worker_module.VARIABLE_FRAME_TABLE_SHORT_STATUS,
+            canonical_geometry,
         )
 
+    for sequence in worker_module.PREVIEW_SET_WINDOW_SEQUENCES:
+        window = decode_window_block(bytes.fromhex(plan[sequence - 1]["data_out"]))
+        assert window is not None
+        assert window["height"] == 250_278
 
-def test_fixed_preview_accepts_complete_canonical_startup_table() -> None:
-    payload = _startup_frame_table(40)
 
-    table = worker_module._require_fixed_preview_startup_table(
-        payload,
-        bytes(8),
+def test_dynamic_preview_final_read_marks_scan_drained() -> None:
+    result = TransactionResult(
+        phase=3,
+        payload=b"",
+        status=bytes(8),
+        sense="000000",
+        stall_recoveries=0,
     )
 
-    assert table["count"] == 40
+    scan_active, ready_required = worker_module._scan_lifecycle_after_transaction(
+        {"seq": 162, "name": "READ", "drains_scan": True},
+        result,
+        scan_active=True,
+        ready_required=False,
+    )
+
+    assert scan_active is False
+    assert ready_required is True
+
+
+def test_preview_accepts_complete_canonical_startup_table() -> None:
+    plan = load_canonical_plan()
+    original_plan = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    canonical_geometry = worker_module._derive_index_geometry(plan)
+    payload = _startup_frame_table(40)
+
+    binding = worker_module._bind_preview_to_startup_table(
+        plan,
+        payload,
+        bytes(8),
+        canonical_geometry,
+    )
+
+    assert binding.mode == "canonical-40-record"
+    assert binding.geometry == canonical_geometry
+    assert binding.active_read_sequences == worker_module.PREVIEW_READ_SEQUENCES
+    assert binding.skipped_read_sequences == ()
+    assert json.dumps(plan, sort_keys=True, separators=(",", ":")) == original_plan
 
 
 def test_startup_frame_table_rejects_nonzero_status_without_a_short_payload(

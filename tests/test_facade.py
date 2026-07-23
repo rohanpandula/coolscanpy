@@ -406,6 +406,16 @@ class _PreviewAndBatchWorker:
         preview_path.write_bytes(preview)
         table_path.write_bytes(table)
         output.write_bytes(b"")
+        preview_binding = {
+            "mode": "canonical-40-record",
+            "startup_records": 40,
+            "native_height": 250_278,
+            "decoded_height": 6_104,
+            "expected_stream_bytes": 6_250_496,
+            "read_count": 48,
+            "active_read_sequence_range": [118, 165],
+            "skipped_read_sequence_range": None,
+        }
         mapping = {
             "status": "preview-only-complete",
             "slot_capacity_hint": 40,
@@ -415,6 +425,12 @@ class _PreviewAndBatchWorker:
             "table_bytes": len(table),
             "table_sha256": _sha256(table),
             "frame_detection": "deferred-offline",
+            "startup_table": {
+                "count": 40,
+                "sha256": "a" * 64,
+                "status": "0000000000000000",
+            },
+            "preview_binding": preview_binding,
         }
         mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
         density_session_id = "single-reservation-facade-preview"
@@ -482,7 +498,9 @@ class _PreviewAndBatchWorker:
                     "density_f03_exposures_raw_10ns_rgb": density_exposures,
                 }
             },
-            "live_startup_0x8f": {"count": 40},
+            "live_startup_0x8f": {"count": 40, "sha256": "a" * 64},
+            "live_startup_0x8f_status": "0000000000000000",
+            "live_preview_binding": preview_binding,
             "live_index_artifacts": {
                 "mapping": str(mapping_path.resolve()),
                 "preview": str(preview_path.resolve()),
