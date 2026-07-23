@@ -65,6 +65,9 @@ from .meter import (
 from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes, load_canonical_plan
 from .roll_index import (
     IndexGeometry,
+    LEADING_ANCHOR_REVIEW_REASON,
+    MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS,
+    MAXIMUM_LEADING_ANCHOR_ERROR_ROWS,
     NativeFrameOrigin,
     RollDetection,
     TransportRecord,
@@ -1757,9 +1760,22 @@ def _addressable_frame_origins(
     }
     origins: list[NativeFrameOrigin] = []
     for origin in mapping.origins:
+        leading_reviewed_prefix = (
+            origin.frame == 1
+            and origin.boundary_index == 0
+            and origin.method == "direct-gap-trailing-row"
+            and LEADING_ANCHOR_REVIEW_REASON in origin.review_reasons
+            and origin.manual_review
+            and not origin.automatic
+        )
+        residual_limit = (
+            MAXIMUM_LEADING_ANCHOR_ERROR_ROWS
+            if leading_reviewed_prefix
+            else MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS
+        )
         if (
             non_addressable_reasons.intersection(origin.review_reasons)
-            or abs(origin.affine_residual_rows) > 2.0
+            or abs(origin.affine_residual_rows) > residual_limit
         ):
             break
         origins.append(origin)

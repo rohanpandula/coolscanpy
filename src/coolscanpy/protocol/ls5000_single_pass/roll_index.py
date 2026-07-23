@@ -25,6 +25,9 @@ INDEX_RGB_WORDS_PER_ROW = 96 * INDEX_CHANNELS
 INDEX_TRAILER_WORDS = 224
 INDEX_TRAILER_MARK = 0xAA55
 INDEX_TRAILER_COUNTER0 = 0xAAE5
+MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS = 2.0
+MAXIMUM_LEADING_ANCHOR_ERROR_ROWS = 5.0
+LEADING_ANCHOR_REVIEW_REASON = "leading-anchor-divergence"
 
 
 class IndexDecodeError(ValueError):
@@ -1220,8 +1223,8 @@ def derive_transport_mapping(
     minimum_scale: float = 40.0,
     maximum_scale: float = 45.0,
     maximum_anchor_mae_rows: float = 1.0,
-    maximum_anchor_error_rows: float = 2.0,
-    maximum_leading_anchor_error_rows: float = 3.0,
+    maximum_anchor_error_rows: float = MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS,
+    maximum_leading_anchor_error_rows: float = MAXIMUM_LEADING_ANCHOR_ERROR_ROWS,
 ) -> TransportMapping:
     """Map physical preview gaps through the same capture's 0x8e lookup.
 
@@ -1261,7 +1264,11 @@ def derive_transport_mapping(
     # Keep its exact same-traversal 0x8e origin, but do not let that one-sided
     # run tilt the affine model used to resolve genuinely inferred gaps.  It
     # remains separately bounded below, while the interior anchors retain the
-    # stricter global residual contract.
+    # stricter global residual contract.  Repeated LS-5000 full-roll captures
+    # show that Nikon's special leading record can move by almost four preview
+    # rows even when the interior fit is exceptionally tight (MAE 0.275, max
+    # 1.161).  Five rows admits that bounded leader behavior without weakening
+    # any interior anchor, scale, monotonicity, or same-traversal requirement.
     leading_anchor = next(
         (item for item in fit_candidates if item[0].index == 0),
         None,
@@ -1301,6 +1308,7 @@ def derive_transport_mapping(
             f"preview traversal (MAE {anchor_mae:.3f} rows, max "
             f"{anchor_max:.3f} rows)"
         )
+    leading_anchor_requires_review = False
     if leading_anchor is not None and leading_anchor not in fit_direct:
         boundary, record = leading_anchor
         leading_error = abs(
@@ -1311,6 +1319,7 @@ def derive_transport_mapping(
                 "leading transport anchor is inconsistent with the interior "
                 f"preview traversal ({leading_error:.3f} rows)"
             )
+        leading_anchor_requires_review = leading_error > maximum_anchor_error_rows
 
     direct_by_index = {item.index: record for item, record in direct}
     origins: list[NativeFrameOrigin] = []
@@ -1346,6 +1355,9 @@ def derive_transport_mapping(
         if tail_start is not None and record.row >= tail_start:
             if terminal_boundary_index is None:
                 terminal_boundary_index = boundary.index
+        if boundary.index == 0 and leading_anchor_requires_review:
+            reasons.append(LEADING_ANCHOR_REVIEW_REASON)
+            automatic = False
         if (
             terminal_boundary_index is not None
             and boundary.index >= terminal_boundary_index

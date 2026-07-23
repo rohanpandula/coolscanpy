@@ -29,14 +29,14 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "capture_process.py": "6d452ee52ad04ed0039365017b2c6bd4e3323e61f1b6a5f1cc2f78e2e4fb0b14",
-    "worker.py": "179224f0fe995304c17e15d76486c9ac922a705055a744787748c9e17ecc7ec3",
+    "worker.py": "dcea2491d7652ed85f2ccab95109c0764a95ea6caf4e4a0fdb32acc9eec96c7c",
     "usb_backend.py": "a1cee3db705afa0067e5866b3efe520c743b09f444f2b8024b72b84ac0cd6932",
     "density.py": "15838dc24c2f39058447ef73cea74f8cafa48420b45175632c97ed48c062b15b",
     "packed.py": "aae6707216d8ed50c12dc7859b78c7331150fd3cde074fb9bf9c60938dd3604f",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "c7d00c9c8796b7264a553848106a1fe075ab4a25315fbe5a05d05bc35515ca10",
-    "roll_index.py": "abc9af2fa1406939e907f0e870caae5513056ab932117aa0ea345b0d5df17187",
+    "roll_index.py": "48bfab350a5b26a6adf26d521acf85d4e9ad6d7f57b3116f61c6a31e6569cff7",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (

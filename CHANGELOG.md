@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Full-roll transport mapping now permits the directly observed Nikon leading
+record to differ by up to five 97-dpi preview rows from the independently
+fitted interior traversal. A live 36-frame reservation produced a 3.924-row
+leader residual while its 33 interior anchors remained tightly consistent
+(0.275-row MAE, 1.161-row maximum); the former three-row leader cap therefore
+refused before frame binding despite clean same-traversal evidence. The wider
+cap applies only to the excluded leading record. Interior scale, MAE, maximum
+residual, monotonicity, exact live-table provenance, and manual-review gates
+remain unchanged, and a leader beyond five rows still fails closed.
+
 Whole-roll preview now binds its motion window and USB read allocation to a
 validated complete 37-record startup table. The Nikon 40-record trace uses a
 native height of `42 * 5959`; the observed full-roll response omits the last

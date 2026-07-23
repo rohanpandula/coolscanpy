@@ -462,7 +462,7 @@ def test_transport_envelope_and_anchor_residuals_fail_closed() -> None:
         roll.derive_transport_mapping(boundaries, len(rows), records)
 
 
-def test_transport_anchor_fit_accepts_bounded_live_endpoint_quantization() -> None:
+def test_transport_anchor_fit_accepts_bounded_live_leading_anchor_divergence() -> None:
     records = [
         roll.TransportRecord(
             row=row,
@@ -480,15 +480,18 @@ def test_transport_anchor_fit_accepts_bounded_live_endpoint_quantization() -> No
         row=first.row,
         code=first.code,
         selector=first.selector,
-        native_origin=first.native_origin + 98,
+        native_origin=first.native_origin + 165,
     )
 
     mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
 
     assert mapping.anchor_mae_rows == pytest.approx(0.0)
     assert mapping.anchor_max_error_rows == pytest.approx(0.0)
-    assert mapping.origins[0].native_origin == first.native_origin + 98
-    assert mapping.origins[0].affine_residual_rows == pytest.approx(-98 / 42)
+    assert mapping.origins[0].native_origin == first.native_origin + 165
+    assert mapping.origins[0].affine_residual_rows == pytest.approx(-165 / 42)
+    assert mapping.origins[0].manual_review
+    assert not mapping.origins[0].automatic
+    assert roll.LEADING_ANCHOR_REVIEW_REASON in mapping.origins[0].review_reasons
 
 
 def test_transport_anchor_fit_still_rejects_bounded_mean_with_large_endpoint_error() -> None:
@@ -509,7 +512,7 @@ def test_transport_anchor_fit_still_rejects_bounded_mean_with_large_endpoint_err
         row=first.row,
         code=first.code,
         selector=first.selector,
-        native_origin=first.native_origin + 130,
+        native_origin=first.native_origin + 211,
     )
 
     with pytest.raises(roll.IndexDecodeError, match="leading transport anchor"):

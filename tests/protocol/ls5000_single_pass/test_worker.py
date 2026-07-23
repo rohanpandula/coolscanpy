@@ -1226,6 +1226,80 @@ def _short_strip_mapping(
     return TransportMapping(6_000, 168.0, 42.0, 0.0, 0.0, origins), records
 
 
+def _with_reviewed_leading_anchor(
+    mapping: TransportMapping,
+    *,
+    residual_rows: float = -3.924,
+) -> TransportMapping:
+    leading = replace(
+        mapping.origins[0],
+        method="direct-gap-trailing-row",
+        automatic=False,
+        manual_review=True,
+        review_reasons=("leading-anchor-divergence",),
+        affine_residual_rows=residual_rows,
+    )
+    return replace(mapping, origins=(leading, *mapping.origins[1:]))
+
+
+def test_reviewed_leading_anchor_remains_a_table_prefix_for_later_frames() -> None:
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping)
+
+    adjusted, resolved = apply_batch_boundary_offsets(
+        mapping,
+        records,
+        ((19, 0),),
+        approved_manual_slots=frozenset(),
+    )
+
+    assert resolved[0][1].frame == 19
+    assert len(worker_module._addressable_frame_origins(adjusted)) == 36
+
+
+def test_reviewed_leading_anchor_still_requires_approval_when_selected() -> None:
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping)
+
+    with pytest.raises(ProtocolError, match="frame 1 transport origin requires manual review"):
+        apply_batch_boundary_offsets(
+            mapping,
+            records,
+            ((1, 0),),
+            approved_manual_slots=frozenset(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("frame", "residual_rows"),
+    [
+        (1, -5.001),
+        (2, 2.001),
+    ],
+)
+def test_addressable_prefix_keeps_leading_exception_narrow(
+    frame: int,
+    residual_rows: float,
+) -> None:
+    mapping, _records = _short_strip_mapping(6)
+    mapping = _with_reviewed_leading_anchor(mapping)
+    changed = replace(
+        mapping.origins[frame - 1],
+        affine_residual_rows=residual_rows,
+    )
+    mapping = replace(
+        mapping,
+        origins=(
+            *mapping.origins[: frame - 1],
+            changed,
+            *mapping.origins[frame:],
+        ),
+    )
+
+    with pytest.raises(ProtocolError, match="fewer than 2 scanner-addressable"):
+        worker_module._addressable_frame_origins(mapping)
+
+
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
     payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS))
     send = next(entry for entry in load_canonical_plan() if entry["seq"] == 174)
