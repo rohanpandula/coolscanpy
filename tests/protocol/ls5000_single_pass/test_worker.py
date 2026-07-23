@@ -152,6 +152,77 @@ def _startup_frame_table(count: int) -> bytes:
     )
 
 
+@pytest.mark.parametrize(
+    "sequences",
+    worker_module.PREVIEW_READY_CONFIRMATION_GROUPS,
+)
+def test_preview_ready_confirmation_groups_replay_every_observed_tur(
+    monkeypatch: pytest.MonkeyPatch,
+    sequences: tuple[int, ...],
+) -> None:
+    calls: list[int] = []
+
+    def ready(_ep_out, _ep_in, entry, *, data_timeout_ms):
+        assert data_timeout_ms == 30_000
+        calls.append(entry["seq"])
+        return TransactionResult(
+            phase=0x01,
+            payload=b"",
+            status=bytes(8),
+            sense="000000",
+            stall_recoveries=0,
+        )
+
+    monkeypatch.setattr(worker_module, "perform_transaction", ready)
+    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+    plan = load_canonical_plan()
+    entries = [plan[sequence - 1] for sequence in sequences]
+
+    polls, stalls = worker_module._perform_ready_group(
+        object(),
+        object(),
+        entries,
+    )
+
+    assert polls == len(sequences)
+    assert stalls == 0
+    assert calls == [sequences[-1]] * len(sequences)
+
+
+def test_other_ready_groups_still_collapse_at_the_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def ready(_ep_out, _ep_in, entry, *, data_timeout_ms):
+        assert data_timeout_ms == 30_000
+        calls.append(entry["seq"])
+        return TransactionResult(
+            phase=0x01,
+            payload=b"",
+            status=bytes(8),
+            sense="000000",
+            stall_recoveries=0,
+        )
+
+    monkeypatch.setattr(worker_module, "perform_transaction", ready)
+    plan = load_canonical_plan()
+    entries = [plan[sequence - 1] for sequence in (79, 80)]
+    for sequence, entry in zip((179, 180), entries, strict=True):
+        entry = dict(entry)
+        entry["seq"] = sequence
+        entries[sequence - 179] = entry
+
+    polls, stalls = worker_module._perform_ready_group(
+        object(),
+        object(),
+        entries,
+    )
+
+    assert (polls, stalls) == (1, 0)
+    assert calls == [180]
+
+
 def test_startup_frame_table_accepts_complete_short_payload_underrun(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

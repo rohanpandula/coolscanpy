@@ -102,6 +102,16 @@ FINE_GET_WINDOW_SEQUENCES = (603, 604, 605, 606)
 PREVIEW_SET_WINDOW_SEQUENCES = (88, 89, 90)
 PREVIEW_READ_SEQUENCES = tuple(range(118, 166))
 DENSITY_CALIBRATION_SEQUENCES = (81, 82, 83)
+# Nikon Scan does not treat these final all-ready TUR runs as ordinary
+# wait-until-ready loops.  It sends every confirmation before programming the
+# 97 dpi whole-roll windows: two confirmations, the three density reads above,
+# then four more confirmations.  Collapsing either run when the unit is already
+# ready removes an observed scanner-side settle boundary and can make the first
+# SET_WINDOW fail with 05/26/00.
+PREVIEW_READY_CONFIRMATION_GROUPS = (
+    (79, 80),
+    (84, 85, 86, 87),
+)
 FRAME_TABLE_SEND_SEQUENCE = 174
 FRAME_TABLE_SEND_RECORDS = 37
 FRAME_TABLE_SEND_BYTES = 4 + FRAME_TABLE_SEND_RECORDS * 8
@@ -2565,6 +2575,10 @@ def _perform_ready_group(
     template = entries[-1]
     terminal_sense = template.get("expected_sense", "")
     allowed_senses = {entry.get("expected_sense", "") for entry in entries}
+    sequences = tuple(entry.get("seq") for entry in entries)
+    minimum_polls = (
+        len(entries) if sequences in PREVIEW_READY_CONFIRMATION_GROUPS else 1
+    )
     deadline = time.monotonic() + READY_POLL_DEADLINE_SECONDS
     polls = 0
     stalls = 0
@@ -2578,9 +2592,15 @@ def _perform_ready_group(
                 f"phase 0x{result.phase:02x} != expected "
                 f"0x{template.get('expected_phase'):02x}"
             )
-        if result.sense == terminal_sense:
+        if result.sense == terminal_sense and polls >= minimum_polls:
             _require_trace_result(template, result)
             return polls, stalls
+        if result.sense == terminal_sense:
+            # Preserve only Nikon's two proven preview-settle confirmation
+            # groups.  Every other traced TUR run remains state-aware and
+            # collapses as soon as its terminal state is observed.
+            time.sleep(READY_POLL_SECONDS)
+            continue
         if result.sense in additional_terminal_senses:
             # Callers may name a semantically safe terminal state that differs
             # from the oracle trace.  This is deliberately opt-in so a no-media
