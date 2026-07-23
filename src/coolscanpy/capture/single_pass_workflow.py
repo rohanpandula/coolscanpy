@@ -1492,7 +1492,8 @@ class LS5000SinglePassWorkflow:
             )
         raw_approval = journal.get("manual_review_approval")
         approval_payload: dict[str, object] | None = None
-        if not automatic or manual_review:
+        approval_required = not automatic or manual_review
+        if approval_required or raw_approval is not None:
             try:
                 approval = ManualFrameApproval.from_payload(raw_approval)
             except (TypeError, ValueError) as error:
@@ -1508,10 +1509,6 @@ class LS5000SinglePassWorkflow:
                     "manual review approval does not bind this frame selection"
                 )
             approval_payload = approval.to_payload()
-        elif raw_approval is not None:
-            raise SinglePassIntegrityError(
-                "automatic frame unexpectedly carries manual review approval"
-            )
         return deepcopy(roll_identity), approval_payload
 
     def _validated_windows(
