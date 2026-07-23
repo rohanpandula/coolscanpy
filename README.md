@@ -23,9 +23,11 @@ converted to SA-30 wiring, that integration produced full-roll previews and
 4000 dpi 16-bit RGBI captures with receipts, and those captures fed the
 downstream dust-repair pipeline.
 
-After extraction, a hardware-free test suite (807 tests) exercises the
-transport protocol, the roll engine, the receipt assembly, and the public
-facade against synthetic fixtures. It passes on Ubuntu, macOS, and Windows.
+The current source tree collects 911 hardware-free tests covering the
+transport protocol, roll engine, capture finalization, receipt assembly, and
+public facade against synthetic fixtures and replay data. CI runs that suite
+and Ruff on Ubuntu and macOS with Python 3.13 and 3.14. Windows is not in the
+CI matrix and has not run the direct-USB transport against real hardware.
 
 Live validation ran on 2026-07-18 with the packaged wheel installed into a
 clean environment against a powered LS-5000, with no SANE installed: USB
@@ -36,15 +38,25 @@ review near the strip end, and slot 6 was correctly reported as a 2-row
 trailing sliver rather than a frame. That run exposed one real bug, fixed
 in 0.1.1: roll fingerprinting rejected strips with a trailing sliver.
 
-As of 0.1.3, short strips (fewer than 6 frames) work for both preview and
-fine scanning. A fingerprint-count regression that rejected short strips
-was fixed in this release.
+The 0.1.3 short-strip fixes allow preview and fine scanning of strips shorter
+than a full roll. The current source also accepts the normal end-of-roll case
+where a fresh transport table has fewer usable records than the reviewed
+preview; it still refuses a count above the reviewed table, a mismatched visual
+fingerprint, or a requested slot that is no longer addressable.
 
 The 285 dpi meter pass is now surfaced on every frame. The scanner already
 captures three of these per frame during auto-exposure; the third (settled
 exposure) is decoded and attached to the `Frame`. Downstream tools that
 need a dual-capture (prepass + main) can use it directly. See the
 [downstream pipeline](#downstream-pipeline) section.
+
+For the proven LS-5000 full-record geometry, fine-scan decoding now starts
+while the raw capture is still arriving. This is an advisory fast path: the
+raw capture remains the oracle, and an absent, slow, malformed, or failed
+streaming sidecar falls back to the normal offline decode without interrupting
+or blocking the scanner read. Set `COOLSCANPY_CAPTURE_STREAMING=0` to disable
+this optimization. The streaming path is covered by hardware-free tests; no
+additional live-hardware claim is made for it here.
 
 Coverage is uneven by material. `Material.COLOR_NEGATIVE` scans through a
 direct-USB single-pass path and is implemented end to end, preview through
@@ -94,6 +106,13 @@ independently installable.
 
 ```
 pip install coolscanpy
+```
+
+coolscanpy requires Python 3.13 or later. To use the current checkout rather
+than an index release, install it in editable mode:
+
+```
+python -m pip install -e .
 ```
 
 The base install covers `get_devices()`, `open()`, and everything under
@@ -181,16 +200,14 @@ against other bodies are welcome, and an LS-50 test is particularly wanted:
 its transport and optics differ from the LS-5000, and none of those
 differences are covered here yet.
 
-Strips shorter than a full roll work for preview and, as of 0.1.3, for fine
-scanning too. A preview traversal parks a short strip at the transport
-end-stop, so a batch run started right after a preview can raise
-`RefeedRequired`. Pull the strip out, reinsert it until the feeder grips,
-and run the batch again.
+Strips shorter than a full roll work for preview and fine scanning. A preview
+traversal parks a short strip at the transport end-stop, so a batch run started
+right after a preview can raise `RefeedRequired`. Pull the strip out, reinsert
+it until the feeder grips, and run the batch again.
 
-The converted SA-21 parks the strip a few minutes after feeding, and the
-transport will not wake from parked. Start a capture within about ninety
-seconds of feeding. A stall in the transport-index read means the feeder
-parked; refeed rather than retry.
+The converted SA-21 can park a strip after an unknown idle interval, and the
+transport will not wake from that parked state. A stall in the transport-index
+read means the feeder parked; refeed rather than retry.
 
 ## Relationship to NegPy
 
@@ -219,6 +236,13 @@ Every returned frame carries transport-smear and clipping telemetry.
 Clipping is informational and never gates a capture. An abnormal repeated
 tail from a stopped transport does gate: that frame is refused rather than
 returned with smeared rows.
+
+The concurrent decoder used for proven full-record captures is deliberately
+non-authoritative. It submits work without blocking the USB loop, has a
+bounded completion wait, and records its terminal state in the frame journal.
+Finalization consumes its derived artifact only after revalidating its schema,
+raw-stream binding, hash, NPY layout, and file identities; otherwise it decodes
+the retained raw stream offline.
 
 ## What this package is not
 
