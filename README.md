@@ -238,6 +238,31 @@ default. A caller wires it in behind whatever extension seam their own
 application already uses for other scanner backends: open a device, run one
 roll to completion, close it.
 
+## How this compares to SANE
+
+SANE's `coolscan3` backend is the mature, general route to these scanners:
+one API across many models, a daemon ecosystem, and a working eject. NegPy
+consumes it happily. coolscanpy exists for the narrower job SANE's frame
+API cannot express: archival capture with evidence. The honest split:
+
+| Capability | coolscanpy | SANE `coolscan3` |
+|---|---|---|
+| Single-pass 4000 dpi 16-bit RGBI contract | yes, fixed protocol | partial — RGB + separate IR handling, backend-dependent |
+| 285 dpi meter-pass surfaced per frame (`Frame.meter_rgbi`) | yes | no |
+| Density-calibration payloads exposed with hashes | yes | no |
+| Per-frame receipt telemetry (exposure vectors, clipping, focus, transport smear) | yes | no |
+| Per-frame + session journals on disk | yes | no |
+| Hash-pinned capture bundle provenance | yes | no |
+| Roll batch under one reservation with fingerprint identity checks | yes | no — per-frame `--frame n` |
+| Whole-roll preview with per-slot review states | yes | no |
+| Eject | delegated to SANE (`coolscanpy[scanner]` extra) | yes |
+| Scanner model breadth | one tested body (LS-5000/SA-30 wiring) | many Coolscan models |
+| Years in production | extracted 2026 | decades |
+
+They compose rather than compete: the direct-USB path owns capture and its
+evidence chain, and the optional SANE extra covers motion conveniences the
+capture path does not need. A live LS-5000 run requires no SANE at all.
+
 ## Safety model
 
 A roll batch takes one reservation over the physical transport for its whole
