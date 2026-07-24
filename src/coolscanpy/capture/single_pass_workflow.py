@@ -1492,7 +1492,28 @@ class LS5000SinglePassWorkflow:
             )
         raw_approval = journal.get("manual_review_approval")
         approval_payload: dict[str, object] | None = None
-        approval_required = not automatic or manual_review
+        # A selection the scan-time gates accepted (leading-anchor divergence
+        # within the five-row bound, both fingerprints matched — the same
+        # fingerprint evidence this audit just validated above) is automatic
+        # in effect: no operator approval payload exists or is required. The
+        # acceptance record itself is validated strictly before it is
+        # honored; anything malformed falls through to the approval path and
+        # fails closed exactly as before.
+        acceptance = selection.get("leading_anchor_divergence_accepted")
+        residual = (
+            acceptance.get("fresh_residual_rows")
+            if isinstance(acceptance, dict)
+            else None
+        )
+        divergence_accepted = (
+            isinstance(acceptance, dict)
+            and acceptance.get("origin") == "leading-anchor-divergence-accepted"
+            and not isinstance(residual, bool)
+            and isinstance(residual, (int, float))
+            and math.isfinite(float(residual))
+            and abs(float(residual)) <= 5.0
+        )
+        approval_required = (not automatic or manual_review) and not divergence_accepted
         if approval_required or raw_approval is not None:
             try:
                 approval = ManualFrameApproval.from_payload(raw_approval)

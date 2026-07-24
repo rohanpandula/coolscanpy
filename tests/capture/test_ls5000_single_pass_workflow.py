@@ -527,6 +527,62 @@ def test_batch_finalization_refuses_tampered_redundant_manual_review_approval(
     assert stream.is_file()
 
 
+def test_finalization_accepts_divergence_accepted_selection_without_approval(
+    tmp_path: Path,
+) -> None:
+    """A scan-time-accepted leading-anchor divergence (fingerprints matched,
+    within the five-row bound) is automatic in effect: finalization must not
+    demand a manual-approval payload. Fixture values mirror the live
+    2026-07-24 soak journal (residual -2.556 rows)."""
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["live_frame_selection"]["selected"].update(
+        automatic=False,
+        manual_review=True,
+    )
+    journal["live_frame_selection"]["leading_anchor_divergence_accepted"] = {
+        "origin": "leading-anchor-divergence-accepted",
+        "fresh_residual_rows": -2.555619603411963,
+        "reviewed_residual_rows": None,
+    }
+    journal["manual_review_approval"] = None
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    completed = _workflow().finalize_attempt(attempt)
+
+    assert completed.scratch_deleted is True
+    assert not stream.exists()
+    manifest = json.loads(completed.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["frame_evidence"]["manual_review_approval"] is None
+
+
+def test_finalization_still_refuses_malformed_acceptance_record(
+    tmp_path: Path,
+) -> None:
+    """An acceptance record with the wrong origin string (or an out-of-bound
+    residual) must not soften the approval requirement."""
+    attempt, stream = _attempt(tmp_path)
+    journal = json.loads(attempt.journal_path.read_text(encoding="utf-8"))
+    journal["live_frame_selection"]["selected"].update(
+        automatic=False,
+        manual_review=True,
+    )
+    journal["live_frame_selection"]["leading_anchor_divergence_accepted"] = {
+        "origin": "not-the-acceptance-origin",
+        "fresh_residual_rows": -2.5,
+    }
+    journal["manual_review_approval"] = None
+    attempt.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        SinglePassIntegrityError,
+        match="manual review approval is missing or malformed",
+    ):
+        _workflow().finalize_attempt(attempt)
+
+    assert stream.is_file()
+
+
 def test_batch_frame_refuses_missing_continuation_plan_provenance(
     tmp_path: Path,
 ) -> None:
