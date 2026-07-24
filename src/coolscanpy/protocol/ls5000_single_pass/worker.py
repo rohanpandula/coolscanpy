@@ -280,6 +280,8 @@ class LiveFrameSelection:
     selected_fingerprint_comparison: SelectedRollFingerprintComparison | None = None
     leading_anchor_divergence_accepted: bool = False
     reviewed_leading_residual_rows: float | None = None
+    origin_rebased: bool = False
+    origin_rebase_info: OriginRebaseInfo | None = None
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -295,6 +297,25 @@ class LiveFrameSelection:
                     "origin": LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN,
                     "fresh_residual_rows": self.base_selected.affine_residual_rows,
                     "reviewed_residual_rows": self.reviewed_leading_residual_rows,
+                }
+            ),
+            "origin_rebase": (
+                None
+                if not self.origin_rebased
+                else {
+                    "origin": ORIGIN_REBASED_OUTSIDE_AFFINE_ACCEPTED_ORIGIN,
+                    "requested_offset_rows": (
+                        self.origin_rebase_info.requested_offset_rows
+                    ),
+                    "resolved_lookup_row": self.origin_rebase_info.resolved_lookup_row,
+                    "resolved_native_origin": (
+                        self.origin_rebase_info.resolved_native_origin
+                    ),
+                    "resolved_residual_rows": (
+                        self.origin_rebase_info.resolved_residual_rows
+                    ),
+                    "rebased_lookup_row": self.base_selected.lookup_row,
+                    "rebased_native_origin": self.base_selected.native_origin,
                 }
             ),
             "roll_identity": {
@@ -1096,6 +1117,26 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
 
 
 LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN = "leading-anchor-divergence-accepted"
+ORIGIN_REBASED_OUTSIDE_AFFINE_ACCEPTED_ORIGIN = "origin-rebased-outside-affine"
+
+
+@dataclass(frozen=True)
+class OriginRebaseInfo:
+    """A boundary offset rebased onto the fresh traversal's detected origin.
+
+    ``apply_boundary_offset`` raises when the reviewed offset resolves to a
+    live-table record whose native origin is more than two preview rows away
+    from the affine mapping. For frame-1 leading transport wobble up to five
+    rows, with matching global and selected fingerprints, the fresh table's
+    own detected origin is physical truth and the reviewed offset is advisory;
+    this dataclass records what the offset would have resolved to before the
+    rebase.
+    """
+
+    requested_offset_rows: int
+    resolved_lookup_row: int
+    resolved_native_origin: int
+    resolved_residual_rows: float
 
 
 def _is_narrowly_divergent_leading_anchor(origin: NativeFrameOrigin) -> bool:
@@ -1237,11 +1278,18 @@ def _derive_live_frame_selection(
                 f"frame {frame} transport origin requires manual review; "
                 "refusing an unattended fine scan"
             )
-    mapping, selected = apply_boundary_offset(
+    origin_rebase_allowed = (
+        fingerprint_comparison is not None
+        and fingerprint_comparison.matches
+        and selected_fingerprint_comparison is not None
+        and selected_fingerprint_comparison.matches
+    )
+    mapping, selected, origin_rebase_info = apply_boundary_offset(
         mapping,
         records,
         frame=frame,
         offset_rows=boundary_offset_rows,
+        origin_rebase_allowed=origin_rebase_allowed,
     )
     return LiveFrameSelection(
         frame=frame,
@@ -1263,6 +1311,8 @@ def _derive_live_frame_selection(
             if leading_anchor_divergence_accepted
             else None
         ),
+        origin_rebased=origin_rebase_info is not None,
+        origin_rebase_info=origin_rebase_info,
         reviewed_fingerprint_sha256=(
             None
             if reviewed_fingerprint is None
@@ -1339,6 +1389,19 @@ def _derive_live_batch_selections(
         validated_table,
         maximum_rows=context.geometry.height,
     )
+    # Fingerprint identity is already gated above: any mismatch would have
+    # raised before reaching this point. Pass the matching slots down so
+    # apply_boundary_offset can rebase a frame-1 leading offset onto the fresh
+    # traversal's own detected origin when the resolved record lands outside
+    # the two-row affine bound but inside the five-row leading-anchor bound.
+    origin_rebase_slots = frozenset(
+        spec.slot
+        for spec in frames
+        if context.fingerprint_comparison is not None
+        and context.fingerprint_comparison.matches
+        and selected_fingerprint_comparisons.get(spec.slot) is not None
+        and selected_fingerprint_comparisons[spec.slot].matches
+    )
     combined, resolved = apply_batch_boundary_offsets(
         context.mapping,
         records,
@@ -1347,6 +1410,7 @@ def _derive_live_batch_selections(
             spec.slot for spec in frames if spec.manual_review_approval is not None
         ),
         reviewed_automatic_slots=reviewed_automatic_slots,
+        origin_rebase_slots=origin_rebase_slots,
     )
     # The reviewed fingerprint's frame count is in scope here, so cross-check
     # it against the live table's addressable count. The two come from
@@ -1422,6 +1486,8 @@ def _derive_live_batch_selections(
                 and spec.slot in reviewed_automatic_slots
                 and _is_narrowly_divergent_leading_anchor(base)
             ),
+            origin_rebased=origin_rebase_info is not None,
+            origin_rebase_info=origin_rebase_info,
             reviewed_fingerprint_sha256=context.reviewed_fingerprint_sha256,
             fresh_fingerprint=context.fresh_fingerprint,
             fingerprint_comparison=context.fingerprint_comparison,
@@ -1429,7 +1495,9 @@ def _derive_live_batch_selections(
                 selected_fingerprint_comparisons[spec.slot]
             ),
         )
-        for spec, (base, selected) in zip(frames, resolved, strict=True)
+        for spec, (base, selected, origin_rebase_info) in zip(
+            frames, resolved, strict=True
+        )
     )
     # Compile each binding before the first fine scan.  This proves that the
     # retained table and every later autofocus/window origin agree.
@@ -1686,13 +1754,20 @@ def apply_boundary_offset(
     *,
     frame: int,
     offset_rows: int,
-) -> tuple[TransportMapping, NativeFrameOrigin]:
+    origin_rebase_allowed: bool = False,
+) -> tuple[TransportMapping, NativeFrameOrigin, OriginRebaseInfo | None]:
     """Resolve an operator offset through this traversal's raw 0x8e records.
 
     The offset is applied in preview rows, then snapped to the exact record at
     that row.  The returned mapping replaces the selected SEND(0x8f) entry, so
     autofocus and all RGBI SET_WINDOW commands remain bound to one raw
     transport identity instead of independently editing a native coordinate.
+
+    When the resolved record lands more than two preview rows outside the
+    affine mapping but no more than five, and the caller has already confirmed
+    matching global and selected fingerprints, the offset is rebased onto the
+    fresh traversal's own detected origin for this slot.  The fresh table is
+    physical truth; the reviewed offset is advisory.
     """
 
     if not 1 <= frame <= len(mapping.origins):
@@ -1731,28 +1806,50 @@ def apply_boundary_offset(
     residual_rows = (
         predicted_origin - record.native_origin
     ) / mapping.native_units_per_preview_row
+    rebase_info: OriginRebaseInfo | None = None
     if abs(residual_rows) > 2.0:
-        raise ProtocolError(
-            f"frame {frame} boundary offset resolves to a transport origin "
-            f"{abs(residual_rows):.3f} rows outside the affine mapping"
+        if (
+            origin_rebase_allowed
+            and abs(residual_rows) <= MAXIMUM_LEADING_ANCHOR_ERROR_ROWS
+        ):
+            rebase_info = OriginRebaseInfo(
+                requested_offset_rows=offset_rows,
+                resolved_lookup_row=resolved_row,
+                resolved_native_origin=record.native_origin,
+                resolved_residual_rows=float(residual_rows),
+            )
+        else:
+            raise ProtocolError(
+                f"frame {frame} boundary offset resolves to a transport origin "
+                f"{abs(residual_rows):.3f} rows outside the affine mapping"
+            )
+    if rebase_info is not None:
+        selected = replace(
+            base,
+            method=(
+                f"{base.method}+operator-boundary-offset-rebased"
+                if offset_rows != 0
+                else base.method
+            ),
         )
-    selected = replace(
-        base,
-        lookup_row=resolved_row,
-        code=record.code,
-        selector=record.selector,
-        native_origin=record.native_origin,
-        method=(
-            base.method
-            if offset_rows == 0
-            else f"{base.method}+operator-boundary-offset"
-        ),
-        automatic=base.automatic,
-        affine_residual_rows=float(residual_rows),
-    )
+    else:
+        selected = replace(
+            base,
+            lookup_row=resolved_row,
+            code=record.code,
+            selector=record.selector,
+            native_origin=record.native_origin,
+            method=(
+                base.method
+                if offset_rows == 0
+                else f"{base.method}+operator-boundary-offset"
+            ),
+            automatic=base.automatic,
+            affine_residual_rows=float(residual_rows),
+        )
     origins = list(mapping.origins)
     origins[frame - 1] = selected
-    return replace(mapping, origins=tuple(origins)), selected
+    return replace(mapping, origins=tuple(origins)), selected, rebase_info
 
 
 def apply_batch_boundary_offsets(
@@ -1762,9 +1859,10 @@ def apply_batch_boundary_offsets(
     *,
     approved_manual_slots: frozenset[int] = frozenset(),
     reviewed_automatic_slots: frozenset[int] = frozenset(),
+    origin_rebase_slots: frozenset[int] = frozenset(),
 ) -> tuple[
     TransportMapping,
-    tuple[tuple[NativeFrameOrigin, NativeFrameOrigin], ...],
+    tuple[tuple[NativeFrameOrigin, NativeFrameOrigin, OriginRebaseInfo | None], ...],
 ]:
     """Apply every selected-frame offset to one shared retained mapping.
 
@@ -1783,7 +1881,9 @@ def apply_batch_boundary_offsets(
         )
     original = mapping
     combined = mapping
-    resolved: list[tuple[NativeFrameOrigin, NativeFrameOrigin]] = []
+    resolved: list[
+        tuple[NativeFrameOrigin, NativeFrameOrigin, OriginRebaseInfo | None]
+    ] = []
     for frame, offset_rows in frames:
         if not 1 <= frame <= len(original.origins):
             raise ProtocolError(
@@ -1814,13 +1914,14 @@ def apply_batch_boundary_offsets(
                     f"frame {frame} transport origin requires manual review; "
                     "refusing an unattended batch"
                 )
-        combined, selected = apply_boundary_offset(
+        combined, selected, rebase_info = apply_boundary_offset(
             combined,
             records,
             frame=frame,
             offset_rows=offset_rows,
+            origin_rebase_allowed=frame in origin_rebase_slots,
         )
-        resolved.append((base, selected))
+        resolved.append((base, selected, rebase_info))
 
     # Validate the fixed-size Nikon page now, before any selected frame is
     # scanned.  Its 37 entries are a firmware configuration page, rather than

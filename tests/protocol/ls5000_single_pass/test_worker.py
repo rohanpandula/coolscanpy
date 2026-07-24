@@ -1781,7 +1781,7 @@ def test_frame_table_ignores_advisory_slots_after_the_fixed_37_records() -> None
 def test_boundary_offset_resolves_raw_identity_from_the_same_transport_table() -> None:
     mapping, records = _short_strip_mapping(37)
 
-    adjusted, selected = apply_boundary_offset(
+    adjusted, selected, _rebase_info = apply_boundary_offset(
         mapping,
         records,
         frame=18,
@@ -1835,7 +1835,7 @@ def test_boundary_offset_accepts_coordinate_valid_interior_high_bit_record() -> 
         native_origin=29_400,
     )
 
-    _adjusted, selected = apply_boundary_offset(
+    _adjusted, selected, _rebase_info = apply_boundary_offset(
         mapping,
         records,
         frame=6,
@@ -1912,7 +1912,7 @@ def test_resolved_offset_is_encoded_into_the_selected_fixed_table_record() -> No
         origins,
     )
 
-    adjusted, selected = apply_boundary_offset(
+    adjusted, selected, _rebase_info = apply_boundary_offset(
         mapping,
         records,
         frame=18,
@@ -1968,7 +1968,7 @@ def test_batch_offsets_share_the_one_retained_table_and_later_frame_origins() ->
         ((7, 9), (18, -11), (23, 6)),
     )
 
-    assert [selected.lookup_row for _base, selected in resolved] == [
+    assert [selected.lookup_row for _base, selected, _rebase in resolved] == [
         lookup_rows[6] + 9,
         lookup_rows[17] - 11,
         lookup_rows[22] + 6,
@@ -2090,7 +2090,7 @@ def test_batch_offsets_accept_every_requested_slot_in_a_short_strip_mapping() ->
     )
 
     assert len(combined.origins) == 6
-    assert [selected.frame for _base, selected in resolved] == [1, 6]
+    assert [selected.frame for _base, selected, _rebase in resolved] == [1, 6]
 
     bound_plan = load_canonical_plan()
     geometry = _derive_index_geometry(bound_plan)
@@ -2113,7 +2113,7 @@ def test_batch_offsets_accept_every_requested_slot_in_a_short_strip_mapping() ->
 def test_short_strip_offset_replaces_its_prefix_record_not_the_nikon_tail() -> None:
     mapping, records = _short_strip_mapping(6)
 
-    adjusted, selected = apply_boundary_offset(
+    adjusted, selected, _rebase_info = apply_boundary_offset(
         mapping,
         records,
         frame=6,
@@ -2866,7 +2866,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
         offset: int,
         pair: tuple[NativeFrameOrigin, NativeFrameOrigin],
     ) -> SimpleNamespace:
-        base, selected = pair
+        base, selected, _rebase = pair
         return SimpleNamespace(
             frame=slot,
             frame_count=len(combined.origins),

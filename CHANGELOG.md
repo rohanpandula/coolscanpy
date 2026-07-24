@@ -158,6 +158,8 @@ Public API: `StreamingFrameDecoder`, `FailOpenStreamConsumer`, and
 `coolscanpy.protocol.ls5000_single_pass`.
 
 ## 0.1.3
+- Boundary-offset application rebases a frame-1 leading origin onto the fresh traversal's detected origin (recorded in the frame journal) instead of raising, when the divergence is within the five-row leading-anchor bound and both roll fingerprints match; all other out-of-affine origins still raise.
+
 
 A live hardware session scanning a 6-frame strip found two bugs in the
 fine-scan path, both specific to strips shorter than a full roll.
