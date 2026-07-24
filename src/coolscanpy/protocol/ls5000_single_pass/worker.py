@@ -278,6 +278,8 @@ class LiveFrameSelection:
     fresh_fingerprint: ReviewedRollFingerprint | None = None
     fingerprint_comparison: RollFingerprintComparison | None = None
     selected_fingerprint_comparison: SelectedRollFingerprintComparison | None = None
+    leading_anchor_divergence_accepted: bool = False
+    reviewed_leading_residual_rows: float | None = None
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -286,6 +288,15 @@ class LiveFrameSelection:
             "usable_rows": self.usable_rows,
             "preview_sha256": self.preview_sha256,
             "table_sha256": self.table_sha256,
+            "leading_anchor_divergence_accepted": (
+                None
+                if not self.leading_anchor_divergence_accepted
+                else {
+                    "origin": LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN,
+                    "fresh_residual_rows": self.base_selected.affine_residual_rows,
+                    "reviewed_residual_rows": self.reviewed_leading_residual_rows,
+                }
+            ),
             "roll_identity": {
                 "reviewed_fingerprint_sha256": self.reviewed_fingerprint_sha256,
                 "fresh_fingerprint_sha256": (
@@ -1084,6 +1095,34 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
     )
 
 
+LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN = "leading-anchor-divergence-accepted"
+
+
+def _is_narrowly_divergent_leading_anchor(origin: NativeFrameOrigin) -> bool:
+    """Return whether ``origin`` is only a bounded frame-1 leading divergence.
+
+    ``derive_transport_mapping`` (roll_index.py) only ever *appends*
+    ``LEADING_ANCHOR_REVIEW_REASON`` on top of whatever review reasons the
+    upstream gap boundary already carried; it never clears them. An exact
+    one-element match therefore proves two things at once: leading-anchor
+    divergence is this origin's one and only flagged issue, and -- because
+    ``derive_transport_mapping`` always raises ``IndexDecodeError`` before it
+    can return any mapping at all when the interior anchor fit's own scale,
+    MAE, or max-residual bound fails -- every interior mapping gate for this
+    same traversal already passed before this origin was ever constructed.
+
+    This does not by itself decide whether the divergence should be
+    auto-accepted; see ``_derive_live_frame_selection`` and
+    ``apply_batch_boundary_offsets``, which combine it with the caller's
+    reviewed-session and fingerprint evidence.
+    """
+
+    return (
+        origin.review_reasons == (LEADING_ANCHOR_REVIEW_REASON,)
+        and abs(origin.affine_residual_rows) <= MAXIMUM_LEADING_ANCHOR_ERROR_ROWS
+    )
+
+
 def _derive_live_frame_selection(
     plan: list[dict],
     preview_data: bytes,
@@ -1094,6 +1133,8 @@ def _derive_live_frame_selection(
     expected_frame_count: int | None = None,
     reviewed_fingerprint: ReviewedRollFingerprint | None = None,
     manual_review_approved: bool = False,
+    reviewed_as_automatic: bool = False,
+    reviewed_leading_residual_rows: float | None = None,
 ) -> LiveFrameSelection:
     """Resolve one automatic frame origin from same-traversal live data."""
 
@@ -1171,13 +1212,31 @@ def _derive_live_frame_selection(
             f"frame {frame} belongs to the terminal transport tail and is not "
             "scanner-addressable"
         )
+    leading_anchor_divergence_accepted = False
     if (
         not base_selected.automatic or base_selected.manual_review
     ) and not manual_review_approved:
-        raise ProtocolError(
-            f"frame {frame} transport origin requires manual review; "
-            "refusing an unattended fine scan"
+        # Narrow scan-time exception (CHANGELOG "leading-anchor-divergence
+        # accepted"): auto-accept a fresh leading-anchor-only divergence,
+        # inside the five-row hard bound, when the caller's reviewed session
+        # already classified this exact slot as automatic and both the
+        # whole-roll and selected-slot visual fingerprints -- checked above,
+        # in the same unchanged order -- already matched. Every other
+        # manual-review cause, and every slot the reviewed session itself
+        # flagged, keeps refusing exactly as before.
+        leading_anchor_divergence_accepted = (
+            reviewed_as_automatic
+            and _is_narrowly_divergent_leading_anchor(base_selected)
+            and fingerprint_comparison is not None
+            and fingerprint_comparison.matches
+            and selected_fingerprint_comparison is not None
+            and selected_fingerprint_comparison.matches
         )
+        if not leading_anchor_divergence_accepted:
+            raise ProtocolError(
+                f"frame {frame} transport origin requires manual review; "
+                "refusing an unattended fine scan"
+            )
     mapping, selected = apply_boundary_offset(
         mapping,
         records,
@@ -1198,6 +1257,12 @@ def _derive_live_frame_selection(
         preview_sha256=hashlib.sha256(preview_data).hexdigest(),
         table_sha256=hashlib.sha256(validated_table).hexdigest(),
         decode_report=decode_report,
+        leading_anchor_divergence_accepted=leading_anchor_divergence_accepted,
+        reviewed_leading_residual_rows=(
+            reviewed_leading_residual_rows
+            if leading_anchor_divergence_accepted
+            else None
+        ),
         reviewed_fingerprint_sha256=(
             None
             if reviewed_fingerprint is None
@@ -1221,6 +1286,19 @@ def _derive_live_batch_selections(
 
     if not frames:
         raise ProtocolError("live batch has no selected frames")
+    # A slot with no manual-review-approval receipt can only appear in this
+    # batch because Roll.scan_many() -- the sole production constructor of
+    # the request this batch job came from -- already refuses
+    # (ManualReviewRequired) any slot its own reviewed session marked
+    # manual_review without one, and RollPreviewSession.approve_manual_origin
+    # itself refuses to approve a slot that is not manual_review
+    # (preview_session.py). An approval-free slot in `frames` therefore
+    # proves this batch's reviewed session classified it automatic at
+    # preflight -- condition 5 of the narrow leading-anchor-divergence
+    # exception below.
+    reviewed_automatic_slots = frozenset(
+        spec.slot for spec in frames if spec.manual_review_approval is None
+    )
     # A zero-offset selection performs the expensive same-traversal decode and
     # gives us the unmodified detector mapping.  All requested offsets are then
     # applied together to that mapping before SEND(0x8f) can execute.
@@ -1233,6 +1311,7 @@ def _derive_live_batch_selections(
         expected_frame_count=None,
         reviewed_fingerprint=reviewed_fingerprint,
         manual_review_approved=frames[0].manual_review_approval is not None,
+        reviewed_as_automatic=frames[0].slot in reviewed_automatic_slots,
     )
     if context.fresh_fingerprint is None:
         raise ProtocolError("fresh batch roll fingerprint was not retained")
@@ -1267,6 +1346,7 @@ def _derive_live_batch_selections(
         approved_manual_slots=frozenset(
             spec.slot for spec in frames if spec.manual_review_approval is not None
         ),
+        reviewed_automatic_slots=reviewed_automatic_slots,
     )
     # The reviewed fingerprint's frame count is in scope here, so cross-check
     # it against the live table's addressable count. The two come from
@@ -1332,6 +1412,16 @@ def _derive_live_batch_selections(
             preview_sha256=context.preview_sha256,
             table_sha256=context.table_sha256,
             decode_report=context.decode_report,
+            # apply_batch_boundary_offsets never mutates `base`'s review
+            # flags, so a still-manual-review origin that nonetheless
+            # survived the batch gate above can only have done so through
+            # the narrow leading-anchor-divergence exception -- recompute
+            # that same predicate here purely to annotate the journal.
+            leading_anchor_divergence_accepted=(
+                base.manual_review
+                and spec.slot in reviewed_automatic_slots
+                and _is_narrowly_divergent_leading_anchor(base)
+            ),
             reviewed_fingerprint_sha256=context.reviewed_fingerprint_sha256,
             fresh_fingerprint=context.fresh_fingerprint,
             fingerprint_comparison=context.fingerprint_comparison,
@@ -1671,6 +1761,7 @@ def apply_batch_boundary_offsets(
     frames: Sequence[tuple[int, int]],
     *,
     approved_manual_slots: frozenset[int] = frozenset(),
+    reviewed_automatic_slots: frozenset[int] = frozenset(),
 ) -> tuple[
     TransportMapping,
     tuple[tuple[NativeFrameOrigin, NativeFrameOrigin], ...],
@@ -1709,10 +1800,20 @@ def apply_batch_boundary_offsets(
         if (
             not base.automatic or base.manual_review
         ) and frame not in approved_manual_slots:
-            raise ProtocolError(
-                f"frame {frame} transport origin requires manual review; "
-                "refusing an unattended batch"
-            )
+            # Same narrow exception as _derive_live_frame_selection's gate
+            # (CHANGELOG "leading-anchor-divergence accepted"). Fingerprint
+            # conditions are not re-checked here: _derive_live_batch_selections,
+            # this function's only caller, already compares every frame's
+            # global and selected visual fingerprint before it ever calls
+            # this function, in the same unchanged order.
+            if (
+                frame not in reviewed_automatic_slots
+                or not _is_narrowly_divergent_leading_anchor(base)
+            ):
+                raise ProtocolError(
+                    f"frame {frame} transport origin requires manual review; "
+                    "refusing an unattended batch"
+                )
         combined, selected = apply_boundary_offset(
             combined,
             records,

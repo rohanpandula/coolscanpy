@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+The scan-time manual-review gate could still refuse an otherwise clean frame
+1 that the operator already reviewed. The five-row leading-anchor cap on the
+physically addressable table only decides which records the scanner can be
+told to address; it does not by itself exempt a slot from the separate,
+same-traversal manual-review gate a fresh scan-time reread runs before frame
+binding. A live 36-slot reservation whose reviewed preview measured a
+-1.525-row leading residual (automatic, inside the two-row interior bound)
+produced a fresh scan-time reread of -2.497 rows on the same slot -- still
+inside the five-row leading bound, but now flagged
+`leading-anchor-divergence` -- and refused before the fine scan ever began,
+despite matching global and selected visual fingerprints on both traversals.
+The scan-time gate now narrowly auto-accepts exactly that condition: a fresh
+frame-1 origin whose only flagged issue is `leading-anchor-divergence`,
+inside the five-row bound, when the reviewed session's own preflight already
+classified that slot automatic, both the whole-roll and selected-slot visual
+fingerprints already matched, and every interior mapping gate already
+passed. An accepted slot's journal now carries a
+`leading-anchor-divergence-accepted` marker with its fresh residual. The
+two-row interior bound is unchanged, the fingerprint checks keep running
+first in the same order, and every other manual-review cause -- including
+any slot the reviewed session itself flagged manual -- still refuses exactly
+as before.
+
 Full-roll transport mapping now permits the directly observed Nikon leading
 record to differ by up to five 97-dpi preview rows from the independently
 fitted interior traversal. A live 36-frame reservation produced a 3.924-row

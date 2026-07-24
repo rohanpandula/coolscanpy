@@ -1300,6 +1300,365 @@ def test_addressable_prefix_keeps_leading_exception_narrow(
         worker_module._addressable_frame_origins(mapping)
 
 
+# -- narrow leading-anchor-divergence auto-acceptance ------------------------
+#
+# The live capture that motivated this exception (attempt 4, 2026-07-23) had
+# its preserved binaries removed by a later tmp-directory cleanup, so there is
+# no original preview/table capture left to replay. These tests instead build
+# the same synthetic mapping/records/fingerprint shapes the rest of this file
+# already uses (`_short_strip_mapping`, `_with_reviewed_leading_anchor`,
+# `_reviewed_fingerprint_with_count`), but pinned to attempt 4's own measured
+# numbers: 36 scanner-addressable slots, a fresh scan-time leading residual of
+# -2.497 preview rows (inside the five-row hard bound), and a reviewed-preview
+# leading residual of -1.525 preview rows (inside the two-row interior bound,
+# hence "automatic" at preflight).
+
+
+def test_leading_anchor_divergence_narrowly_auto_accepted_when_reviewed_automatic() -> (
+    None
+):
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping, residual_rows=-2.497)
+
+    adjusted, resolved = apply_batch_boundary_offsets(
+        mapping,
+        records,
+        ((1, 0),),
+        approved_manual_slots=frozenset(),
+        reviewed_automatic_slots=frozenset({1}),
+    )
+
+    assert resolved[0][1].frame == 1
+    assert len(worker_module._addressable_frame_origins(adjusted)) == 36
+
+
+def test_leading_anchor_divergence_still_manual_beyond_five_row_bound() -> None:
+    # -5.001 rows is a residual derive_transport_mapping would never actually
+    # hand back (it raises IndexDecodeError first, above the five-row bound);
+    # this proves apply_batch_boundary_offsets's own narrow-acceptance check
+    # re-verifies the bound rather than trusting reviewed_automatic_slots alone.
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping, residual_rows=-5.001)
+
+    with pytest.raises(
+        ProtocolError, match="frame 1 transport origin requires manual review"
+    ):
+        apply_batch_boundary_offsets(
+            mapping,
+            records,
+            ((1, 0),),
+            approved_manual_slots=frozenset(),
+            reviewed_automatic_slots=frozenset({1}),
+        )
+
+
+def test_leading_anchor_divergence_still_manual_with_second_origin_issue() -> None:
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping, residual_rows=-2.497)
+    origin = mapping.origins[0]
+    changed = replace(
+        origin,
+        # A second, unrelated review reason from the same gap boundary --
+        # leading-anchor divergence must be the *only* fresh-origin issue.
+        review_reasons=(*origin.review_reasons, "narrow-gap-evidence"),
+    )
+    mapping = replace(mapping, origins=(changed, *mapping.origins[1:]))
+
+    with pytest.raises(
+        ProtocolError, match="frame 1 transport origin requires manual review"
+    ):
+        apply_batch_boundary_offsets(
+            mapping,
+            records,
+            ((1, 0),),
+            approved_manual_slots=frozenset(),
+            reviewed_automatic_slots=frozenset({1}),
+        )
+
+
+def test_leading_anchor_divergence_still_manual_when_not_reviewed_automatic() -> None:
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping, residual_rows=-2.497)
+
+    with pytest.raises(
+        ProtocolError, match="frame 1 transport origin requires manual review"
+    ):
+        apply_batch_boundary_offsets(
+            mapping,
+            records,
+            ((1, 0),),
+            approved_manual_slots=frozenset(),
+            # Empty: the reviewed session's own preflight did not classify
+            # this slot automatic (or this call did not say so), so the
+            # narrow exception must not fire no matter how clean the fresh
+            # residual is.
+            reviewed_automatic_slots=frozenset(),
+        )
+
+
+def test_batch_selections_derive_reviewed_automatic_slots_from_missing_approvals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_derive_live_batch_selections must derive condition 5 itself.
+
+    Roll.scan_many() -- the sole production constructor of the request a
+    batch job comes from -- already refuses (ManualReviewRequired) any slot
+    its own reviewed session marked manual_review without a valid approval,
+    and RollPreviewSession.approve_manual_origin refuses to approve a slot
+    that is not manual_review. A slot with no manual_review_approval reaching
+    this function therefore already proves its reviewed session classified
+    it automatic at preflight.
+    """
+
+    mapping, records = _short_strip_mapping(36)
+    mapping = _with_reviewed_leading_anchor(mapping, residual_rows=-2.497)
+    reviewed = _reviewed_fingerprint_with_count(36)
+    context = _batch_selection_context(mapping, records, reviewed)
+    frames = _one_slot_batch(tmp_path, "leading-anchor-wiring", 1)
+
+    monkeypatch.setattr(
+        worker_module, "_derive_live_frame_selection", lambda *_a, **_k: context
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "compare_selected_roll_fingerprint",
+        lambda *_a, **_k: SimpleNamespace(matches=True, reason="matched"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, context.geometry.height),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_a, **_k: records,
+    )
+    monkeypatch.setattr(
+        worker_module, "_bind_plan_to_live_selection", lambda *_a, **_k: None
+    )
+
+    selections = worker_module._derive_live_batch_selections(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frames,
+        reviewed_fingerprint=reviewed,
+    )
+
+    # This helper's mocked compare_selected_roll_fingerprint returns a bare
+    # SimpleNamespace without a to_payload() method, so this checks the
+    # underlying fields directly rather than the full diagnostics() dict --
+    # test_derive_live_frame_selection_accepts_full_incident_shape above
+    # already exercises the real journal payload end to end.
+    assert len(selections) == 1
+    assert selections[0].leading_anchor_divergence_accepted is True
+    assert selections[0].base_selected.affine_residual_rows == pytest.approx(-2.497)
+
+
+def _leading_anchor_gate_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    frame_count: int = 36,
+    mismatched: bool,
+) -> ReviewedRollFingerprint:
+    """Same shape as ``test_fresh_batch_index_refuses_a_different_roll_...``
+    above, with frame 1's origin rebuilt as a bounded leading-anchor-only
+    divergence (fresh residual -2.497 rows) instead of a plain automatic
+    origin. ``mismatched`` reuses the same reversed-frame-order trick that
+    test already relies on to force a visual-content mismatch; otherwise the
+    fresh raster is bit-identical to the reviewed one.
+    """
+
+    frame_height = 20
+    intervals = tuple(
+        (slot * frame_height, (slot + 1) * frame_height) for slot in range(frame_count)
+    )
+    reviewed_frames = []
+    for slot in range(frame_count):
+        rng = np.random.default_rng(70_000 + slot)
+        reviewed_frames.append(
+            np.repeat(
+                np.repeat(
+                    rng.integers(2_000, 50_000, size=(10, 10, 3), dtype=np.uint16),
+                    2,
+                    axis=0,
+                ),
+                2,
+                axis=1,
+            )
+        )
+    reviewed_rgb = np.concatenate(reviewed_frames, axis=0)
+    fresh_rgb = (
+        np.concatenate(list(reversed(reviewed_frames)), axis=0)
+        if mismatched
+        else reviewed_rgb
+    )
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(6_000)
+    )
+    lookup_rows = tuple(100 + 143 * index for index in range(frame_count))
+    origins = [
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=intervals[frame - 1][0],
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(lookup_rows, start=1)
+    ]
+    origins[0] = replace(
+        origins[0],
+        automatic=False,
+        manual_review=True,
+        review_reasons=(worker_module.LEADING_ANCHOR_REVIEW_REASON,),
+        affine_residual_rows=-2.497,
+    )
+    origins_tuple = tuple(origins)
+    mapping = TransportMapping(
+        6_000,
+        origins_tuple[0].native_origin - 42.0 * origins_tuple[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins_tuple,
+    )
+    reviewed = build_reviewed_roll_fingerprint(
+        reviewed_rgb,
+        frame_intervals=intervals,
+        frame_native_origins=tuple(origin.native_origin for origin in origins_tuple),
+        source_preview_sha256="1" * 64,
+        source_table_sha256="2" * 64,
+    )
+    geometry = SimpleNamespace(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=250_278,
+        width=20,
+        height=len(fresh_rgb),
+        block_bytes=1,
+        expected_stream_bytes=1,
+    )
+    detection = SimpleNamespace(
+        confidence="high",
+        intervals=tuple(
+            SimpleNamespace(start_row=start, end_row=end) for start, end in intervals
+        ),
+        boundaries=(),
+        diagnostics=lambda: {},
+    )
+    monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
+    monkeypatch.setattr(
+        worker_module,
+        "validate_live_0x8e_bytes",
+        lambda table, _height: (table, len(fresh_rgb)),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "decode_full_index_bytes",
+        lambda *_args, **_kwargs: (
+            fresh_rgb,
+            np.ones(len(fresh_rgb), dtype=bool),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module, "detect_roll_frames", lambda *_args, **_kwargs: detection
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "parse_live_transport_records_bytes",
+        lambda *_args, **_kwargs: records,
+    )
+    monkeypatch.setattr(
+        worker_module, "derive_transport_mapping", lambda *_args, **_kwargs: mapping
+    )
+    return reviewed
+
+
+def test_derive_live_frame_selection_accepts_full_incident_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end gate acceptance encoding attempt 4's exact parameters: 36
+    addressable slots, fresh leading residual -2.497 rows against the
+    5.0-row hard bound, a reviewed-preflight residual of -1.525 rows
+    (automatic), and matching global and selected visual fingerprints on
+    both traversals.
+    """
+
+    reviewed = _leading_anchor_gate_fixture(monkeypatch, mismatched=False)
+
+    selection = worker_module._derive_live_frame_selection(
+        [],
+        b"fresh-preview",
+        b"fresh-table",
+        frame=1,
+        reviewed_fingerprint=reviewed,
+        manual_review_approved=False,
+        reviewed_as_automatic=True,
+        reviewed_leading_residual_rows=-1.525,
+    )
+
+    assert selection.frame == 1
+    assert selection.frame_count == 36
+    assert selection.leading_anchor_divergence_accepted is True
+    assert selection.fingerprint_comparison is not None
+    assert selection.fingerprint_comparison.matches
+    assert selection.selected_fingerprint_comparison is not None
+    assert selection.selected_fingerprint_comparison.matches
+    accepted = selection.diagnostics()["leading_anchor_divergence_accepted"]
+    assert accepted == {
+        "origin": worker_module.LEADING_ANCHOR_DIVERGENCE_ACCEPTED_ORIGIN,
+        "fresh_residual_rows": pytest.approx(-2.497),
+        "reviewed_residual_rows": pytest.approx(-1.525),
+    }
+
+
+def test_derive_live_frame_selection_still_refuses_on_fingerprint_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An otherwise-eligible, bounded, reviewed-automatic leading-anchor-only
+    frame 1 must still refuse when the fresh visual fingerprint does not
+    match -- and with the pre-existing fingerprint-mismatch message, proving
+    the fingerprint checks still run first, in their unchanged order, ahead
+    of this narrow exception.
+    """
+
+    reviewed = _leading_anchor_gate_fixture(monkeypatch, mismatched=True)
+
+    with pytest.raises(
+        ProtocolError, match="does not match the reviewed roll fingerprint"
+    ):
+        worker_module._derive_live_frame_selection(
+            [],
+            b"fresh-preview",
+            b"fresh-table",
+            frame=1,
+            reviewed_fingerprint=reviewed,
+            manual_review_approved=False,
+            reviewed_as_automatic=True,
+            reviewed_leading_residual_rows=-1.525,
+        )
+
+
 def test_live8_frame_table_is_the_exact_firmware_accepted_payload() -> None:
     payload = build_live_frame_table_payload(_mapping(LIVE8_TRANSPORT_FIELDS))
     send = next(entry for entry in load_canonical_plan() if entry["seq"] == 174)
