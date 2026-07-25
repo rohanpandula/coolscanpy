@@ -541,7 +541,7 @@ def _drive_two_frame_batch(
     )
 
     def selection_for(slot, offset, pair):
-        base, selected = pair
+        base, selected, _rebase = pair
         return SimpleNamespace(
             frame=slot,
             frame_count=len(combined.origins),
