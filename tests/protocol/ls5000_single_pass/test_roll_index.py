@@ -1,5 +1,6 @@
 """Regression contracts for whole-roll index decoding and dynamic frame origins."""
 
+import math
 import os
 import struct
 from pathlib import Path
@@ -567,10 +568,23 @@ def test_terminal_high_bit_suffix_cannot_poison_short_strip_mapping() -> None:
         :4
     ]
     terminal = mapping.origins[4]
-    assert terminal.native_origin == 43_946
+    # The garbage tail record (native_origin 43_946, a ~24k unit jump beyond
+    # the healthy ramp) is never surfaced as this slot's resolved origin: the
+    # clamp replaces it with the interior fit's own extrapolation at this
+    # boundary's row, so the value is reconstructible from the fit alone.
+    expected_clamped_origin = math.floor(
+        mapping.native_intercept
+        + mapping.native_units_per_preview_row * terminal.boundary_output_row
+        + 0.5
+    )
+    assert terminal.native_origin == expected_clamped_origin
+    assert terminal.native_origin != 43_946
+    assert terminal.lookup_row == 718
     assert terminal.automatic is False
     assert terminal.manual_review is True
+    assert terminal.affine_residual_rows == pytest.approx(0.0, abs=0.02)
     assert "terminal-transport-tail" in terminal.review_reasons
+    assert roll.TRANSPORT_ORIGIN_CLAMP_REASON in terminal.review_reasons
 
 
 def test_terminal_suffix_requires_three_pre_tail_direct_anchors() -> None:
@@ -660,6 +674,142 @@ def test_one_record_terminal_suffix_preserves_prefix_and_truncates_tail() -> Non
     assert tail.lookup_row == 99
     assert tail.automatic is False
     assert "terminal-transport-tail" in tail.review_reasons
+
+
+def _expected_extrapolated_origin(mapping: roll.TransportMapping, origin) -> int:
+    """Recompute the interior fit's own prediction at one origin's boundary
+    row, the same way the terminal-tail/residual clamp does internally."""
+
+    return math.floor(
+        mapping.native_intercept
+        + mapping.native_units_per_preview_row * origin.boundary_output_row
+        + 0.5
+    )
+
+
+def test_last_slot_terminal_tail_clamp_extrapolates_instead_of_garbage_record() -> None:
+    """Defect 4: a last-frame lookup row inside the terminal transport tail
+    must never surface the garbage record's native_origin.  The clamp
+    replaces it with the interior fit's own extrapolation and forces manual
+    review with a warning that names the clamp, while leaving the earlier,
+    healthy slots and the raw lookup_row/code/selector diagnostics alone."""
+    records = [
+        roll.TransportRecord(row=row, code=0, selector=0, native_origin=42 * row)
+        for row in range(600)
+    ]
+    for row in range(560, 600):
+        records[row] = roll.TransportRecord(
+            row=row,
+            code=0x8330,
+            selector=31,
+            native_origin=43_946,
+        )
+    rows = [20, 163, 306, 449]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+    # This boundary keeps "direct" physical-gap support; only its transport
+    # lookup row happens to land inside the terminal tail, exactly as
+    # observed live when the trailing edge clears the drive mid-last-frame.
+    boundaries[3] = _boundary(3, rows[3], evidence_run=(rows[3] - 3, 565))
+
+    mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    assert roll.terminal_transport_tail_start(records) == 560
+    assert [origin.native_origin for origin in mapping.origins[:3]] == [
+        42 * 24,
+        42 * 167,
+        42 * 310,
+    ]
+    assert [origin.automatic for origin in mapping.origins[:3]] == [True, True, True]
+    last = mapping.origins[3]
+    assert last.method == "direct-gap-trailing-row"
+    assert last.lookup_row == 565
+    assert last.code == records[565].code
+    assert last.selector == records[565].selector
+    assert last.native_origin != 43_946
+    assert last.native_origin == _expected_extrapolated_origin(mapping, last)
+    assert last.native_origin > mapping.origins[2].native_origin
+    assert last.automatic is False
+    assert last.manual_review is True
+    assert last.affine_residual_rows == pytest.approx(0.0, abs=0.01)
+    assert "terminal-transport-tail" in last.review_reasons
+    assert roll.TRANSPORT_ORIGIN_CLAMP_REASON in last.review_reasons
+
+
+def test_non_tail_high_residual_record_is_also_clamped() -> None:
+    """The residual backstop protects slots the high-bit tail heuristic does
+    not catch: an isolated, non-terminal anomaly with no 0x8000 marker at all
+    must still be clamped once its resolved record disagrees with the
+    interior fit by more than the interior anchor bound."""
+    records = [
+        roll.TransportRecord(row=row, code=0, selector=0, native_origin=42 * row)
+        for row in range(500)
+    ]
+    for row in range(230, 238):
+        records[row] = roll.TransportRecord(
+            row=row, code=0, selector=0, native_origin=42 * row + 20_000
+        )
+    rows = [20, 163, 229, 449]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+    # A broad/cut gap is never "direct": resolution falls back to the local
+    # affine-guided lookup, whose trailing search window after the fitted
+    # centre lands entirely inside the anomalous run.
+    boundaries[2] = _boundary(2, rows[2], support="cadence-broad")
+
+    mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    assert roll.terminal_transport_tail_start(records) is None
+    healthy = (mapping.origins[0], mapping.origins[1], mapping.origins[3])
+    assert [origin.automatic for origin in healthy] == [True, True, True]
+    anomalous = mapping.origins[2]
+    assert anomalous.method == "affine-guided-local-lookup"
+    assert anomalous.native_origin < 20_000
+    assert anomalous.native_origin == _expected_extrapolated_origin(mapping, anomalous)
+    assert anomalous.automatic is False
+    assert anomalous.manual_review is True
+    assert "terminal-transport-tail" not in anomalous.review_reasons
+    assert roll.TRANSPORT_ORIGIN_CLAMP_REASON in anomalous.review_reasons
+    # Origins must stay strictly increasing across the clamped slot.
+    assert (
+        mapping.origins[1].native_origin
+        < anomalous.native_origin
+        < mapping.origins[3].native_origin
+    )
+
+
+def test_leading_anchor_divergence_is_never_clamped() -> None:
+    """The leading anchor keeps its own wider, separately reviewed divergence
+    allowance (MAXIMUM_LEADING_ANCHOR_ERROR_ROWS); the terminal-tail/residual
+    clamp must never re-litigate that already-tolerated case even though its
+    residual against the interior fit can exceed the interior anchor bound
+    by design."""
+    records = [
+        roll.TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(1_500)
+    ]
+    rows = [8 + index * 143 for index in range(10)]
+    boundaries = [_boundary(index, row) for index, row in enumerate(rows)]
+    first_lookup_row = boundaries[0].evidence_run[1]
+    first = records[first_lookup_row]
+    records[first_lookup_row] = roll.TransportRecord(
+        row=first.row,
+        code=first.code,
+        selector=first.selector,
+        native_origin=first.native_origin + 165,
+    )
+
+    mapping = roll.derive_transport_mapping(boundaries, len(rows), records)
+
+    leading = mapping.origins[0]
+    assert abs(leading.affine_residual_rows) > roll.MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS
+    assert abs(leading.affine_residual_rows) < roll.MAXIMUM_LEADING_ANCHOR_ERROR_ROWS
+    assert leading.native_origin == first.native_origin + 165
+    assert roll.LEADING_ANCHOR_REVIEW_REASON in leading.review_reasons
+    assert roll.TRANSPORT_ORIGIN_CLAMP_REASON not in leading.review_reasons
 
 
 @pytest.mark.skipif(

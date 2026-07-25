@@ -28,6 +28,7 @@ INDEX_TRAILER_COUNTER0 = 0xAAE5
 MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS = 2.0
 MAXIMUM_LEADING_ANCHOR_ERROR_ROWS = 5.0
 LEADING_ANCHOR_REVIEW_REASON = "leading-anchor-divergence"
+TRANSPORT_ORIGIN_CLAMP_REASON = "transport-origin-extrapolated-clamp"
 
 
 class IndexDecodeError(ValueError):
@@ -1233,6 +1234,19 @@ def derive_transport_mapping(
     Broad/cut gaps are never called automatic.  They receive a local candidate
     chosen against the robust direct-anchor line so a UI can present it for
     review without silently pretending that the damaged boundary was exact.
+
+    A slot's resolved record is never trusted as-is once it falls at or after
+    ``terminal_transport_tail_start(records)``, or once its own residual
+    against the interior affine fit exceeds ``maximum_anchor_error_rows``: the
+    live 0x8e ramp is proven to jump by tens of thousands of native units once
+    the strip's trailing edge clears the drive mid-frame (defect 4).  Such a
+    slot's ``native_origin`` is replaced by the interior fit's own
+    extrapolation (``intercept + scale * boundary_output_row``) and forced to
+    ``manual_review`` with ``TRANSPORT_ORIGIN_CLAMP_REASON`` in
+    ``review_reasons``.  This never fires for the leading anchor, which keeps
+    its own separately reviewed, wider divergence allowance, and it never
+    fires for a healthy interior anchor: those are exactly the anchors this
+    function's own residual gate above already required to be tight.
     """
 
     if frame_count < 1 or len(boundaries) < frame_count:
@@ -1352,9 +1366,9 @@ def derive_transport_mapping(
             reasons = list(boundary.review_reasons)
             reasons.append("transport-origin-inferred")
             automatic = False
-        if tail_start is not None and record.row >= tail_start:
-            if terminal_boundary_index is None:
-                terminal_boundary_index = boundary.index
+        record_in_terminal_tail = tail_start is not None and record.row >= tail_start
+        if record_in_terminal_tail and terminal_boundary_index is None:
+            terminal_boundary_index = boundary.index
         if boundary.index == 0 and leading_anchor_requires_review:
             reasons.append(LEADING_ANCHOR_REVIEW_REASON)
             automatic = False
@@ -1364,7 +1378,31 @@ def derive_transport_mapping(
         ):
             reasons.append("terminal-transport-tail")
             automatic = False
-        residual = (prediction - record.native_origin) / scale
+        native_origin = record.native_origin
+        residual = (prediction - native_origin) / scale
+        # A record at/after the terminal transport tail is never trustworthy
+        # on its own: the same live 0x8e ramp that produced it is the one
+        # observed to jump by tens of thousands of native units once the
+        # strip's trailing edge clears the drive (defect 4). A record whose
+        # residual against the *interior* affine fit already exceeds the
+        # interior anchor bound is treated the same way, as a fail-closed
+        # backstop for a garbage record the high-bit tail heuristic did not
+        # catch. Either way, the live record is discarded in favour of the
+        # interior fit's own extrapolation, and the slot is forced to manual
+        # review with a warning that names the clamp. The leading anchor is
+        # excluded from the residual backstop: it already has its own wider,
+        # separately reviewed divergence allowance
+        # (``maximum_leading_anchor_error_rows``) precisely because Nikon's
+        # special leading record can move several rows even on a clean feed,
+        # and this clamp must not re-litigate that already-tolerated case.
+        clamp_required = record_in_terminal_tail or (
+            boundary.index != 0 and abs(residual) > maximum_anchor_error_rows
+        )
+        if clamp_required:
+            native_origin = int(math.floor(prediction + 0.5))
+            residual = (prediction - native_origin) / scale
+            reasons.append(TRANSPORT_ORIGIN_CLAMP_REASON)
+            automatic = False
         origins.append(
             NativeFrameOrigin(
                 frame=frame,
@@ -1373,7 +1411,7 @@ def derive_transport_mapping(
                 lookup_row=record.row,
                 code=record.code,
                 selector=record.selector,
-                native_origin=record.native_origin,
+                native_origin=native_origin,
                 method=method,
                 automatic=automatic,
                 manual_review=not automatic,
