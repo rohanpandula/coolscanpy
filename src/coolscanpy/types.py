@@ -50,6 +50,7 @@ __all__ = [
     "DigitalIceAcquisition",
     "DigitalIceAcquisitionEvidence",
     "DIGITAL_ICE_STORAGE_TRANSFORM",
+    "DIGITAL_ICE_STORAGE_TRANSFORM_V1_ROT90K1",
     "build_digital_ice_acquisition_evidence",
     "ApprovalReceipt",
     "Receipt",
@@ -235,6 +236,16 @@ class ArtifactEvidence:
 
 
 DIGITAL_ICE_STORAGE_TRANSFORM = "swapaxes01-scanner-native-to-nikon-render-parity-v2"
+# Pre-05bfe2a historical transform. No live capture path emits this any more
+# -- single_pass_workflow.py has only ever produced DIGITAL_ICE_STORAGE_TRANSFORM
+# above -- but it is named here, once, as the single canonical identifier a
+# human/operator can use to LABEL an archived pre-05bfe2a capture whose
+# provenance is independently known (e.g. from capture timestamp vs commit
+# history), since those captures predate Receipt.storage_transform existing
+# at all and carry no on-disk stamp of their own (Sol adversarial review
+# 2026-07-26, finding 2). Never assigned by this module; render_roll.py's
+# own copy of this same string is what an operator actually passes.
+DIGITAL_ICE_STORAGE_TRANSFORM_V1_ROT90K1 = "rot90k1-scanner-native-to-storage-v1"
 _DIGITAL_ICE_EVIDENCE_KIND = "coolscanpy.digital-ice-acquisition-evidence"
 _DIGITAL_ICE_EVIDENCE_VERSION = 1
 
@@ -583,10 +594,25 @@ class Receipt:
     focus_detail: FocusDetailTelemetry
     transport_smear: TransportSmearAssessment
     artifacts: Mapping[str, ArtifactEvidence]
+    # Mandatory (Sol adversarial review 2026-07-26, finding 2): the versioned
+    # identifier for the numpy transform single_pass_workflow.py applied to
+    # go from the scanner-native RGB/IR planes to this frame's stored
+    # rgb/ir -- currently always DIGITAL_ICE_STORAGE_TRANSFORM, sourced
+    # directly from this same frame's DigitalIceAcquisitionEvidence so the
+    # value a downstream consumer sees can never drift from the value that
+    # was actually used to build the native Digital ICE pair. Required (not
+    # Optional/defaulted) so a caller cannot construct a Receipt without
+    # deciding it, and so JSON produced from old code that predates this
+    # field is distinguishable from JSON that declares one: a missing key
+    # after `dataclasses.asdict()`/round-trip is a loud TypeError, never a
+    # silent None a reader could mistake for "no transform applied".
+    storage_transform: str
     nikon_density_ownership: NikonDensityFrameOwnershipReceipt | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "artifacts", _ImmutableArtifacts(self.artifacts))
+        if type(self.storage_transform) is not str or not self.storage_transform.strip():
+            raise ValueError("receipt storage_transform must be a non-empty string")
 
 
 @dataclass(frozen=True)

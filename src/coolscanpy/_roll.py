@@ -1213,6 +1213,7 @@ def _build_receipt(
     *,
     device_id: str,
     artifacts: dict[str, ArtifactEvidence],
+    storage_transform: str,
     density_ownership: NikonDensityFrameOwnershipReceipt | None = None,
 ) -> Receipt:
     """Adapt a completed ``LS5000SinglePassWorkflow`` manifest dict into the
@@ -1225,7 +1226,11 @@ def _build_receipt(
     ``ScannerCaptureState``. ``red/green/blue_exposure_us`` are populated
     faithfully by converting those raw 10ns ticks to microseconds.
     ``split_alignment`` is always ``None`` for this route: RGB and IR share
-    one pass with no separate registration step.
+    one pass with no separate registration step. ``storage_transform`` is
+    required (Sol adversarial review 2026-07-26, finding 2): the caller
+    passes this frame's own ``DigitalIceAcquisitionEvidence.storage_transform``
+    so the value published on the public Receipt can never drift from the
+    value actually used to build the scanner-native Digital ICE pair.
     """
 
     capture = manifest["capture"]
@@ -1305,6 +1310,7 @@ def _build_receipt(
         focus_detail=focus_detail,
         transport_smear=transport_smear,
         artifacts=artifacts,
+        storage_transform=storage_transform,
         nikon_density_ownership=density_ownership,
     )
 
@@ -1611,6 +1617,7 @@ def _read_frame(
         finalization.manifest,
         device_id=device_id,
         artifacts=artifacts,
+        storage_transform=digital_ice_evidence.storage_transform,
         density_ownership=density_ownership,
     )
     _cleanup_finalization(finalization)
