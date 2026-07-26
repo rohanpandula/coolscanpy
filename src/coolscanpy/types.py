@@ -234,7 +234,7 @@ class ArtifactEvidence:
     dtype: str
 
 
-DIGITAL_ICE_STORAGE_TRANSFORM = "rot90-k1-scanner-native-to-upright-v1"
+DIGITAL_ICE_STORAGE_TRANSFORM = "swapaxes01-scanner-native-to-nikon-render-parity-v2"
 _DIGITAL_ICE_EVIDENCE_KIND = "coolscanpy.digital-ice-acquisition-evidence"
 _DIGITAL_ICE_EVIDENCE_VERSION = 1
 
@@ -290,16 +290,23 @@ def _scanner_native_main_rgbi(
     storage_rgb: np.ndarray,
     storage_ir: np.ndarray,
 ) -> np.ndarray:
+    # swapaxes(0,1) is self-inverse, so the storage->native direction uses the
+    # same operation the workflow used native->storage. This MUST track
+    # single_pass_workflow's storage transform: when storage was rot90(k=1)
+    # the inverse here was rot90(k=-1); storage is now swapaxes(0,1) for Nikon
+    # render parity (LS5000-FLIP-OWNERSHIP-20260724), so a rot90 inverse would
+    # silently mirror the reconstructed native raster.
     native_shape = (storage_rgb.shape[1], storage_rgb.shape[0])
     native = np.empty((*native_shape, 4), dtype="<u2", order="C")
-    native[..., :3] = np.rot90(storage_rgb, k=-1, axes=(0, 1))
-    native[..., 3] = np.rot90(storage_ir, k=-1, axes=(0, 1))
+    native[..., :3] = np.swapaxes(storage_rgb, 0, 1)
+    native[..., 3] = np.swapaxes(storage_ir, 0, 1)
     return native
 
 
 def _scanner_native_ir_validity(storage_ir_validity: np.ndarray) -> np.ndarray:
+    # Same self-inverse swap as _scanner_native_main_rgbi -- keep both in step.
     return np.array(
-        np.rot90(storage_ir_validity, k=-1, axes=(0, 1)),
+        np.swapaxes(storage_ir_validity, 0, 1),
         dtype=np.bool_,
         order="C",
         copy=True,

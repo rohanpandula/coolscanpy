@@ -26,7 +26,7 @@ class _Receipt:
 
 def test_frame_prepares_scanner_native_dice_acquisition_and_freezes_sources() -> None:
     native_main = np.arange(4 * 3 * 4, dtype=np.uint16).reshape(4, 3, 4)
-    upright = np.ascontiguousarray(np.rot90(native_main, k=1, axes=(0, 1)))
+    upright = np.ascontiguousarray(np.swapaxes(native_main, 0, 1))
     storage_rgb = upright[..., :3]
     storage_ir = upright[..., 3]
     storage_validity = np.ones(storage_ir.shape, dtype=np.bool_)
@@ -62,13 +62,13 @@ def test_frame_prepares_scanner_native_dice_acquisition_and_freezes_sources() ->
     np.testing.assert_array_equal(acquisition.main_rgbi, native_main)
     np.testing.assert_array_equal(
         acquisition.ir_validity,
-        np.rot90(storage_validity, k=-1, axes=(0, 1)),
+        np.swapaxes(storage_validity, 0, 1),
     )
     np.testing.assert_array_equal(acquisition.meter_rgbi, meter_rgbi)
     assert acquisition.acquisition_id == evidence.acquisition_id
     assert acquisition.slot == 7
     assert acquisition.reservation_id == ownership.reservation_id
-    assert acquisition.storage_transform == "rot90-k1-scanner-native-to-upright-v1"
+    assert acquisition.storage_transform == "swapaxes01-scanner-native-to-nikon-render-parity-v2"
     assert acquisition.evidence_sha256 == evidence.sha256
     for array in (
         frame.rgb,
@@ -86,7 +86,7 @@ def test_frame_prepares_scanner_native_dice_acquisition_and_freezes_sources() ->
 
 def test_prepare_digital_ice_rejects_post_capture_ir_meter_mutation() -> None:
     native_main = np.arange(4 * 3 * 4, dtype=np.uint16).reshape(4, 3, 4)
-    upright = np.ascontiguousarray(np.rot90(native_main, k=1, axes=(0, 1)))
+    upright = np.ascontiguousarray(np.swapaxes(native_main, 0, 1))
     validity = np.ones(upright.shape[:2], dtype=np.bool_)
     meter = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
     ownership = _Ownership("reservation-001", "fine-slot-7-attempt-001", 7)
@@ -118,7 +118,7 @@ def test_prepare_digital_ice_rejects_post_capture_ir_meter_mutation() -> None:
 
 def test_frame_rejects_meter_or_reservation_swapped_across_acquisitions() -> None:
     native_main = np.arange(4 * 3 * 4, dtype=np.uint16).reshape(4, 3, 4)
-    upright = np.ascontiguousarray(np.rot90(native_main, k=1, axes=(0, 1)))
+    upright = np.ascontiguousarray(np.swapaxes(native_main, 0, 1))
     validity = np.ones(upright.shape[:2], dtype=np.bool_)
     meter_a = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
     meter_b = np.ascontiguousarray(meter_a + 100)

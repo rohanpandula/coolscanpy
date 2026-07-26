@@ -1962,7 +1962,7 @@ class TestRollPreview:
                 assert acquisition.meter_rgbi.shape == (425, 281, 4)
                 assert acquisition.ir_validity.shape == (5_959, 3_946)
                 upright = np.ascontiguousarray(
-                    np.rot90(acquisition.main_rgbi, k=1, axes=(0, 1))
+                    np.swapaxes(acquisition.main_rgbi, 0, 1)
                 )
                 np.testing.assert_array_equal(upright[..., :3], frame.rgb)
                 np.testing.assert_array_equal(upright[..., 3], frame.ir)

@@ -284,10 +284,10 @@ def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(
     rgb_path = completed.output_paths["rgb"]
     ir_path = completed.output_paths["ir"]
     np.testing.assert_array_equal(
-        tifffile.imread(rgb_path), np.rot90(decoded, k=1)[..., :3]
+        tifffile.imread(rgb_path), np.swapaxes(decoded, 0, 1)[..., :3]
     )
     np.testing.assert_array_equal(
-        tifffile.imread(ir_path), np.rot90(decoded, k=1)[..., 3]
+        tifffile.imread(ir_path), np.swapaxes(decoded, 0, 1)[..., 3]
     )
     with tifffile.TiffFile(rgb_path) as tiff:
         assert has_linear_scanner_rgb_marker(tiff.pages[0].tags)
@@ -302,7 +302,8 @@ def test_finalizes_explicit_tail_slot_without_treating_roll_count_as_a_gate(
     assert manifest["frame_evidence"]["roll_identity"]["comparison"]["matches"] is True
     assert manifest["frame_evidence"]["manual_review_approval"]["slot"] == 39
     assert (
-        manifest["orientation"]["source_to_storage"] == "numpy rot90(k=1, axes=(0,1))"
+        manifest["orientation"]["source_to_storage"]
+        == "numpy swapaxes(0,1); Nikon Scan render parity per LS5000-FLIP-OWNERSHIP-20260724"
     )
     smear_qc = manifest["quality_control"]["stopped_transport_smear"]
     assert smear_qc["coordinate_space"] == "scanner-native RGB before storage rotation"
@@ -1113,7 +1114,7 @@ def test_default_finalization_consumes_bound_streamed_artifact_and_skips_offline
 
     assert spy.calls == 0, "offline decode must be skipped for a valid bound artifact"
     rgb = tifffile.imread(completed.output_paths["rgb"])
-    np.testing.assert_array_equal(rgb, np.rot90(decoded, k=1)[..., :3])
+    np.testing.assert_array_equal(rgb, np.swapaxes(decoded, 0, 1)[..., :3])
     manifest = json.loads(completed.manifest_path.read_text(encoding="utf-8"))
     assert manifest["decode_layout"]["streaming_receipt"] == _receipt_path(stream).name
     # The raw oracle is preserved; finalization did not consume it as the image.
@@ -1183,7 +1184,7 @@ def test_default_finalization_falls_back_to_offline_decode_without_receipt(
 
     assert spy.calls == 1
     np.testing.assert_array_equal(
-        tifffile.imread(completed.output_paths["rgb"]), np.rot90(decoded, k=1)[..., :3]
+        tifffile.imread(completed.output_paths["rgb"]), np.swapaxes(decoded, 0, 1)[..., :3]
     )
 
 
@@ -1324,7 +1325,7 @@ def test_injected_decoder_ignores_streamed_artifact(
 
     # A caller-injected decoder keeps its exact semantics; the artifact is unused.
     np.testing.assert_array_equal(
-        tifffile.imread(completed.output_paths["rgb"]), np.rot90(marker, k=1)[..., :3]
+        tifffile.imread(completed.output_paths["rgb"]), np.swapaxes(marker, 0, 1)[..., :3]
     )
     assert (
         not _receipt_path(stream).exists()

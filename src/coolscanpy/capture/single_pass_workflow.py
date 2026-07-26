@@ -998,7 +998,8 @@ class LS5000SinglePassWorkflow:
         if final_journal_bytes != journal_bytes or not hmac.compare_digest(final_journal_sha, journal_sha):
             raise SinglePassIntegrityError("capture journal changed while the stream was being decoded")
 
-        upright = np.ascontiguousarray(np.rot90(rgbi, k=1, axes=(0, 1)))
+        # Plain axis swap: rot90(k=1) would mirror the CCD axis vs Nikon Scan's render (LS5000-FLIP-OWNERSHIP-20260724).
+        upright = np.ascontiguousarray(np.swapaxes(rgbi, 0, 1))
         rgb = upright[..., :3]
         ir = upright[..., 3]
         valid = np.ones(ir.shape, dtype=np.bool_)
@@ -1129,9 +1130,9 @@ class LS5000SinglePassWorkflow:
                 "basis": "RGB and IR decoded from the same packed scanner traversal",
             },
             "orientation": {
-                "storage": "DIY-upright",
+                "storage": "nikon-render-parity",
                 "source_storage": "scanner-native portrait",
-                "source_to_storage": "numpy rot90(k=1, axes=(0,1))",
+                "source_to_storage": "numpy swapaxes(0,1); Nikon Scan render parity per LS5000-FLIP-OWNERSHIP-20260724",
                 "downstream_rotation_degrees": 0,
             },
             "ir_valid_mask": {
