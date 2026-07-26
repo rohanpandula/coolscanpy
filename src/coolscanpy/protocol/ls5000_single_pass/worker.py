@@ -1944,8 +1944,17 @@ def _addressable_frame_origins(
     """Return the proven physical prefix of a preview traversal.
 
     This count is deliberately independent of the 37 entries in Nikon's
-    SEND(0x8f) configuration page.  A preview may expose an advisory terminal
-    cell, while the firmware page remains fixed-size even for a short strip.
+    SEND(0x8f) configuration page in BOTH directions.  A preview may expose
+    an advisory terminal cell while the firmware page remains fixed-size for
+    a short strip, and a long roll may prove more addressable frames than
+    one page can carry: frame selection travels the wire as an absolute
+    native origin (dynamic SET_WINDOW / autofocus / GET_WINDOW bindings),
+    never as a page index, so every origin this prefix proves is
+    scanner-addressable regardless of whether it fits in the page.  Nikon
+    Scan itself scans frame 38+ of a 39-frame roll while sending the same
+    fixed 300-byte page (observed live, 2026-07-25; confirmed offline by
+    replaying all five persisted traversals of that roll).  Only
+    ``build_live_frame_table_payload`` truncates to the page capacity.
     """
 
     # The preview UI deliberately exposes every aligned candidate cell, including
@@ -1985,7 +1994,7 @@ def _addressable_frame_origins(
         raise ProtocolError(
             "live mapping has fewer than 2 scanner-addressable frame records"
         )
-    return tuple(origins[:FRAME_TABLE_SEND_RECORDS])
+    return tuple(origins)
 
 
 def _canonical_frame_table_records() -> tuple[tuple[int, int, int], ...]:
@@ -2028,9 +2037,15 @@ def build_live_frame_table_payload(mapping: TransportMapping) -> bytes:
     tail was accepted by this firmware on the retained short-strip preview;
     the live prefix remains guarded by its exact transport identity and every
     selected-frame geometry check.
+
+    A roll can prove MORE addressable frames than one page carries (39 on
+    the 2026-07-25 owner roll); the page then holds the first 37 records and
+    the overflow frames stay selectable, because scan-time addressing binds
+    each frame's absolute native origin into the plan rather than a page
+    index.  Nikon Scan demonstrates exactly this combination live.
     """
 
-    origins = _addressable_frame_origins(mapping)
+    origins = _addressable_frame_origins(mapping)[:FRAME_TABLE_SEND_RECORDS]
     payload = bytearray((0x01, 0x2A, len(origins), 0x00))
     previous = -1
     for expected_frame, origin in enumerate(origins, start=1):

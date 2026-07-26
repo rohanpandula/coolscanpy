@@ -1705,6 +1705,58 @@ def test_frame_table_keeps_short_strip_prefix_in_the_fixed_nikon_page() -> None:
     assert payload[4 + 6 * 8 :] == canonical[4 + 6 * 8 :]
 
 
+def test_long_roll_addressable_prefix_is_not_capped_by_the_send_page() -> None:
+    """39 proven origins stay selectable; only SEND(0x8f) truncates to 37.
+
+    The 2026-07-25 owner roll: five independent traversals each proved 39
+    clean origins, yet every batch refused frame 38 with "outside the
+    scanner-addressable table 1..37" -- the page capacity leaking into
+    selection legality.  Frame addressing crosses the wire as an absolute
+    native origin (dynamic SET_WINDOW / autofocus / GET_WINDOW), never a
+    page index, and Nikon Scan scans frame 38+ of the same roll while
+    sending the same fixed 300-byte page (observed live, 2026-07-25).
+    """
+
+    mapping, records = _short_strip_mapping(39)
+
+    assert len(worker_module._addressable_frame_origins(mapping)) == 39
+
+    payload = build_live_frame_table_payload(mapping)
+    assert len(payload) == FRAME_TABLE_SEND_BYTES
+    assert payload[:4] == bytes.fromhex("012a2500")
+    assert payload[4:] == b"".join(
+        struct.pack(">IHH", origin.native_origin, origin.selector, origin.code)
+        for origin in mapping.origins[:37]
+    )
+
+    adjusted, resolved = apply_batch_boundary_offsets(
+        mapping,
+        records,
+        ((38, 0), (39, 0)),
+        approved_manual_slots=frozenset(),
+    )
+    assert [item[1].frame for item in resolved] == [38, 39]
+    assert len(worker_module._addressable_frame_origins(adjusted)) == 39
+
+
+def test_long_roll_selection_still_stops_at_the_proven_prefix() -> None:
+    """The flag-break gate survives the page-cap removal: a long roll whose
+    trailing origins are genuinely non-addressable still refuses them."""
+
+    mapping, records = _short_strip_mapping(39, non_addressable_trailing=2)
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"outside the scanner-addressable table 1\.\.37",
+    ):
+        apply_batch_boundary_offsets(
+            mapping,
+            records,
+            ((38, 0),),
+            approved_manual_slots=frozenset(),
+        )
+
+
 def _with_terminal_sixth_origin(
     mapping: TransportMapping,
 ) -> TransportMapping:

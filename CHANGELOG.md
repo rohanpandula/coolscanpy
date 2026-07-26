@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Frame-selection legality no longer inherits the SEND(0x8f) page capacity.
+The physically addressable prefix and the fixed 37-record firmware page are
+two different things, but `_addressable_frame_origins` silently truncated
+the proven prefix to the page size, so frames 38+ of a long roll could never
+be selected: every batch requesting them refused with `requested frame 38 is
+outside the scanner-addressable table 1..37`. Observed live twice on
+2026-07-25 with a 39-frame C-41 roll whose five persisted traversals (two
+previews and all three batch index rereads) each prove 39 clean origins with
+sub-row anchor residuals — the refusal was roll-independent, not a detection
+shortfall. Frame addressing crosses the wire as an absolute native origin
+bound into the dynamic SET_WINDOW, autofocus, and GET_WINDOW commands, never
+as a page index, and Nikon Scan scans frame 38+ of the same roll while
+sending the same fixed 300-byte page. The addressable prefix now returns
+every proven origin; only `build_live_frame_table_payload` truncates to the
+page's 37 records, and the page keeps its exact firmware-required shape. The
+non-addressable flag gates (terminal-transport-tail, outside-index-raster,
+spacing-outlier, residual bounds) are unchanged, so a genuinely
+non-addressable trailing origin still stops selection at the proven prefix,
+and the excess-frames-vs-reviewed-roll comparison now sees the true live
+count instead of a page-capped one. A live fine scan of a frame past the
+page boundary has not yet been performed; replaying the exact failed live
+batch call (32 slots through frame 38) against the persisted reread
+artifacts succeeds end-to-end through selection derivation and page
+construction.
+
 The scan-time manual-review gate could still refuse an otherwise clean frame
 1 that the operator already reviewed. The five-row leading-anchor cap on the
 physically addressable table only decides which records the scanner can be
