@@ -28,10 +28,19 @@ DEFAULT_EXPOSURES = {"R": 90_000, "G": 180_000, "B": 165_000, "IR": 280_000}
 TARGET_FRACTIONS = {"R": 0.85, "G": 0.85, "B": 0.85, "IR": 0.84}
 CEILING_FRACTION = 0.95
 NIKON_PARITY_PROFILE = "nikon-parity"
-NIKON_PARITY_PROFILE_VERSION = 2
+NIKON_PARITY_PROFILE_VERSION = 3
+# v3 fractions are wire-measured: Nikon Scan's own fine-scan SET_WINDOW ticks
+# for the matched frames (fineticks-20260731-slot12-a, fineticks-20260801-
+# slot12-b, fineticks-20260801-slot13-a) exceeded the v2 guarded-parity
+# commands by mean R +2.086 % / G +2.621 % (spread 2.4 / 1.5 pp), so the R/G
+# targets scale by those measured ratios.  Blue measured +0.201 % against a
+# 0.96 pp pair spread — inside session noise and already riding the reviewed
+# 64,880 q99.99 guard — and is deliberately unchanged.  Basis:
+# reverse_engineering/live-captures/20260730-descriptor-capture/
+# fineticks-20260801-wire-comparison.json
 NIKON_PARITY_TARGET_FRACTIONS = {
-    "R": 0.930917,
-    "G": 0.962261,
+    "R": 0.950337,
+    "G": 0.987481,
     "B": 0.983639,
 }
 NIKON_PARITY_REVIEWED_HIGH_THRESHOLD = 64_880.0

@@ -35,7 +35,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "packed.py": "7380c8685c77be1234ad17bfd265cb6efc16efd05204ff56f55faf811f14cb9d",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
-    "meter.py": "47ad04ce5bddf85b3e6818a8338872cc9de7101d39a669ed61d49b8c098e935b",
+    "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",
     "roll_index.py": "436b504ecfa6bd01219e34c36e0e0fa29f11c9cd740dafcebc93685a9149545d",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
