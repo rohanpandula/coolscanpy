@@ -29,7 +29,10 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     build_reviewed_roll_fingerprint,
 )
 from coolscanpy.protocol.ls5000_single_pass.density import (
+    NikonDensityEvidence,
     NikonDensityExposureBinding,
+    NikonDensitySourceBinding,
+    density_source_geometry_for_startup_records,
 )
 from coolscanpy.protocol.ls5000_single_pass.plan import (
     CANONICAL_PLAN_SHA256,
@@ -61,6 +64,12 @@ LS5000_FINE_NATIVE_HEIGHT = 5_959
 SA30_ADAPTER_FRAME_CAPACITY = 40
 SESSION_VERSION = 1
 _PREVIEW_SLOT_SEMANTICS = "scanner-addressable preview slots; not an exposure count"
+_MINIMUM_PREVIEW_STARTUP_RECORDS = 2
+_PREVIEW_INDEX_PITCH = 41
+_PREVIEW_READ_MAX_BYTES = 131_072
+_PREVIEW_READ_FIRST_SEQUENCE = 118
+_PREVIEW_READ_LAST_SEQUENCE = 165
+_PREVIEW_SHORT_TABLE_STATUS = "022b4b0000000000"
 _PREVIEW_BINDING_CONTRACTS: dict[int, dict[str, object]] = {
     40: {
         "mode": "canonical-40-record",
@@ -73,29 +82,57 @@ _PREVIEW_BINDING_CONTRACTS: dict[int, dict[str, object]] = {
         "skipped_read_sequence_range": None,
         "startup_status": "0000000000000000",
     },
-    37: {
-        "mode": "canonical-prefix-37-record",
-        "startup_records": 37,
-        "native_height": 232_401,
-        "decoded_height": 5_668,
-        "expected_stream_bytes": 5_804_032,
-        "read_count": 45,
-        "active_read_sequence_range": [118, 162],
-        "skipped_read_sequence_range": [163, 165],
-        "startup_status": "022b4b0000000000",
-    },
 }
+
+
+def _short_preview_binding_contract(slot_capacity: int) -> dict[str, object]:
+    """Derive the sealed preview receipt for a scanner-reported short table."""
+
+    native_height, decoded_height = density_source_geometry_for_startup_records(
+        slot_capacity
+    )
+    expected_stream_bytes = decoded_height * INDEX_ROW_WORDS * 2
+    full_reads, final_bytes = divmod(expected_stream_bytes, _PREVIEW_READ_MAX_BYTES)
+    read_count = full_reads + (1 if final_bytes else 0)
+    if not 1 <= read_count <= (
+        _PREVIEW_READ_LAST_SEQUENCE - _PREVIEW_READ_FIRST_SEQUENCE + 1
+    ):
+        raise RollSessionIntegrityError(
+            "short preview contract has an invalid bounded READ allocation"
+        )
+    last_active = _PREVIEW_READ_FIRST_SEQUENCE + read_count - 1
+    return {
+        "mode": (
+            "canonical-prefix-37-record"
+            if slot_capacity == 37
+            else f"scanner-derived-{slot_capacity}-record"
+        ),
+        "startup_records": slot_capacity,
+        "native_height": native_height,
+        "decoded_height": decoded_height,
+        "expected_stream_bytes": expected_stream_bytes,
+        "read_count": read_count,
+        "active_read_sequence_range": [_PREVIEW_READ_FIRST_SEQUENCE, last_active],
+        "skipped_read_sequence_range": (
+            None
+            if last_active == _PREVIEW_READ_LAST_SEQUENCE
+            else [last_active + 1, _PREVIEW_READ_LAST_SEQUENCE]
+        ),
+        "startup_status": _PREVIEW_SHORT_TABLE_STATUS,
+    }
 
 
 def _preview_binding_contract(slot_capacity: object) -> dict[str, object]:
     if type(slot_capacity) is not int:
         raise RollSessionIntegrityError("preview slot capacity is not an integer")
     contract = _PREVIEW_BINDING_CONTRACTS.get(slot_capacity)
-    if contract is None:
+    if contract is not None:
+        return contract
+    if not _MINIMUM_PREVIEW_STARTUP_RECORDS <= slot_capacity < SA30_ADAPTER_FRAME_CAPACITY:
         raise RollSessionIntegrityError(
-            "preview startup count is not a proven 40- or 37-record contract"
+            "preview startup count is outside the scanner-derived 2..40 range"
         )
-    return contract
+    return _short_preview_binding_contract(slot_capacity)
 
 
 def _immutable_array(value: np.ndarray) -> np.ndarray:
@@ -755,9 +792,20 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
         raise RollSessionIntegrityError(
             f"preview density exposure evidence is malformed: {error}"
         ) from error
-    if exposure_binding.session_id != journal.get("density_calibration_session_id"):
+    try:
+        source_binding = NikonDensitySourceBinding.from_dict(
+            density_evidence.get("source_binding")
+        )
+    except ValueError as error:
         raise RollSessionIntegrityError(
-            "preview density exposure evidence belongs to another reservation"
+            f"preview density source evidence is malformed: {error}"
+        ) from error
+    if (
+        exposure_binding.session_id != journal.get("density_calibration_session_id")
+        or source_binding.session_id != exposure_binding.session_id
+    ):
+        raise RollSessionIntegrityError(
+            "preview density source/exposure evidence belongs to another reservation"
         )
     window_exposures = tuple(
         item["density_f03_exposure_raw_10ns"] for item in normalized
@@ -765,6 +813,15 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
     if window_exposures != exposure_binding.density_f03_exposures_raw_10ns:
         raise RollSessionIntegrityError(
             "preview window density f03 exposures disagree with their evidence"
+        )
+    if (
+        source_binding.native_height != contract["native_height"]
+        or source_binding.height != contract["decoded_height"]
+        or density_evidence.get("source_payload_bytes")
+        != contract["expected_stream_bytes"]
+    ):
+        raise RollSessionIntegrityError(
+            "preview density source geometry disagrees with its startup binding"
         )
     first = normalized[0]
     geometry_fields = ("resolution", "origin", "size", "bit_depth")
@@ -816,6 +873,46 @@ def _derive_geometry(journal: Mapping[str, Any], preview_bytes: int) -> IndexGeo
             "preview geometry does not match the LS-5000 RGB96 allocation"
         )
     return geometry
+
+
+def _validated_preview_density_evidence(
+    attempt: CaptureAttemptResult,
+    journal: Mapping[str, Any],
+    preview_bytes: bytes,
+    geometry: IndexGeometry,
+) -> NikonDensityEvidence:
+    """Replay the full density receipt and bind it to this preview artifact."""
+
+    try:
+        evidence = attempt.density_evidence
+    except (OSError, ValueError) as error:
+        raise RollSessionIntegrityError(
+            f"preview density evidence does not replay from its source: {error}"
+        ) from error
+    if not isinstance(evidence, NikonDensityEvidence):
+        raise RollSessionIntegrityError("preview density evidence is unavailable")
+    source = evidence.source_binding
+    preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
+    expected_session_id = journal.get("density_calibration_session_id")
+    expected_attempt_id = attempt.paths.directory.name
+    expected_scan_identity = (
+        f"{expected_session_id}:density-97dpi:{preview_sha256}"
+    )
+    if (
+        evidence.source_payload != preview_bytes
+        or source.session_id != expected_session_id
+        or source.capture_attempt_id != expected_attempt_id
+        or source.scan_identity != expected_scan_identity
+        or source.native_height != geometry.native_height
+        or source.height != geometry.height
+        or source.wire_sha256 != preview_sha256
+        or evidence.result.source_native_height != geometry.native_height
+        or evidence.result.source_height != geometry.height
+    ):
+        raise RollSessionIntegrityError(
+            "preview density provenance disagrees with the startup-bound artifact"
+        )
+    return evidence
 
 
 def _thumbnail(rgb: np.ndarray, start: int, end: int) -> np.ndarray:
@@ -926,6 +1023,12 @@ def build_roll_preview_session(
         usb_topology,
     ) = _validate_preview_result(attempt)
     geometry = _derive_geometry(journal, len(preview_bytes))
+    _validated_preview_density_evidence(
+        attempt,
+        journal,
+        preview_bytes,
+        geometry,
+    )
     validated_table, usable_rows = validate_live_0x8e_bytes(
         table_bytes,
         geometry.height,
@@ -1063,6 +1166,7 @@ def _restore_roll_preview_session(payload: str) -> RollPreviewSession:
         journal=journal_path,
         plan=root / "replay-first-rgbi4-plan.jsonl",
         manifest=root / "replay-first-rgbi4-manifest.json",
+        bootstrap_status=root / "worker-bootstrap.json",
         stdout=root / "stdout.txt",
         stderr=root / "stderr.txt",
     )

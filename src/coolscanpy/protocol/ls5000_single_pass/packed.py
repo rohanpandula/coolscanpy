@@ -109,6 +109,39 @@ def _counter_train_ok(
     return bool(np.all(block[:, 0::2] == 0xAA55) and np.all(block[:, 1::2] == expected.astype(np.uint16)[None, :]))
 
 
+def _padding_counter_dialect(block: np.ndarray) -> str | None:
+    """Identify any complete padding counter dialect observed live.
+
+    The original captures begin with the canonical ``AA55,D893`` pair.  Two
+    further stable LS-5000 states, each observed identically in both long
+    padding blocks across every record of its captured stream, replace only
+    the first three words with a repeated sentinel — ``E9EA``, ``E004``, or
+    ``DC4C``.
+    The fourth word remains ``D894`` and the canonical ``AA55,D895...`` train
+    resumes immediately afterward.  Accept only those exact whole-block forms.
+    """
+
+    if _counter_train_ok(block, first_counter=0xD893):
+        return "canonical"
+    if block.ndim != 2 or block.shape[1] < 4:
+        return None
+    for sentinel, dialect in (
+        (0xE9EA, "e9ea-prefixed"),
+        (0xE004, "e004-prefixed"),
+        (0xDC4C, "dc4c-prefixed"),
+    ):
+        sentinel_prefix = np.array(
+            [sentinel, sentinel, sentinel, 0xD894],
+            dtype=np.uint16,
+        )
+        if np.all(block[:, :4] == sentinel_prefix[None, :]) and _counter_train_ok(
+            block[:, 4:],
+            first_counter=0xD895,
+        ):
+            return dialect
+    return None
+
+
 def validate_full_record_layout(words: np.ndarray) -> dict[str, object]:
     """Fail closed on the four invariant padding regions in every record."""
     if words.ndim != 2 or words.shape[1] != FULL_RECORD_WORDS:
@@ -122,16 +155,19 @@ def validate_full_record_layout(words: np.ndarray) -> dict[str, object]:
 
     if not _counter_train_ok(pad0, first_counter=0xE7FD):
         raise ValueError("full-record padding 0 counter train mismatch")
-    if not _counter_train_ok(pad1, first_counter=0xD893):
+    pad1_dialect = _padding_counter_dialect(pad1)
+    if pad1_dialect is None:
         raise ValueError("full-record padding 1 counter train mismatch")
     if not np.array_equal(pad2, ir_head):
         raise ValueError("full-record padding 2 is not the expected IR-head copy")
-    if not _counter_train_ok(pad3, first_counter=0xD893):
+    pad3_dialect = _padding_counter_dialect(pad3)
+    if pad3_dialect is None or pad3_dialect != pad1_dialect:
         raise ValueError("full-record padding 3 counter train mismatch")
 
     return {
         "padding_validated_records": int(words.shape[0]),
         "padding_byte_ranges": [list(bounds) for bounds in FULL_PADDING_BYTE_RANGES],
+        "padding_1_3_counter_dialect": pad1_dialect,
         "padding_2_semantics": "duplicate of first 388 IR words; discarded",
     }
 

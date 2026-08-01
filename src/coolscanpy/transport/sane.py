@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
@@ -65,6 +67,12 @@ _COOLSCAN3_IR_OPTION_NAME = "infrared"
 # Presence-only, like _find_ir_option — a device without it simply has no
 # eject capability to gate on.
 _EJECT_OPTION_NAMES = ("eject",)
+_SCANIMAGE_CANDIDATES = (
+    "/opt/homebrew/bin/scanimage",
+    "/usr/local/bin/scanimage",
+    "/usr/bin/scanimage",
+)
+_SCANIMAGE_BUTTON_TIMEOUT_SECONDS = 30.0
 
 _COOLSCAN3_PREFIX = "coolscan3:"
 _SPLIT_DIAGNOSTICS_ENV = "NEGPY_SPLIT_DIAGNOSTICS_DIR"
@@ -241,6 +249,55 @@ def _detect_eject(opt) -> bool:
 
     option_name = _find_eject_option(opt)
     return option_name is not None and _option_is_usable(opt[option_name])
+
+
+def _scanimage_executable() -> str:
+    """Resolve the SANE frontend used to press action-button options.
+
+    python-sane 2.9.2 deliberately rejects ``SANE_TYPE_BUTTON`` in both
+    ``SaneDev.__setattr__`` and its native ``set_option`` wrapper.  The
+    system ``scanimage`` frontend implements the SANE button contract and
+    supports ``--dont-scan``, so it can press the option without starting an
+    acquisition.  GUI-launched macOS applications do not inherit Homebrew's
+    shell PATH, hence the explicit standard-prefix fallbacks.
+    """
+
+    candidates = (shutil.which("scanimage"), *_SCANIMAGE_CANDIDATES)
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError(
+        "scanimage is required to trigger the SANE eject button but was not found"
+    )
+
+
+def _trigger_eject_button(device_id: str) -> None:
+    """Press the device's SANE eject button without starting a scan."""
+
+    command = [
+        _scanimage_executable(),
+        "--device-name",
+        device_id,
+        "--eject",
+        "--dont-scan",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_SCANIMAGE_BUTTON_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"scanimage eject invocation failed: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"scanimage eject exited with status {completed.returncode}{suffix}"
+        )
 
 
 def _detect_adapter_frame_capacity(opt) -> int | None:
@@ -1992,23 +2049,33 @@ class SaneBackend:
         try:
             option_map = dev.opt if hasattr(dev, "opt") else {}
             eject_option = _find_eject_option(option_map)
-            if eject_option is None or not _option_is_usable(option_map[eject_option]):
-                triggered = False
-            else:
-                setattr(dev, eject_option, True)
-                triggered = True
+            can_eject = eject_option is not None and _option_is_usable(
+                option_map[eject_option]
+            )
         except Exception as exc:
             try:
                 dev.close()
             except Exception:
                 pass
-            raise RuntimeError(f"Could not trigger eject on {device_id!r}: {exc}") from exc
+            raise RuntimeError(
+                f"Could not inspect eject capability on {device_id!r}: {exc}"
+            ) from exc
 
         try:
             dev.close()
         except Exception as exc:
             raise RuntimeError(f"Could not close scanner device {device_id!r} after eject: {exc}") from exc
-        return triggered
+        if not can_eject:
+            return False
+
+        # The real option is SANE_TYPE_BUTTON. python-sane refuses buttons as
+        # values, so close its inspection handle before the one-shot
+        # scanimage frontend opens the same device and presses --eject.
+        try:
+            _trigger_eject_button(device_id)
+        except Exception as exc:
+            raise RuntimeError(f"Could not trigger eject on {device_id!r}: {exc}") from exc
+        return True
 
     def _detect_caps(self, dev, device_id: str = "") -> ScannerCapabilities:
         """Read dev.opt to build ScannerCapabilities."""

@@ -21,6 +21,7 @@ __all__ = [
     "EjectFailed",
     "SafeStopRequested",
     "FeederParked",
+    "CaptureWorkerBootstrapFailed",
     "RollMismatch",
     "FingerprintRefused",
     "ManualReviewRequired",
@@ -65,6 +66,14 @@ class SafeStopRequested(PyCoolscanError):
 class FeederParked(PyCoolscanError):
     """The capture outcome requires a power cycle before the transport can be
     used again."""
+
+
+class CaptureWorkerBootstrapFailed(PyCoolscanError):
+    """The bundled worker failed before it could dispatch to the scanner.
+
+    This is a local installation/packaging repair condition, not a statement
+    about the scanner or a reason to power-cycle it.
+    """
 
 
 class RollMismatch(PyCoolscanError):

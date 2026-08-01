@@ -68,10 +68,38 @@ METER_ROWS_STOP = 225
 DENSITY_SOURCE_RESOLUTION_DPI = 97
 DENSITY_SOURCE_NATIVE_RESOLUTION_DPI = 4_000
 DENSITY_SOURCE_NATIVE_WIDTH = 3_946
-DENSITY_SOURCE_NATIVE_HEIGHT = 250_278
 DENSITY_SOURCE_SCALE_DIVISOR = 41
+DENSITY_SOURCE_FRAME_NATIVE_HEIGHT = 5_959
+DENSITY_SOURCE_MINIMUM_STARTUP_RECORDS = 2
+DENSITY_SOURCE_MAXIMUM_STARTUP_RECORDS = 40
 DENSITY_SOURCE_WIDTH = 96
-DENSITY_SOURCE_HEIGHT = 6_104
+
+
+def density_source_geometry_for_startup_records(
+    startup_records: int,
+) -> tuple[int, int]:
+    """Derive the exact two-row-aligned density geometry for a startup table."""
+
+    if (
+        type(startup_records) is not int
+        or not DENSITY_SOURCE_MINIMUM_STARTUP_RECORDS
+        <= startup_records
+        <= DENSITY_SOURCE_MAXIMUM_STARTUP_RECORDS
+    ):
+        raise ValueError("density source startup record count must be in 2..40")
+    native_height = (startup_records + 2) * DENSITY_SOURCE_FRAME_NATIVE_HEIGHT
+    height = native_height // DENSITY_SOURCE_SCALE_DIVISOR
+    if height % 2:
+        height += 1
+        native_height = height * DENSITY_SOURCE_SCALE_DIVISOR
+    return native_height, height
+
+
+DENSITY_SOURCE_NATIVE_HEIGHT, DENSITY_SOURCE_HEIGHT = (
+    density_source_geometry_for_startup_records(
+        DENSITY_SOURCE_MAXIMUM_STARTUP_RECORDS
+    )
+)
 DENSITY_SOURCE_INPUT_CHANNELS = 3
 DENSITY_SOURCE_DENSITY_CHANNELS = 3
 DENSITY_SOURCE_SAMPLE_BITS = 16
@@ -87,10 +115,11 @@ DENSITY_SOURCE_DISCARDED_ROW_BYTES = DENSITY_SOURCE_OPAQUE_ROW_TAIL_BYTES
 DENSITY_SOURCE_WIRE_BYTES = DENSITY_SOURCE_HEIGHT * DENSITY_SOURCE_ROW_STRIDE_BYTES
 DENSITY_SOURCE_CHILD_BYTES = DENSITY_SOURCE_HEIGHT * DENSITY_SOURCE_RGB_ROW_BYTES
 DENSITY_SOURCE_SUPPORTED_HEIGHTS = frozenset(
-    {
-        (DENSITY_SOURCE_NATIVE_HEIGHT, DENSITY_SOURCE_HEIGHT),
-        (232_401, 5_668),
-    }
+    density_source_geometry_for_startup_records(startup_records)
+    for startup_records in range(
+        DENSITY_SOURCE_MINIMUM_STARTUP_RECORDS,
+        DENSITY_SOURCE_MAXIMUM_STARTUP_RECORDS + 1,
+    )
 )
 DENSITY_SOURCE_LAYOUT = "row-planar-rgb-plus-opaque-tail"
 DENSITY_SOURCE_BYTE_ORDER = "big"

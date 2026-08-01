@@ -45,6 +45,7 @@ from .density import (
     build_nikon_density_evidence,
     build_nikon_density_frame_ownership,
     decode_density_calibration_read,
+    density_source_geometry_for_startup_records,
 )
 from .capture_process import (
     ManualFrameApproval,
@@ -57,7 +58,11 @@ from .capture_process import (
 )
 from .meter import (
     DEFAULT_EXPOSURES,
+    EXPOSURE_MAX,
+    EXPOSURE_MIN,
+    NIKON_PARITY_PROFILE,
     MeterObservation,
+    calculate_nikon_parity_shadow,
     observe_meter_pass,
     propose_next_exposures,
     verify_final_convergence,
@@ -173,6 +178,32 @@ VARIABLE_FRAME_TABLE_MAX_BYTES = 330
 VARIABLE_FRAME_TABLE_SHORT_STATUS = bytes.fromhex("022b4b0000000000")
 FIXED_PREVIEW_FRAME_TABLE_RECORDS = 40
 SHORT_FULL_ROLL_FRAME_TABLE_RECORDS = 37
+MINIMUM_PREVIEW_FRAME_TABLE_RECORDS = 2
+
+
+def _preview_native_height_for_startup_records(record_count: int) -> int:
+    """Return the two-row-aligned preview window for a scanner table count.
+
+    Nikon's index stream is emitted in two-row records.  The transport table
+    itself supplies the count (not an exposure estimate), while the proven
+    leading/trailing two-frame margin supplies the starting native height.
+    When that height lands between two index-row pairs, round only into the
+    already-reserved trailing margin so the fixed-size READ stream stays
+    exactly decodable.
+    """
+
+    native_height, _decoded_height = density_source_geometry_for_startup_records(
+        record_count
+    )
+    return native_height
+
+
+def _short_preview_binding_mode(record_count: int) -> str:
+    """Keep the previously persisted 37-record receipt mode stable."""
+
+    if record_count == SHORT_FULL_ROLL_FRAME_TABLE_RECORDS:
+        return "canonical-prefix-37-record"
+    return f"scanner-derived-{record_count}-record"
 
 
 def _meter_layout_receipt() -> dict[str, object]:
@@ -205,6 +236,10 @@ class SynchronizedProtocolError(ProtocolError):
 
 class DesynchronizedProtocolError(ProtocolError):
     """The current USB/application phase is unknown; send no more CDBs."""
+
+
+class TransactionDeadlineExceeded(TimeoutError):
+    """No further USB stage fits inside the transaction's absolute deadline."""
 
 
 class CountedBulkReadError(OSError):
@@ -472,8 +507,32 @@ class TransactionResult:
     stall_recoveries: int
 
 
-def _write_exact(endpoint: Any, payload: bytes, timeout_ms: int) -> None:
-    written = endpoint.write(payload, timeout=timeout_ms)
+def _deadline_capped_timeout_ms(
+    timeout_ms: int,
+    deadline_monotonic: float | None,
+) -> int:
+    if deadline_monotonic is None:
+        return timeout_ms
+    remaining_ms = int((deadline_monotonic - time.monotonic()) * 1_000)
+    if remaining_ms <= 0:
+        raise TransactionDeadlineExceeded(
+            errno.ETIMEDOUT,
+            "USB transaction deadline expired",
+        )
+    return min(timeout_ms, remaining_ms)
+
+
+def _write_exact(
+    endpoint: Any,
+    payload: bytes,
+    timeout_ms: int,
+    *,
+    deadline_monotonic: float | None = None,
+) -> None:
+    written = endpoint.write(
+        payload,
+        timeout=_deadline_capped_timeout_ms(timeout_ms, deadline_monotonic),
+    )
     if written != len(payload):
         raise ProtocolError(f"short USB write: {written} of {len(payload)} bytes")
 
@@ -489,9 +548,19 @@ def _read_with_one_stall_recovery(
     endpoint: Any,
     size: int,
     timeout_ms: int,
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[bytes, int]:
     try:
-        return bytes(endpoint.read(size, timeout=timeout_ms)), 0
+        return bytes(
+            endpoint.read(
+                size,
+                timeout=_deadline_capped_timeout_ms(
+                    timeout_ms,
+                    deadline_monotonic,
+                ),
+            )
+        ), 0
     except Exception as error:
         if not _is_pipe_error(error):
             raise DesynchronizedProtocolError(
@@ -506,7 +575,15 @@ def _read_with_one_stall_recovery(
         endpoint.clear_halt()
         # Only a counted zero-byte PIPE proves the data phase was untouched.
         try:
-            return bytes(endpoint.read(size, timeout=timeout_ms)), 1
+            return bytes(
+                endpoint.read(
+                    size,
+                    timeout=_deadline_capped_timeout_ms(
+                        timeout_ms,
+                        deadline_monotonic,
+                    ),
+                )
+            ), 1
         except Exception as retry_error:
             raise DesynchronizedProtocolError(
                 f"bulk read failed after zero-byte PIPE recovery: {retry_error}"
@@ -519,23 +596,44 @@ def perform_transaction(
     entry: dict,
     *,
     data_timeout_ms: int,
+    deadline_monotonic: float | None = None,
 ) -> TransactionResult:
     cdb = bytes.fromhex(entry["cdb"])
 
     def read_stage(size: int, stage: str) -> tuple[bytes, int]:
         try:
-            return _read_with_one_stall_recovery(ep_in, size, data_timeout_ms)
+            return _read_with_one_stall_recovery(
+                ep_in,
+                size,
+                data_timeout_ms,
+                deadline_monotonic=deadline_monotonic,
+            )
         except DesynchronizedProtocolError as error:
             raise DesynchronizedProtocolError(
                 f"command {entry['seq']} {entry.get('name')} CDB {entry['cdb']} "
                 f"during {stage}: {error}"
             ) from error
 
-    _write_exact(ep_out, cdb, 10_000)
-    _write_exact(ep_out, b"\xd0", 10_000)
+    _write_exact(
+        ep_out,
+        cdb,
+        10_000,
+        deadline_monotonic=deadline_monotonic,
+    )
+    _write_exact(
+        ep_out,
+        b"\xd0",
+        10_000,
+        deadline_monotonic=deadline_monotonic,
+    )
 
     try:
-        phase_raw, phase_stalls = _read_with_one_stall_recovery(ep_in, 1, 30_000)
+        phase_raw, phase_stalls = _read_with_one_stall_recovery(
+            ep_in,
+            1,
+            30_000,
+            deadline_monotonic=deadline_monotonic,
+        )
     except DesynchronizedProtocolError as error:
         raise DesynchronizedProtocolError(
             f"command {entry['seq']} {entry.get('name')} CDB {entry['cdb']} "
@@ -551,7 +649,12 @@ def perform_transaction(
     if phase == 0x02:
         data_out = bytes.fromhex(entry.get("data_out", ""))
         if data_out:
-            _write_exact(ep_out, data_out, 30_000)
+            _write_exact(
+                ep_out,
+                data_out,
+                30_000,
+                deadline_monotonic=deadline_monotonic,
+            )
     elif phase == 0x03:
         request_len = entry.get("request_len", 0)
         if request_len <= 0:
@@ -599,9 +702,19 @@ def perform_transaction(
         )
 
     # A complete data phase is followed by Nikon's explicit status trigger.
-    _write_exact(ep_out, b"\x06", 10_000)
+    _write_exact(
+        ep_out,
+        b"\x06",
+        10_000,
+        deadline_monotonic=deadline_monotonic,
+    )
     try:
-        status, status_stalls = _read_with_one_stall_recovery(ep_in, 8, 15_000)
+        status, status_stalls = _read_with_one_stall_recovery(
+            ep_in,
+            8,
+            15_000,
+            deadline_monotonic=deadline_monotonic,
+        )
     except DesynchronizedProtocolError as error:
         raise DesynchronizedProtocolError(
             f"command {entry['seq']} {entry.get('name')} CDB {entry['cdb']} "
@@ -1052,8 +1165,11 @@ def _derive_index_geometry(plan: list[dict]) -> IndexGeometry:
         or first["width"] != FINE_NATIVE_WIDTH
         or first["height"]
         not in {
-            (FIXED_PREVIEW_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
-            (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT,
+            _preview_native_height_for_startup_records(record_count)
+            for record_count in range(
+                MINIMUM_PREVIEW_FRAME_TABLE_RECORDS,
+                FIXED_PREVIEW_FRAME_TABLE_RECORDS + 1,
+            )
         }
         or first["bit_depth"] != 16
     ):
@@ -2392,6 +2508,94 @@ def _patch_exposure_contract(
     return wire_exposures
 
 
+def _resolve_parity_active_exposures(
+    journal: dict[str, Any],
+    *,
+    observation: MeterObservation,
+    final_result: Any,
+) -> dict[str, int]:
+    """Form the fine-scan exposure commands: guarded nikon-parity RGB, active IR.
+
+    This is the ONLY place a nikon-parity value may become a scanner command,
+    and it reads exactly one field per channel — the guarded
+    ``candidate_exposure_raw_10ns``.  The higher uncapped diagnostic value is
+    journaled beside it and can never be commanded (the fail-closed tests pin
+    this).  Infrared always passes through from the active controller's final
+    solve, unchanged.
+
+    Fail-closed policy: a parity calculation error refuses the fine scan with
+    a named error — never a silent fallback to the active RGB solve, which
+    would silently reintroduce the +6-9% brightness family this authority
+    exists to close (RESULT-FINE-EXPOSURE-DOMAIN-20260731).  A guarded
+    candidate outside the scanner's [EXPOSURE_MIN, EXPOSURE_MAX] contract is
+    clamped to the device bound — one more named, journaled guard, matching
+    the ceiling the scanner itself enforces — so thin or dim frames stay
+    scannable exactly as they were under the active controller.
+    """
+
+    if "meter_shadow_profiles" in journal:
+        raise ProtocolError("meter shadow profile was already journaled")
+    active = dict(final_result.final_exposures)
+    try:
+        shadow = calculate_nikon_parity_shadow(
+            observation,
+            current_metered_exposures=active,
+        )
+    except (TypeError, ValueError) as error:
+        journal["meter_shadow_profiles"] = {
+            NIKON_PARITY_PROFILE: {
+                "profile": NIKON_PARITY_PROFILE,
+                "status": "calculation-error",
+                "armed": False,
+                "scanner_route": "none",
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            }
+        }
+        raise SynchronizedProtocolError(
+            "nikon-parity active exposure calculation refused: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    guarded = {
+        channel.channel: int(channel.candidate_exposure_raw_10ns)
+        for channel in shadow.channels
+    }
+    if sorted(guarded) != ["B", "G", "R"]:
+        raise ProtocolError(
+            f"nikon-parity calculation returned channels {sorted(guarded)!r}, "
+            "expected exactly R/G/B"
+        )
+    journal["meter_shadow_profiles"] = {
+        NIKON_PARITY_PROFILE: shadow.to_journal_dict(routing="active-rgb-authority")
+    }
+    device_bound_clamped = {
+        channel: exposure
+        for channel, exposure in guarded.items()
+        if not EXPOSURE_MIN <= exposure <= EXPOSURE_MAX
+    }
+    bounded = {
+        channel: min(max(exposure, EXPOSURE_MIN), EXPOSURE_MAX)
+        for channel, exposure in guarded.items()
+    }
+    commanded = {
+        "R": bounded["R"],
+        "G": bounded["G"],
+        "B": bounded["B"],
+        "IR": int(active["IR"]),
+    }
+    journal["active_exposure_authority"] = {
+        "rgb_source": "nikon-parity-guarded-v2",
+        "ir_source": "active-controller",
+        "commanded_channels_raw_10ns": dict(commanded),
+        "active_controller_channels_raw_10ns": dict(active),
+        "device_bound_clamped_channels_raw_10ns": dict(device_bound_clamped),
+        "device_exposure_bounds_raw_10ns": [EXPOSURE_MIN, EXPOSURE_MAX],
+    }
+    return commanded
+
+
 def _validate_live_meter_windows(
     payloads: list[bytes],
     *,
@@ -2725,7 +2929,9 @@ def _validate_variable_frame_table_payload(payload: bytes) -> StartupFrameTable:
     if (
         outer != length - 6
         or inner != length - 8
-        or not 1 <= count <= 40
+        or not MINIMUM_PREVIEW_FRAME_TABLE_RECORDS
+        <= count
+        <= FIXED_PREVIEW_FRAME_TABLE_RECORDS
         or payload[9] != 0
         or length != 10 + count * 8
     ):
@@ -2867,6 +3073,8 @@ def _patch_preview_read_allocation(
         entry["drains_scan"] = drains_scan
         entry.pop("preview_skipped", None)
         return
+    cdb[6:9] = b"\x00\x00\x00"
+    entry["cdb"] = cdb.hex()
     entry["request_len"] = 0
     entry["request_parts"] = []
     entry["live_bound_request_len"] = 0
@@ -2874,23 +3082,74 @@ def _patch_preview_read_allocation(
     entry.pop("drains_scan", None)
 
 
-def _validate_short_preview_frame_table_records(payload: bytes) -> None:
-    """Validate a live 37-record Nikon transport table without freezing its positions."""
+def _validate_short_preview_frame_table_records(
+    payload: bytes,
+    *,
+    record_count: int,
+    canonical_payload: bytes,
+) -> None:
+    """Validate one bounded short startup-table record family.
+
+    Nikon has returned two legitimate short-table forms: an exact prefix of
+    the canonical 40-record startup table (including the retained six-record
+    strip evidence), and a live transport-coordinate table whose records can
+    be independently checked.  Do not loosen either family into an arbitrary
+    sequence of increasing values.
+    """
+
+    expected_prefix = canonical_payload[10 : 10 + record_count * 8]
+    if payload[10:] == expected_prefix:
+        return
 
     records = tuple(struct.iter_unpack(">IHH", payload[10:]))
-    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
-    if len(records) != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS:
+    native_height = _preview_native_height_for_startup_records(record_count)
+    if len(records) != record_count:
         raise SynchronizedProtocolError(
             "command 64: short startup table does not contain the required "
-            f"{SHORT_FULL_ROLL_FRAME_TABLE_RECORDS} complete transport records; "
+            f"{record_count} complete transport records; "
             "no preview window was sent"
         )
 
-    first_selector = records[0][1]
+    selectors = tuple(record[1] for record in records)
+    # A 2026-07-31 full-roll observation after Nikon Scan had traversed the
+    # same loaded film used one further bounded edge representation.  Its
+    # first two selectors are 0 and 10, every interior selector advances by
+    # eight, and the final film-end selector remains the canonical 289.  After
+    # a completed fine capture and a fresh ScanStudio session, the same film
+    # returned the identity-valid companion with only the first selector
+    # advanced to 2.  Keep these as two exact 37-record families; the
+    # per-record transport identity, origin ordering, and native-height bound
+    # below remain mandatory.
+    edge_adjusted_full_roll = (
+        record_count == SHORT_FULL_ROLL_FRAME_TABLE_RECORDS
+        and selectors
+        in (
+            (0, *range(10, 283, 8), 289),
+            (2, *range(10, 283, 8), 289),
+        )
+    )
+
+    first_selector = selectors[0]
     previous_origin = -1
     for index, (native_origin, selector, code) in enumerate(records):
+        # After capture activity the scanner's table window slides and its
+        # FINAL record may be a film-end terminal whose selector advances by
+        # exactly one instead of eight (observed identically in three
+        # independent 2026-07-28/30 sessions; every other property of a
+        # terminal record — the transport-coordinate identity, strict
+        # monotonicity, and the height bound — still holds and is still
+        # enforced below. Only that exact final-position +1 form is
+        # admitted; any other cadence break stays refused.
+        cadence_ok = edge_adjusted_full_roll or (
+            selector == first_selector + 8 * index
+            or (
+                index == len(records) - 1
+                and index > 0
+                and selector == first_selector + 8 * (index - 1) + 1
+            )
+        )
         if (
-            selector != first_selector + 8 * index
+            not cadence_ok
             or native_origin <= previous_origin
             or native_origin >= native_height
             or transport_native_origin(code, selector) != native_origin
@@ -2917,7 +3176,9 @@ def _bind_preview_to_startup_table(
         or status != bytes(8)
     ):
         if (
-            table["count"] != SHORT_FULL_ROLL_FRAME_TABLE_RECORDS
+            not MINIMUM_PREVIEW_FRAME_TABLE_RECORDS
+            <= table["count"]
+            < FIXED_PREVIEW_FRAME_TABLE_RECORDS
             or status != VARIABLE_FRAME_TABLE_SHORT_STATUS
         ):
             raise SynchronizedProtocolError(
@@ -2925,8 +3186,8 @@ def _bind_preview_to_startup_table(
                 f"{len(payload)}-byte/{table['count']}-record startup table with "
                 f"status {status.hex()}; supported preview bindings require "
                 f"{FIXED_PREVIEW_FRAME_TABLE_RECORDS} canonical records or the "
-                f"observed {SHORT_FULL_ROLL_FRAME_TABLE_RECORDS}-record full-roll "
-                "prefix"
+                "scanner-derived 2..39-record short table with Nikon's "
+                "short-table status"
             )
     else:
         return PreviewTraversalBinding(
@@ -2945,10 +3206,13 @@ def _bind_preview_to_startup_table(
             "command 64: canonical startup table template is malformed; "
             "no preview window was sent"
         )
-    if payload[10:] != canonical_payload[10 : len(payload)]:
-        _validate_short_preview_frame_table_records(payload)
+    _validate_short_preview_frame_table_records(
+        payload,
+        record_count=table["count"],
+        canonical_payload=canonical_payload,
+    )
 
-    native_height = (SHORT_FULL_ROLL_FRAME_TABLE_RECORDS + 2) * FINE_NATIVE_HEIGHT
+    native_height = _preview_native_height_for_startup_records(table["count"])
     for sequence in PREVIEW_SET_WINDOW_SEQUENCES:
         entry = _entry(plan, sequence)
         entry["data_out"] = _patched_preview_window_height(
@@ -2967,7 +3231,7 @@ def _bind_preview_to_startup_table(
     decoded_height = native_height // canonical_geometry.pitch
     if decoded_height % 2:
         raise ProtocolError(
-            "37-record preview height does not end on a two-row index block"
+            "short-table preview height does not end on a two-row index block"
         )
     expected_stream_bytes = (decoded_height // 2) * canonical_geometry.block_bytes
     full_reads, final_bytes = divmod(
@@ -2976,7 +3240,7 @@ def _bind_preview_to_startup_table(
     )
     active_read_count = full_reads + (1 if final_bytes else 0)
     if not 1 <= active_read_count <= len(PREVIEW_READ_SEQUENCES):
-        raise ProtocolError("37-record preview READ allocation is out of bounds")
+        raise ProtocolError("short-table preview READ allocation is out of bounds")
     active_read_sequences = PREVIEW_READ_SEQUENCES[:active_read_count]
     skipped_read_sequences = PREVIEW_READ_SEQUENCES[active_read_count:]
     for index, sequence in enumerate(active_read_sequences):
@@ -3003,14 +3267,115 @@ def _bind_preview_to_startup_table(
         or geometry.height != decoded_height
         or geometry.expected_stream_bytes != expected_stream_bytes
     ):
-        raise ProtocolError("37-record preview binding failed geometry verification")
+        raise ProtocolError("short-table preview binding failed geometry verification")
     return PreviewTraversalBinding(
         geometry=geometry,
         active_read_sequences=active_read_sequences,
         skipped_read_sequences=skipped_read_sequences,
-        startup_records=SHORT_FULL_ROLL_FRAME_TABLE_RECORDS,
-        mode="canonical-prefix-37-record",
+        startup_records=table["count"],
+        mode=_short_preview_binding_mode(table["count"]),
     )
+
+
+def _validate_preview_density_source_contract(
+    plan: list[dict],
+    startup_table: StartupFrameTable,
+    binding: PreviewTraversalBinding,
+    geometry: IndexGeometry,
+) -> None:
+    """Rebind density provenance to the validated startup/read contract."""
+
+    record_count = startup_table.get("count")
+    try:
+        expected_native_height, expected_height = (
+            density_source_geometry_for_startup_records(record_count)
+        )
+    except ValueError as error:
+        raise SynchronizedProtocolError(
+            "validated startup table cannot derive a density source geometry"
+        ) from error
+    expected_stream_bytes = expected_height * 1_024
+    full_reads, final_bytes = divmod(
+        expected_stream_bytes,
+        PREVIEW_READ_MAX_BYTES,
+    )
+    expected_requests = (PREVIEW_READ_MAX_BYTES,) * full_reads + (
+        (final_bytes,) if final_bytes else ()
+    )
+    expected_active_sequences = PREVIEW_READ_SEQUENCES[: len(expected_requests)]
+    expected_skipped_sequences = PREVIEW_READ_SEQUENCES[len(expected_requests) :]
+    canonical_binding = record_count == FIXED_PREVIEW_FRAME_TABLE_RECORDS
+    if (
+        binding.startup_records != record_count
+        or binding.geometry != geometry
+        or binding.active_read_sequences != expected_active_sequences
+        or binding.skipped_read_sequences != expected_skipped_sequences
+        or geometry.native_height != expected_native_height
+        or geometry.height != expected_height
+        or geometry.expected_stream_bytes != expected_stream_bytes
+    ):
+        raise SynchronizedProtocolError(
+            "startup-bound density source geometry and READ receipt disagree"
+        )
+    for index, (sequence, expected_request) in enumerate(
+        zip(expected_active_sequences, expected_requests, strict=True)
+    ):
+        entry = _entry(plan, sequence)
+        try:
+            cdb = bytes.fromhex(entry.get("cdb", ""))
+        except (TypeError, ValueError):
+            cdb = b""
+        expected_drain = index == len(expected_active_sequences) - 1
+        if (
+            entry.get("seq") != sequence
+            or entry.get("name") != "READ"
+            or entry.get("request_len") != expected_request
+            or entry.get("request_parts") != [expected_request]
+            or len(cdb) != 10
+            or cdb[0] != 0x28
+            or cdb[6:9] != expected_request.to_bytes(3, "big")
+            or cdb[9] != 0x80
+            or "preview_skipped" in entry
+            or (
+                canonical_binding
+                and (
+                    "live_bound_request_len" in entry
+                    or "drains_scan" in entry
+                )
+            )
+            or (
+                not canonical_binding
+                and (
+                    entry.get("live_bound_request_len") != expected_request
+                    or entry.get("drains_scan") is not expected_drain
+                )
+            )
+        ):
+            raise SynchronizedProtocolError(
+                "startup-bound density source geometry and READ receipt disagree"
+            )
+    for sequence in expected_skipped_sequences:
+        entry = _entry(plan, sequence)
+        try:
+            cdb = bytes.fromhex(entry.get("cdb", ""))
+        except (TypeError, ValueError):
+            cdb = b""
+        if (
+            entry.get("seq") != sequence
+            or entry.get("name") != "READ"
+            or entry.get("request_len") != 0
+            or entry.get("request_parts") != []
+            or entry.get("live_bound_request_len") != 0
+            or entry.get("preview_skipped") is not True
+            or "drains_scan" in entry
+            or len(cdb) != 10
+            or cdb[0] != 0x28
+            or cdb[6:9] != b"\x00\x00\x00"
+            or cdb[9] != 0x80
+        ):
+            raise SynchronizedProtocolError(
+                "startup-bound density source geometry and READ receipt disagree"
+            )
 
 
 def _perform_with_busy_retry(
@@ -3789,16 +4154,21 @@ def _run_live_continuation_frame(
                                 raise SynchronizedProtocolError(
                                     f"meter pass 3 final controller refused: {codes}"
                                 )
+                            commanded_exposures = _resolve_parity_active_exposures(
+                                journal,
+                                observation=observation,
+                                final_result=final_result,
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                final_result.final_exposures,
+                                commanded_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    final_result.final_exposures
+                                    commanded_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure
@@ -4503,6 +4873,16 @@ def run_live_capture(
                             f"live preview has {len(preview_data)} bytes, expected "
                             f"{geometry.expected_stream_bytes}"
                         )
+                    if startup_table is None:
+                        raise SynchronizedProtocolError(
+                            "density source completed without a validated startup table"
+                        )
+                    _validate_preview_density_source_contract(
+                        active_plan,
+                        startup_table,
+                        preview_binding,
+                        geometry,
+                    )
                     preview_bytes = bytes(preview_data)
                     preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
                     table_sha256 = hashlib.sha256(live_sub_8e_table).hexdigest()
@@ -4855,16 +5235,21 @@ def run_live_capture(
                                 raise SynchronizedProtocolError(
                                     f"meter pass 3 final controller refused: {codes}"
                                 )
+                            commanded_exposures = _resolve_parity_active_exposures(
+                                journal,
+                                observation=observation,
+                                final_result=final_result,
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                final_result.final_exposures,
+                                commanded_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    final_result.final_exposures
+                                    commanded_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure

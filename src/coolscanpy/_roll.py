@@ -50,6 +50,7 @@ from coolscanpy.capture.single_pass_workflow import (
 )
 from coolscanpy.exceptions import (
     BatchIntegrityError,
+    CaptureWorkerBootstrapFailed,
     DeviceBusy,
     FeederParked,
     FingerprintRefused,
@@ -480,6 +481,12 @@ class Roll:
             except CaptureStopped as error:
                 raise SafeStopRequested(str(error)) from error
 
+            if attempt.outcome is CaptureOutcome.BOOTSTRAP_FAILED:
+                raise CaptureWorkerBootstrapFailed(
+                    _bootstrap_error(attempt)
+                    or "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled capture worker "
+                    "failed before scanner dispatch"
+                )
             if attempt.outcome is CaptureOutcome.RECOVERY_REQUIRED:
                 raise FeederParked(
                     _journal_error(attempt)
@@ -579,17 +586,19 @@ class Roll:
             self._check_slot(session, slot)
             return session.slots[slot - 1].boundary_offset_rows
 
-    def set_spacing_offset(self, slot: int, offset_rows: int) -> None:
+    def set_spacing_offset(self, slot: int, offset_rows: int) -> Thumbnail:
         """Nudge ``slot``'s transport boundary by ``offset_rows`` native rows
         at preview resolution. Invalidates any existing approval for this
-        slot."""
+        slot and returns the freshly re-cropped preview thumbnail."""
 
         with self._state_condition:
             self._require_mutable_review_locked()
             session = self._require_session_locked()
             self._check_slot(session, slot)
-            self._session = session.with_boundary_offset(slot, offset_rows)
+            updated_session = session.with_boundary_offset(slot, offset_rows)
+            self._session = updated_session
             self._approvals.pop(slot, None)
+            return _thumbnail_from_slot(updated_session.slots[slot - 1])
 
     # -- fingerprint ---------------------------------------------------
 
@@ -844,6 +853,8 @@ class Roll:
                     # than leaking the adapter's internal wrapper type.
                     cause = error.__cause__
                     try:
+                        if error.outcome is CaptureOutcome.BOOTSTRAP_FAILED:
+                            raise CaptureWorkerBootstrapFailed(str(error)) from error
                         if isinstance(cause, PyCoolscanError):
                             raise cause from error
                         raise BatchIntegrityError(str(error)) from error
@@ -851,6 +862,18 @@ class Roll:
                         frame_queue.put(("error", translated))
                     return
 
+                if result.outcome is CaptureOutcome.BOOTSTRAP_FAILED:
+                    frame_queue.put(
+                        (
+                            "error",
+                            CaptureWorkerBootstrapFailed(
+                                (result.session_journal or {}).get("error")
+                                or "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled "
+                                "capture worker failed before scanner dispatch"
+                            ),
+                        )
+                    )
+                    return
                 if result.outcome is CaptureOutcome.RECOVERY_REQUIRED:
                     frame_queue.put(
                         (
@@ -1142,6 +1165,20 @@ def _journal_error(attempt: Any) -> str | None:
         if isinstance(error, str):
             return error
     return None
+
+
+def _bootstrap_error(attempt: Any) -> str | None:
+    """Return only the adapter's already-validated pre-dispatch detail.
+
+    Recovery outcomes intentionally continue to read only a trustworthy
+    worker journal. A bootstrap attempt has no such journal, so its bounded
+    marker detail is carried separately in ``journal_error``.
+    """
+
+    if attempt.outcome is not CaptureOutcome.BOOTSTRAP_FAILED:
+        return None
+    detail = attempt.journal_error
+    return detail if isinstance(detail, str) and detail else None
 
 
 def _translate_finalization_error(error: SinglePassWorkflowError) -> PyCoolscanError:
@@ -1553,12 +1590,31 @@ def _read_exact_analyzer_source(
     if (
         type(controller) is not dict
         or controller.get("accepted") is not True
-        or controller.get("final_exposures_raw_10ns") != final_controller
         or type(last_observation) is not dict
         or last_observation.get("exposures_raw_10ns") != third_controller
     ):
         raise BatchIntegrityError(
             "settled third meter pass is not bound to the accepted controller result"
+        )
+    # Since the guarded nikon-parity solve became the RGB command authority,
+    # the commanded contract is bound to the active controller's accepted
+    # solve THROUGH the journaled authority record: active solve -> authority
+    # -> commanded contract, with infrared passing through unchanged.
+    authority = journal.get("active_exposure_authority")
+    if (
+        type(authority) is not dict
+        or authority.get("rgb_source") != "nikon-parity-guarded-v2"
+        or authority.get("ir_source") != "active-controller"
+        or authority.get("commanded_channels_raw_10ns") != final_controller
+        or authority.get("active_controller_channels_raw_10ns")
+        != controller.get("final_exposures_raw_10ns")
+        or type(controller.get("final_exposures_raw_10ns")) is not dict
+        or final_controller.get("IR")
+        != controller["final_exposures_raw_10ns"].get("IR")
+    ):
+        raise BatchIntegrityError(
+            "commanded exposure contract is not bound to the parity authority "
+            "and the accepted controller result"
         )
 
     meter_payload = _read_bound_regular_file(

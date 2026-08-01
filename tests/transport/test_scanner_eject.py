@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from coolscanpy.transport import sane as sane_module
 from coolscanpy.transport.sane import SaneBackend, _find_eject_option
 from coolscanpy.session.service import ScannerService
 
@@ -118,14 +119,19 @@ class TestFindEjectOption:
 
 
 class TestSaneBackendEject:
-    def test_triggers_the_eject_option_and_returns_true(self) -> None:
+    def test_triggers_the_eject_option_and_returns_true(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         dev = FakeSaneDev(dict(COOLSCAN3_OPT_WITH_EJECT))
         backend = _make_backend(FakeSaneModule(dev))
+        triggered: list[str] = []
+        monkeypatch.setattr(sane_module, "_trigger_eject_button", triggered.append)
 
         result = backend.eject("coolscan3:usb:libusb:001:007")
 
         assert result is True
-        assert dev.recorded.get("eject") is True
+        assert triggered == ["coolscan3:usb:libusb:001:007"]
+        assert dev.recorded == {}
         assert dev.closed is True
 
     def test_capability_gated_skip_when_device_has_no_eject_option(self) -> None:
@@ -157,11 +163,20 @@ class TestSaneBackendEject:
         assert dev.recorded == {}
         assert dev.closed is True
 
-    def test_raises_when_a_present_eject_option_rejects_the_trigger(self) -> None:
-        dev = FakeSaneDev(dict(COOLSCAN3_OPT_WITH_EJECT), reject_trigger=True)
+    def test_raises_when_a_present_eject_option_rejects_the_trigger(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dev = FakeSaneDev(dict(COOLSCAN3_OPT_WITH_EJECT))
         backend = _make_backend(FakeSaneModule(dev))
 
-        with pytest.raises(RuntimeError, match="Could not trigger eject.*device rejected eject"):
+        def reject_trigger(_device_id: str) -> None:
+            raise RuntimeError("device rejected eject")
+
+        monkeypatch.setattr(sane_module, "_trigger_eject_button", reject_trigger)
+
+        with pytest.raises(
+            RuntimeError, match="Could not trigger eject.*device rejected eject"
+        ):
             backend.eject("coolscan3:usb:libusb:001:007")
 
         # A failed trigger must not leak an open device handle.
@@ -174,14 +189,70 @@ class TestSaneBackendEject:
         with pytest.raises(RuntimeError, match="Failed to open scanner.*scanner is busy"):
             backend.eject("coolscan3:usb:libusb:001:007")
 
-    def test_only_the_requested_device_is_opened(self) -> None:
+    def test_only_the_requested_device_is_opened(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         dev = FakeSaneDev(dict(COOLSCAN3_OPT_WITH_EJECT))
         module = FakeSaneModule(dev)
         backend = _make_backend(module)
+        monkeypatch.setattr(sane_module, "_trigger_eject_button", lambda _device_id: None)
 
         backend.eject("coolscan3:usb:libusb:001:007")
 
         assert module.opened == ["coolscan3:usb:libusb:001:007"]
+
+
+class TestScanimageEjectButton:
+    def test_uses_dont_scan_and_exact_device(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        executable = tmp_path / "scanimage"
+        executable.write_text("")
+        executable.chmod(0o755)
+        monkeypatch.setattr(sane_module.shutil, "which", lambda _name: str(executable))
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        class Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return Completed()
+
+        monkeypatch.setattr(sane_module.subprocess, "run", fake_run)
+
+        sane_module._trigger_eject_button("coolscan3:usb:libusb:001:007")
+
+        assert calls[0][0] == [
+            str(executable),
+            "--device-name",
+            "coolscan3:usb:libusb:001:007",
+            "--eject",
+            "--dont-scan",
+        ]
+        assert calls[0][1]["check"] is False
+
+    def test_nonzero_exit_fails_loud(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        executable = tmp_path / "scanimage"
+        executable.write_text("")
+        executable.chmod(0o755)
+        monkeypatch.setattr(sane_module.shutil, "which", lambda _name: str(executable))
+
+        class Completed:
+            returncode = 1
+            stdout = ""
+            stderr = "setting of option --eject failed (Device busy)"
+
+        monkeypatch.setattr(
+            sane_module.subprocess, "run", lambda *_args, **_kwargs: Completed()
+        )
+
+        with pytest.raises(RuntimeError, match="Device busy"):
+            sane_module._trigger_eject_button("coolscan3:usb:libusb:001:007")
 
 
 class TestScannerServiceEject:

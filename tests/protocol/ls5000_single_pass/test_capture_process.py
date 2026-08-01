@@ -1972,9 +1972,13 @@ def test_packaged_factory_uses_isolated_module_dispatch_and_internal_manifest(
     assert result.argv[:4] == (
         sys.executable,
         "-I",
-        "-m",
-        capture.PACKAGED_WORKER_MODULE,
+        "-B",
+        "-c",
     )
+    assert result.argv[4] == capture._PACKAGED_WORKER_BOOTSTRAP
+    assert result.argv[6] == capture.PACKAGED_WORKER_MODULE
+    assert result.argv[7] == result.paths.bootstrap_nonce
+    assert result.argv[8] == capture._worker_argv_sha256(result.argv[9:])
     assert result.paths.manifest.is_file()
     assert _argument(result.argv, "--manifest") == str(result.paths.manifest)
     assert (
@@ -1986,6 +1990,182 @@ def test_packaged_factory_uses_isolated_module_dispatch_and_internal_manifest(
     assert result.density_calibration is not None
     assert result.density_calibration.numerators == (57_114, 48_036, 32_683)
     assert result.density_calibration.session_id == "single-reservation-test"
+
+
+def test_verified_pre_dispatch_worker_bootstrap_failure_is_not_recovery_required(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    def bootstrap_failure(
+        argv: Sequence[str], *, cwd: Path
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd
+        command = tuple(argv)
+        marker = command.index(capture._PACKAGED_WORKER_BOOTSTRAP)
+        Path(command[marker + 1]).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "failed-before-ready",
+                    "nonce": command[marker + 3],
+                    "worker_argv_sha256": command[marker + 4],
+                    "error_type": "ModuleNotFoundError",
+                    "error_message": "No module named 'coolscanpy'",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        runner=bootstrap_failure,
+    )
+
+    result = adapter.run_attempt(capture.CaptureRequest(capture.CaptureMode.PREVIEW))
+
+    assert result.outcome is capture.CaptureOutcome.BOOTSTRAP_FAILED
+    assert result.recovery_required is False
+    assert result.journal is None
+    assert result.journal_error is not None
+    assert "CAPTURE_WORKER_BOOTSTRAP_FAILED" in result.journal_error
+    assert "before scanner dispatch" in result.journal_error
+
+
+def test_unmarked_no_journal_remains_recovery_required(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    runner = FakeRunner(
+        binding.worker_sha256,
+        returncode=1,
+        write_journal=False,
+    )
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        runner=runner,
+    )
+
+    result = adapter.run_attempt(capture.CaptureRequest(capture.CaptureMode.PREVIEW))
+
+    assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
+    assert result.recovery_required is True
+    assert result.journal is None
+
+
+def test_ready_bootstrap_marker_without_journal_remains_recovery_required(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    def exited_after_ready(
+        argv: Sequence[str], *, cwd: Path
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd
+        command = tuple(argv)
+        marker = command.index(capture._PACKAGED_WORKER_BOOTSTRAP)
+        Path(command[marker + 1]).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "ready",
+                    "nonce": command[marker + 3],
+                    "worker_argv_sha256": command[marker + 4],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        runner=exited_after_ready,
+    )
+
+    result = adapter.run_attempt(capture.CaptureRequest(capture.CaptureMode.PREVIEW))
+
+    assert result.outcome is capture.CaptureOutcome.RECOVERY_REQUIRED
+    assert result.recovery_required is True
+    assert result.journal is None
+
+
+def test_verified_batch_bootstrap_failure_is_not_recovery_required(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    class FailedBeforeDispatch:
+        def poll(self) -> int:
+            return 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 1
+
+    def spawn(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+    ) -> FailedBeforeDispatch:
+        del cwd, stdout, stderr
+        command = tuple(argv)
+        marker = command.index(capture._PACKAGED_WORKER_BOOTSTRAP)
+        Path(command[marker + 1]).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "failed-before-ready",
+                    "nonce": command[marker + 3],
+                    "worker_argv_sha256": command[marker + 4],
+                    "error_type": "ModuleNotFoundError",
+                    "error_message": "No module named 'coolscanpy'",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FailedBeforeDispatch()
+
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        batch_spawner=spawn,
+        batch_poll_seconds=0,
+    )
+    request = capture.CaptureBatchRequest(
+        frames=(capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+
+    with pytest.raises(capture.CaptureBatchProcessError) as excinfo:
+        adapter.run_batch_session(
+            request,
+            frame_handler=lambda _result: capture.BatchAckAction.CONTINUE,
+        )
+
+    assert excinfo.value.outcome is capture.CaptureOutcome.BOOTSTRAP_FAILED
+    assert excinfo.value.recovery_required is False
+    assert "CAPTURE_WORKER_BOOTSTRAP_FAILED" in str(excinfo.value)
 
 
 def test_packaged_factory_uses_frozen_app_helper_dispatch(

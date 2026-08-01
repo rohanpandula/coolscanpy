@@ -111,6 +111,14 @@ class DeviceInfo:
 
 @dataclass(frozen=True)
 class Thumbnail:
+    """One preview crop plus its transport-review state.
+
+    ``boundary_rows`` is the slot's unshifted detected interval in the saved
+    whole-roll preview. ``spacing_offset`` selects another saved transport
+    table row and re-crops ``image`` from that same preview; it does not alter
+    the base interval reported by ``boundary_rows``.
+    """
+
     slot: int
     image: np.ndarray
     boundary_rows: tuple[int, int]

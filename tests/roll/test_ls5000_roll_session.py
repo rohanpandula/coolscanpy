@@ -20,13 +20,41 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CaptureRequest,
 )
 from coolscanpy.protocol.ls5000_single_pass.plan import CANONICAL_PLAN_SHA256
+from coolscanpy.protocol.ls5000_single_pass.density import (
+    DensityCalibration,
+    build_nikon_density_evidence,
+)
 from coolscanpy.roll.preview_session import (
     CaptureRoute,
     RollSessionIntegrityError,
+    _preview_binding_contract,
     build_roll_preview_session,
     reload_thumbnail,
 )
 from coolscanpy.roll.controls import ScanMaterial
+
+
+_DENSITY_CALIBRATION_PAYLOADS = tuple(
+    bytes.fromhex(value)
+    for value in (
+        "8c20000000040000df1a",
+        "8c20000000040000bba4",
+        "8c200000000400007fab",
+    )
+)
+_DENSITY_CALIBRATION_NUMERATORS = (57_114, 48_036, 32_683)
+
+
+def _density_calibration(session_id: str) -> DensityCalibration:
+    return DensityCalibration(
+        session_id=session_id,
+        numerators=_DENSITY_CALIBRATION_NUMERATORS,
+        payload_hex=tuple(payload.hex() for payload in _DENSITY_CALIBRATION_PAYLOADS),
+        payload_sha256=tuple(
+            hashlib.sha256(payload).hexdigest()
+            for payload in _DENSITY_CALIBRATION_PAYLOADS
+        ),
+    )
 
 
 def _sha256(payload: bytes) -> str:
@@ -108,21 +136,19 @@ def _preview_fixture(
     *,
     content_frames: int = 40,
     slot_capacity_hint: int = 40,
+    density_capture_attempt_id: str | None = None,
+    density_scan_identity: str | None = None,
 ) -> PreviewFixture:
-    dynamic_37 = slot_capacity_hint == 37
-    native_height = 232_401 if dynamic_37 else 250_278
-    decoded_height = 5_668 if dynamic_37 else 6_104
-    startup_status = "022b4b0000000000" if dynamic_37 else "0000000000000000"
+    contract = _preview_binding_contract(slot_capacity_hint)
+    native_height = contract["native_height"]
+    decoded_height = contract["decoded_height"]
+    startup_status = contract["startup_status"]
     preview_binding = {
-        "mode": ("canonical-prefix-37-record" if dynamic_37 else "canonical-40-record"),
-        "startup_records": 37 if dynamic_37 else 40,
-        "native_height": native_height,
-        "decoded_height": decoded_height,
-        "expected_stream_bytes": decoded_height * 1_024,
-        "read_count": 45 if dynamic_37 else 48,
-        "active_read_sequence_range": [118, 162] if dynamic_37 else [118, 165],
-        "skipped_read_sequence_range": [163, 165] if dynamic_37 else None,
+        key: value for key, value in contract.items() if key != "startup_status"
     }
+    assert isinstance(native_height, int)
+    assert isinstance(decoded_height, int)
+    assert isinstance(startup_status, str)
     attempt = tmp_path / "preview-attempt"
     attempt.mkdir()
     output = attempt / "capture.bin"
@@ -138,6 +164,23 @@ def _preview_fixture(
     table = _transport_table(len(rgb))
     preview_path.write_bytes(preview)
     table_path.write_bytes(table)
+    density_session_id = "single-reservation-roll-preview"
+    density_exposures = (71_373, 137_524, 126_126)
+    preview_sha256 = _sha256(preview)
+    density_attempt_id = density_capture_attempt_id or attempt.name
+    density_identity = density_scan_identity or (
+        f"{density_session_id}:density-97dpi:{preview_sha256}"
+    )
+    density_evidence = build_nikon_density_evidence(
+        preview,
+        calibration=_density_calibration(density_session_id),
+        density_f03_exposures_raw_10ns=density_exposures,
+        session_id=density_session_id,
+        capture_attempt_id=density_attempt_id,
+        scan_identity=density_identity,
+        source_native_height=native_height,
+        source_height=decoded_height,
+    )
     receipt = {
         "status": "preview-only-complete",
         "slot_capacity_hint": slot_capacity_hint,
@@ -145,7 +188,7 @@ def _preview_fixture(
             "scanner-addressable preview slots; not an exposure count"
         ),
         "preview_bytes": len(preview),
-        "preview_sha256": _sha256(preview),
+        "preview_sha256": preview_sha256,
         "table_bytes": len(table),
         "table_sha256": _sha256(table),
         "frame_detection": "deferred-offline",
@@ -159,8 +202,6 @@ def _preview_fixture(
     mapping_path.write_text(json.dumps(receipt), encoding="utf-8")
     journal_path = attempt / "journal.json"
     engine_sha256 = "b" * 64
-    density_session_id = "single-reservation-roll-preview"
-    density_exposures = [71_373, 137_524, 126_126]
     journal = {
         "status": "complete",
         "capture_mode": "preview-only",
@@ -199,14 +240,7 @@ def _preview_fixture(
             )
         ],
         "density_calibration_session_id": density_session_id,
-        "nikon_density_evidence": {
-            "exposure_binding": {
-                "session_id": density_session_id,
-                "capture_attempt_id": attempt.name,
-                "scan_identity": f"{density_session_id}:density-97dpi:{_sha256(preview)}",
-                "density_f03_exposures_raw_10ns_rgb": density_exposures,
-            }
-        },
+        "nikon_density_evidence": density_evidence.to_dict(),
         "live_startup_0x8f": {
             "count": slot_capacity_hint,
             "sha256": "a" * 64,
@@ -234,6 +268,7 @@ def _preview_fixture(
         journal=journal_path,
         plan=attempt / "plan.jsonl",
         manifest=attempt / "manifest.json",
+        bootstrap_status=attempt / "worker-bootstrap.json",
         stdout=attempt / "stdout.txt",
         stderr=attempt / "stderr.txt",
     )
@@ -412,16 +447,110 @@ def test_preview_refuses_malformed_density_exposure_evidence(
         build_roll_preview_session(replace(fixture.result, journal=journal))
 
 
-def test_preview_refuses_a_live_startup_table_outside_proven_counts(
+@pytest.mark.parametrize("slot_capacity_hint", range(2, 41))
+def test_preview_binding_contract_accepts_scanner_derived_startup_table_capacity(
+    slot_capacity_hint: int,
+) -> None:
+    contract = _preview_binding_contract(slot_capacity_hint)
+
+    assert contract["startup_records"] == slot_capacity_hint
+    assert contract["decoded_height"] % 2 == 0
+    assert contract["expected_stream_bytes"] == contract["decoded_height"] * 1_024
+    assert contract["active_read_sequence_range"][0] == 118
+    assert contract["active_read_sequence_range"][1] <= 165
+    if slot_capacity_hint == 40:
+        assert contract["startup_status"] == "0000000000000000"
+    else:
+        assert contract["startup_status"] == "022b4b0000000000"
+
+
+def test_preview_session_accepts_the_observed_six_record_short_strip(
     tmp_path: Path,
 ) -> None:
-    fixture = _preview_fixture(tmp_path, slot_capacity_hint=6)
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=6,
+        slot_capacity_hint=6,
+    )
+
+    session = build_roll_preview_session(fixture.result)
+
+    assert session.geometry.native_height == _preview_binding_contract(6)["native_height"]
+    assert len(session.slots) == 6
+    assert fixture.result.density_evidence is not None
+    assert fixture.result.density_evidence.source_binding.height == 1_162
+
+
+def test_preview_refuses_density_source_geometry_from_another_startup_count(
+    tmp_path: Path,
+) -> None:
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=6,
+        slot_capacity_hint=6,
+    )
+    journal = json.loads(json.dumps(fixture.result.journal))
+    source_binding = journal["nikon_density_evidence"]["source_binding"]
+    other_contract = _preview_binding_contract(7)
+    source_binding["native_height"] = other_contract["native_height"]
+    source_binding["height"] = other_contract["decoded_height"]
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
 
     with pytest.raises(
         RollSessionIntegrityError,
-        match="40- or 37-record",
+        match="density source geometry disagrees",
     ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+@pytest.mark.parametrize(
+    "fixture_kwargs",
+    (
+        {"density_capture_attempt_id": "another-preview-attempt"},
+        {"density_scan_identity": "another-valid-density-scan-identity"},
+    ),
+)
+def test_preview_refuses_internally_valid_density_provenance_from_another_capture(
+    tmp_path: Path,
+    fixture_kwargs: dict[str, str],
+) -> None:
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=6,
+        slot_capacity_hint=6,
+        **fixture_kwargs,
+    )
+
+    with pytest.raises(RollSessionIntegrityError, match="density provenance disagrees"):
         build_roll_preview_session(fixture.result)
+
+
+def test_preview_refuses_tampered_density_source_digest(
+    tmp_path: Path,
+) -> None:
+    fixture = _preview_fixture(
+        tmp_path,
+        content_frames=6,
+        slot_capacity_hint=6,
+    )
+    journal = json.loads(json.dumps(fixture.result.journal))
+    journal["nikon_density_evidence"]["source_binding"]["wire_sha256"] = "0" * 64
+    fixture.result.paths.journal.write_text(json.dumps(journal), encoding="utf-8")
+
+    with pytest.raises(
+        RollSessionIntegrityError,
+        match="density evidence does not replay",
+    ):
+        build_roll_preview_session(replace(fixture.result, journal=journal))
+
+
+@pytest.mark.parametrize("slot_capacity_hint", (0, 1, 41))
+def test_preview_refuses_startup_table_outside_scanner_derived_range(
+    tmp_path: Path,
+    slot_capacity_hint: int,
+) -> None:
+    with pytest.raises(RollSessionIntegrityError, match="2..40"):
+        _preview_fixture(tmp_path, slot_capacity_hint=slot_capacity_hint)
 
 
 def test_reload_thumbnail_recrops_the_saved_full_width_preview_at_exact_offset(

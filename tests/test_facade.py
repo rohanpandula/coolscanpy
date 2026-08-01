@@ -33,6 +33,7 @@ import pytest
 import coolscanpy
 import coolscanpy._device as device_module
 import coolscanpy._roll as roll_module
+import coolscanpy.transport.adapter_status as adapter_status_module
 from coolscanpy._roll import Roll
 from coolscanpy.capture.single_pass_workflow import (
     LS5000SinglePassWorkflow,
@@ -41,15 +42,20 @@ from coolscanpy.capture.single_pass_workflow import (
 from coolscanpy.protocol.ls5000_single_pass import roll_index
 from coolscanpy.protocol.ls5000_single_pass.bundle import CAPTURE_BUNDLE_SHA256
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
+    AttemptPaths,
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
+    CaptureAttemptResult,
+    CaptureOutcome,
     CaptureProcessAdapter,
+    CaptureRequest,
     ManualFrameApproval,
 )
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
 )
 from coolscanpy.protocol.ls5000_single_pass.density import (
+    DensityCalibration,
     assemble_density_calibration,
     build_nikon_density_evidence,
     build_nikon_density_frame_ownership,
@@ -434,9 +440,22 @@ class _PreviewAndBatchWorker:
         }
         mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
         density_session_id = "single-reservation-facade-preview"
-        density_exposures = [71_373, 137_524, 126_126]
+        density_exposures = (71_373, 137_524, 126_126)
+        density_provenance = _density_calibration_provenance(density_session_id)
+        density_evidence = build_nikon_density_evidence(
+            preview,
+            calibration=DensityCalibration.from_dict(
+                density_provenance["nikon_density_calibration"]
+            ),
+            density_f03_exposures_raw_10ns=density_exposures,
+            session_id=density_session_id,
+            capture_attempt_id=cwd.name,
+            scan_identity=(
+                f"{density_session_id}:density-97dpi:{_sha256(preview)}"
+            ),
+        )
         journal = {
-            **_density_calibration_provenance(density_session_id),
+            **density_provenance,
             "status": "complete",
             "capture_mode": "preview-only",
             "requested_frame": None,
@@ -490,14 +509,7 @@ class _PreviewAndBatchWorker:
                     strict=True,
                 )
             ],
-            "nikon_density_evidence": {
-                "exposure_binding": {
-                    "session_id": density_session_id,
-                    "capture_attempt_id": cwd.name,
-                    "scan_identity": f"{density_session_id}:density-97dpi:{_sha256(preview)}",
-                    "density_f03_exposures_raw_10ns_rgb": density_exposures,
-                }
-            },
+            "nikon_density_evidence": density_evidence.to_dict(),
             "live_startup_0x8f": {"count": 40, "sha256": "a" * 64},
             "live_startup_0x8f_status": "0000000000000000",
             "live_preview_binding": preview_binding,
@@ -835,6 +847,27 @@ class _FakeBatchProcess:
                     "3": 100_003,
                     "9": 100_009,
                 },
+            },
+            # The guarded nikon-parity solve is the RGB command authority;
+            # this fixture's parity solve happens to equal the active solve,
+            # which is a legal (unclamped, unguarded) state.
+            "active_exposure_authority": {
+                "rgb_source": "nikon-parity-guarded-v2",
+                "ir_source": "active-controller",
+                "commanded_channels_raw_10ns": {
+                    "R": 100_001,
+                    "G": 100_002,
+                    "B": 100_003,
+                    "IR": 100_009,
+                },
+                "active_controller_channels_raw_10ns": {
+                    "R": 100_001,
+                    "G": 100_002,
+                    "B": 100_003,
+                    "IR": 100_009,
+                },
+                "device_bound_clamped_channels_raw_10ns": {},
+                "device_exposure_bounds_raw_10ns": [50_000, 400_000],
             },
         }
         journal_path.write_text(json.dumps(journal), encoding="utf-8")
@@ -1235,6 +1268,15 @@ class TestDeviceClosedRaises:
         with pytest.raises(RuntimeError, match="has been closed"):
             dev.eject()
 
+    def test_film_present_after_close_raises_runtime_error(
+        self, fake_service_factory
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        dev.close()
+
+        with pytest.raises(RuntimeError, match="has been closed"):
+            dev.film_present()
+
 
 # ===========================================================================
 # Device option introspection / get / set
@@ -1414,6 +1456,70 @@ class TestDeviceScanAndEject:
         finally:
             dev.close()
 
+
+class TestDeviceFilmPresent:
+    @pytest.mark.parametrize(
+        ("probe_value", "expected"),
+        ((True, True), (False, False), (None, None)),
+    )
+    def test_film_presence_passes_exact_device_id_and_tristate(
+        self,
+        fake_service_factory,
+        monkeypatch: pytest.MonkeyPatch,
+        probe_value: bool | None,
+        expected: bool | None,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        device_ids: list[str] = []
+
+        def probe(*, device_id: str):
+            device_ids.append(device_id)
+            return adapter_status_module.AdapterStatus(
+                film_present=probe_value,
+                frame_capacity=40 if probe_value is True else None,
+                raw_status=(
+                    "000000"
+                    if probe_value is True
+                    else "023a00"
+                    if probe_value is False
+                    else None
+                ),
+            )
+
+        monkeypatch.setattr(adapter_status_module, "probe_adapter_status", probe)
+        try:
+            assert dev.film_present() is expected
+            assert device_ids == [_LOCAL_COOLSCAN_ID]
+        finally:
+            dev.close()
+
+    def test_film_presence_cannot_race_an_in_process_capture(
+        self,
+        fake_service_factory,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        probed = False
+
+        def forbidden_probe(**_kwargs: object):
+            nonlocal probed
+            probed = True
+            raise AssertionError("a busy Device must not open raw USB")
+
+        monkeypatch.setattr(
+            adapter_status_module,
+            "probe_adapter_status",
+            forbidden_probe,
+        )
+        assert dev._lock.acquire(blocking=False)
+        try:
+            with pytest.raises(coolscanpy.DeviceBusy, match="film status"):
+                dev.film_present()
+            assert probed is False
+        finally:
+            dev._lock.release()
+            dev.close()
+
     def test_second_roll_while_first_open_raises_device_busy(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -1506,6 +1612,56 @@ class TestDeviceScanAndEject:
 
 
 class TestRollPreview:
+    def test_preview_surfaces_typed_pre_dispatch_bootstrap_failure(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        attempt_dir = tmp_path / "attempts" / "bootstrap-failure"
+        attempt_dir.mkdir(parents=True)
+        paths = AttemptPaths(
+            directory=attempt_dir,
+            output=attempt_dir / "capture.bin",
+            journal=attempt_dir / "journal.json",
+            plan=attempt_dir / "replay-first-rgbi4-plan.jsonl",
+            manifest=attempt_dir / "replay-first-rgbi4-manifest.json",
+            bootstrap_status=attempt_dir / "worker-bootstrap.json",
+            stdout=attempt_dir / "stdout.txt",
+            stderr=attempt_dir / "stderr.txt",
+        )
+
+        def bootstrap_failed(request: CaptureRequest) -> CaptureAttemptResult:
+            return CaptureAttemptResult(
+                outcome=CaptureOutcome.BOOTSTRAP_FAILED,
+                request=request,
+                paths=paths,
+                argv=(),
+                returncode=1,
+                stdout="",
+                stderr="",
+                journal=None,
+                journal_error=(
+                    "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled capture worker "
+                    "failed before scanner dispatch (ModuleNotFoundError): "
+                    "No module named 'coolscanpy'"
+                ),
+            )
+
+        assert roll._adapter is not None
+        roll._adapter.run_attempt = bootstrap_failed  # type: ignore[method-assign]
+        try:
+            with pytest.raises(coolscanpy.CaptureWorkerBootstrapFailed) as excinfo:
+                roll.preview()
+        finally:
+            roll.close()
+            dev.close()
+
+        assert "CAPTURE_WORKER_BOOTSTRAP_FAILED" in str(excinfo.value)
+        assert "ModuleNotFoundError" in str(excinfo.value)
+        assert "No module named 'coolscanpy'" in str(excinfo.value)
+
     def test_caller_owned_attempts_root_retains_generated_preview_evidence(
         self,
         fake_service_factory,
@@ -1787,6 +1943,57 @@ class TestRollPreview:
             roll.close()
             dev.close()
 
+    def test_set_spacing_offset_before_preview_raises_runtime_error(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            with pytest.raises(RuntimeError, match=r"preview\(\) has not been called"):
+                roll.set_spacing_offset(1, 0)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_set_spacing_offset_returns_the_fresh_recropped_thumbnail(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            before = next(thumbnail for thumbnail in roll.preview() if thumbnail.slot == 10)
+
+            adjusted = roll.set_spacing_offset(10, 5)
+
+            assert isinstance(adjusted, coolscanpy.Thumbnail)
+            assert adjusted.slot == before.slot
+            assert adjusted.boundary_rows == before.boundary_rows
+            assert adjusted.spacing_offset == 5
+            assert adjusted.needs_approval == before.needs_approval
+            assert adjusted.warnings == before.warnings
+            assert adjusted.image.shape == before.image.shape
+            assert not np.array_equal(adjusted.image, before.image)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_set_spacing_offset_is_absolute_when_the_same_value_is_set_twice(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+
+            first = roll.set_spacing_offset(10, 5)
+            second = roll.set_spacing_offset(10, 5)
+
+            assert first.spacing_offset == second.spacing_offset == 5
+            np.testing.assert_array_equal(second.image, first.image)
+        finally:
+            roll.close()
+            dev.close()
+
     def test_spacing_offset_out_of_range_raises_value_error(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -1798,6 +2005,30 @@ class TestRollPreview:
                 # slot 1's range is [0, 144] (never negative); every other
                 # slot allows [-144, 144].
                 roll.set_spacing_offset(1, -5)
+        finally:
+            roll.close()
+            dev.close()
+
+    @pytest.mark.parametrize(
+        ("slot", "offset_rows"),
+        ((1, 0), (1, 144), (10, -144), (10, 144)),
+    )
+    def test_set_spacing_offset_accepts_each_inclusive_policy_boundary(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+        slot: int,
+        offset_rows: int,
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+
+            adjusted = roll.set_spacing_offset(slot, offset_rows)
+
+            assert adjusted.spacing_offset == offset_rows
+            assert roll.spacing_offset(slot) == offset_rows
         finally:
             roll.close()
             dev.close()
@@ -1815,26 +2046,65 @@ class TestRollPreview:
             roll.close()
             dev.close()
 
-    def test_set_spacing_offset_invalidates_prior_approval(
+    def test_set_spacing_offset_rejects_an_unknown_slot(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
         dev = _open_device(fake_service_factory)
         roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
         try:
             roll.preview()
-            slot = (
-                next(t.slot for t in roll.preview() if t.needs_approval)
-                if any(roll.needs_approval(s) for s in range(1, 41))
-                else None
+            with pytest.raises(ValueError, match="unknown roll slot"):
+                roll.set_spacing_offset(999, 0)
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_set_spacing_offset_is_refused_while_a_batch_owns_the_roll(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        iterator = None
+        try:
+            roll.preview()
+            if roll.needs_approval(3):
+                roll.approve(3)
+            iterator = roll.scan_many([3])
+
+            with pytest.raises(coolscanpy.DeviceBusy, match="active roll batch"):
+                roll.set_spacing_offset(3, 1)
+        finally:
+            if iterator is not None:
+                iterator.close()
+            roll.close()
+            dev.close()
+
+    def test_setting_even_the_same_spacing_offset_requires_public_reapproval(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            thumbnails = roll.preview()
+            flagged = next(
+                (thumbnail for thumbnail in thumbnails if thumbnail.needs_approval),
+                None,
             )
-            if slot is None:
+            if flagged is None:
                 pytest.skip(
                     "synthetic preview produced no manual-review slot to test invalidation against"
                 )
-            roll.approve(slot)
-            assert slot in roll._approvals
-            roll.set_spacing_offset(slot, 1 if slot != 1 else 0)
-            assert slot not in roll._approvals
+            roll.approve(flagged.slot)
+
+            adjusted = roll.set_spacing_offset(
+                flagged.slot,
+                flagged.spacing_offset,
+            )
+
+            assert adjusted.spacing_offset == flagged.spacing_offset
+            with pytest.raises(coolscanpy.ManualReviewRequired) as excinfo:
+                next(iter(roll.scan_many([flagged.slot])))
+            assert excinfo.value.slot == flagged.slot
         finally:
             roll.close()
             dev.close()
@@ -1989,6 +2259,59 @@ class TestRollPreview:
             frame = roll.scan(11)
 
             assert frame.slot == 11
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_scan_many_binds_the_adjusted_offset_and_reapproval_to_the_worker(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        events: list[str] = []
+        observed_jobs: list[dict[str, Any]] = []
+
+        def spawn(
+            argv: Sequence[str],
+            *,
+            cwd: Path,
+            stdout: object,
+            stderr: object,
+        ) -> _FakeBatchProcess:
+            del cwd, stdout, stderr
+            job_path = Path(_arg(argv, "--batch-job"))
+            session_journal_path = Path(_arg(argv, "--session-journal"))
+            observed_jobs.append(json.loads(job_path.read_text(encoding="utf-8")))
+            return _FakeBatchProcess(job_path, session_journal_path, events)
+
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=spawn)
+        try:
+            thumbnails = roll.preview()
+            flagged = next(
+                (
+                    thumbnail
+                    for thumbnail in thumbnails
+                    if thumbnail.needs_approval and thumbnail.slot != 1
+                ),
+                None,
+            )
+            if flagged is None:
+                pytest.skip("synthetic preview has no offsettable manual-review slot")
+            adjusted = roll.set_spacing_offset(flagged.slot, -7)
+            approval = roll.approve(flagged.slot)
+
+            frame = next(iter(roll.scan_many([flagged.slot])))
+
+            assert adjusted.spacing_offset == -7
+            assert approval.boundary_offset_rows == -7
+            assert len(observed_jobs) == 1
+            worker_frame = observed_jobs[0]["frames"][0]
+            assert worker_frame["boundary_offset_rows"] == -7
+            assert worker_frame["manual_review_approval"] == approval.to_payload()
+            assert frame.receipt.spacing_offset == -7
+            assert frame.receipt.manual_approval is not None
+            assert frame.receipt.manual_approval.spacing_offset == -7
         finally:
             roll.close()
             dev.close()

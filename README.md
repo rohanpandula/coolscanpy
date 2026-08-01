@@ -50,6 +50,19 @@ exposure) is decoded and attached to the `Frame`. Downstream tools that
 need a dual-capture (prepass + main) can use it directly. See the
 [downstream pipeline](#downstream-pipeline) section.
 
+C-41 fine scans expose RGB to Nikon Scan's rendering intent by default.
+The auto-exposure loop still converges exactly as before, but the commanded
+fine-scan RGB exposures are now a guarded Nikon-like target derived from
+the settled meter pass — matched-pair analysis against Nikon's own scans of
+the same physical frames showed the previous solve consistently landed
+6–9 % brighter in the rendered midtones, and this closes that gap to about
+±1 % on green and blue (red currently retains +2–3 %). Highlights are
+capped at a reviewed q99.99 threshold and the device exposure bounds, both
+journaled; infrared metering is unchanged; and each frame's journal carries
+an `active_exposure_authority` record binding the active solve, the guarded
+candidate, and the exact commanded contract, so the receipt trail proves
+which numbers reached the scanner and why.
+
 For the proven LS-5000 full-record geometry, fine-scan decoding now starts
 while the raw capture is still arriving. This is an advisory fast path: the
 raw capture remains the oracle, and an absent, slow, malformed, or failed

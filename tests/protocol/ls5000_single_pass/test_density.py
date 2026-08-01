@@ -35,6 +35,7 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     DENSITY_SOURCE_ROW_STRIDE_BYTES,
     DENSITY_SOURCE_SAMPLE_BITS,
     DENSITY_SOURCE_SCALE_DIVISOR,
+    DENSITY_SOURCE_SUPPORTED_HEIGHTS,
     DENSITY_SOURCE_WIDTH,
     DENSITY_SOURCE_WIRE_BYTES,
     NIKON_ANALYZER_SHAPE,
@@ -53,6 +54,7 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     build_nikon_exact_builder_evidence,
     decode_density_calibration_read,
     decode_nikon_density_source,
+    density_source_geometry_for_startup_records,
     evaluate_nikon_density,
     verify_nikon_density_arithmetic_backend,
 )
@@ -331,6 +333,51 @@ def test_37_record_source_geometry_replays_with_truthful_receipt() -> None:
     assert evidence.to_dict()["source_payload_bytes"] == 5_804_032
     assert evidence.result.to_dict()["source_native_height"] == 232_401
     assert evidence.result.to_dict()["source_geometry"] == [5_668, 96, 3]
+
+
+def test_observed_6_record_source_geometry_replays_with_truthful_receipt() -> None:
+    native_height, height = density_source_geometry_for_startup_records(6)
+    image = _source_image(height=height)
+    wire = _wire_from_image(image)
+    evidence = build_nikon_density_evidence(
+        wire,
+        calibration=_calibration(),
+        density_f03_exposures_raw_10ns=_DENSITY_F03_DENOMINATORS,
+        session_id="reservation-7",
+        capture_attempt_id="preview-7vgsdf1f",
+        scan_identity="reservation-7:density-97dpi:observed-six-record",
+        source_native_height=native_height,
+        source_height=height,
+    )
+
+    assert (native_height, height) == (47_672, 1_162)
+    assert len(wire) == 1_189_888
+    assert evidence.source_binding.native_height == 47_672
+    assert evidence.source_binding.height == 1_162
+    assert evidence.to_dict()["source_payload_bytes"] == 1_189_888
+    assert evidence.result.to_dict()["source_geometry"] == [1_162, 96, 3]
+
+
+@pytest.mark.parametrize("startup_records", range(2, 41))
+def test_density_source_policy_covers_every_validated_startup_count(
+    startup_records: int,
+) -> None:
+    native_height, height = density_source_geometry_for_startup_records(
+        startup_records
+    )
+
+    assert (native_height, height) in DENSITY_SOURCE_SUPPORTED_HEIGHTS
+    assert height % 2 == 0
+    assert native_height // DENSITY_SOURCE_SCALE_DIVISOR == height
+    assert height * DENSITY_SOURCE_ROW_STRIDE_BYTES > 0
+
+
+@pytest.mark.parametrize("startup_records", (None, True, 0, 1, 41, 2.0))
+def test_density_source_policy_refuses_unvalidated_startup_counts(
+    startup_records: object,
+) -> None:
+    with pytest.raises(ValueError, match="2..40"):
+        density_source_geometry_for_startup_records(startup_records)
 
 
 def test_density_evaluator_uses_first_maximum_and_skips_saturated_rows() -> None:
@@ -823,6 +870,8 @@ def test_source_binding_refuses_any_nonvendor_geometry_or_identity(
         (232_401, 6_104),
         (250_278, 5_668),
         (232_400, 5_668),
+        (47_672, 1_308),
+        (47_671, 1_162),
     ),
 )
 def test_source_binding_refuses_unproven_height_pairs(

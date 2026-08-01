@@ -25,6 +25,8 @@ import hashlib
 import json
 import math
 import os
+import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -73,6 +75,9 @@ METER_CAPTURE_BYTES = 3_264_000
 POWER_CYCLE_RECOVERY = "power-cycle scanner before another attempt"
 CAPTURE_HELPER_FLAG = "--ls5000-capture-helper"
 PACKAGED_WORKER_MODULE = "coolscanpy.protocol.ls5000_single_pass.worker"
+WORKER_BOOTSTRAP_SCHEMA_VERSION = 1
+WORKER_BOOTSTRAP_FAILED = "failed-before-ready"
+WORKER_BOOTSTRAP_STATUS_FILENAME = "worker-bootstrap.json"
 REVIEWED_ROLL_FINGERPRINT_VERSION = 2
 MANUAL_FRAME_APPROVAL_VERSION = 1
 MAX_VISUAL_MEDIAN_HAMMING = 24
@@ -85,6 +90,77 @@ MAX_FRAME_START_DELTA_ROWS = 32
 MAX_NATIVE_ORIGIN_MEDIAN_DELTA = 128
 MAX_NATIVE_ORIGIN_DELTA = 256
 MAX_PREVIEW_HEIGHT_DELTA_ROWS = 32
+
+# This child-side launcher is intentionally stdlib-only. It writes a durable
+# `starting` status before importing the worker, and records a typed bootstrap
+# failure only if the import or entrypoint lookup fails. It writes `ready`
+# immediately before calling the worker's canonical ``main(argv)`` entrypoint,
+# which is the first code path that can dispatch to the scanner. Do not turn
+# this into a shell command or a PYTHONPATH setup: the outer interpreter stays
+# isolated.
+_PACKAGED_WORKER_BOOTSTRAP = r'''
+import importlib
+import json
+import os
+import sys
+import tempfile
+
+status_path, module_name, nonce, worker_argv_sha256, *worker_argv = sys.argv[1:]
+
+def _write_status(payload):
+    directory = os.path.dirname(status_path) or "."
+    descriptor, temporary = tempfile.mkstemp(prefix=".worker-bootstrap-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, status_path)
+        try:
+            directory_descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+def _state():
+    try:
+        with open(status_path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload.get("state") if isinstance(payload, dict) else None
+
+binding = {"nonce": nonce, "worker_argv_sha256": worker_argv_sha256}
+_write_status({"schema_version": 1, "state": "starting", **binding})
+try:
+    worker = importlib.import_module(module_name)
+    main = getattr(worker, "main")
+    if not callable(main):
+        raise TypeError("packaged capture worker has no callable main(argv) entrypoint")
+    _write_status({"schema_version": 1, "state": "ready", **binding})
+    main(worker_argv)
+except BaseException as error:
+    if _state() == "starting":
+        _write_status(
+            {
+                "schema_version": 1,
+                "state": "failed-before-ready",
+                **binding,
+                "error_type": type(error).__name__,
+                "error_message": str(error)[:2048],
+            }
+        )
+    raise
+'''
 
 
 def _lower_sha256(value: object) -> bool:
@@ -247,6 +323,7 @@ class CaptureOutcome(StrEnum):
 
     COMPLETE = "complete"
     SYNCHRONIZED_REFUSAL = "synchronized-refusal"
+    BOOTSTRAP_FAILED = "bootstrap-failed"
     RECOVERY_REQUIRED = "recovery-required"
 
 
@@ -1002,8 +1079,10 @@ class AttemptPaths:
     journal: Path
     plan: Path
     manifest: Path
+    bootstrap_status: Path
     stdout: Path
     stderr: Path
+    bootstrap_nonce: str = ""
 
 
 @dataclass(frozen=True)
@@ -1015,9 +1094,11 @@ class BatchSessionPaths:
     first_plan: Path
     continuation_plan: Path
     manifest: Path
+    bootstrap_status: Path
     session_journal: Path
     stdout: Path
     stderr: Path
+    bootstrap_nonce: str = ""
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1413,102 @@ def _is_sha256(value: object) -> bool:
     return _lower_sha256(value)
 
 
+def _worker_argv_sha256(argv: Sequence[str]) -> str:
+    """Bind a bootstrap receipt to the exact worker arguments it launched."""
+
+    if any(not isinstance(argument, str) for argument in argv):
+        raise TypeError("worker argv must contain only strings")
+    encoded = json.dumps(
+        list(argv),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_verified_bootstrap_failure(
+    *,
+    status_path: Path,
+    journal_path: Path,
+    returncode: int,
+    nonce: str,
+    worker_argv_sha256: str,
+) -> str | None:
+    """Return a typed pre-dispatch error only for an exact child receipt.
+
+    Any ambiguity is deliberately ignored.  In particular, a journal (even a
+    malformed one), a zero exit, a symlinked or oversized marker, a marker for
+    another argv, and a marker that reached ``ready`` all remain the existing
+    fail-closed recovery path.
+    """
+
+    if returncode == 0 or os.path.lexists(journal_path):
+        return None
+    if (
+        len(nonce) != 64
+        or any(character not in "0123456789abcdef" for character in nonce)
+        or not _lower_sha256(worker_argv_sha256)
+    ):
+        return None
+
+    descriptor: int | None = None
+    try:
+        initial_info = status_path.lstat()
+        if not stat.S_ISREG(initial_info.st_mode) or not 1 <= initial_info.st_size <= 4096:
+            return None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(status_path, flags)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or not 1 <= info.st_size <= 4096:
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            raw = stream.read(4097)
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not 1 <= len(raw) <= 4096:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    required = {
+        "schema_version",
+        "state",
+        "nonce",
+        "worker_argv_sha256",
+        "error_type",
+        "error_message",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        return None
+    error_type = payload.get("error_type")
+    error_message = payload.get("error_message")
+    if (
+        payload.get("schema_version") != WORKER_BOOTSTRAP_SCHEMA_VERSION
+        or payload.get("state") != WORKER_BOOTSTRAP_FAILED
+        or payload.get("nonce") != nonce
+        or payload.get("worker_argv_sha256") != worker_argv_sha256
+        or not isinstance(error_type, str)
+        or not 1 <= len(error_type) <= 128
+        or not error_type.isidentifier()
+        or not isinstance(error_message, str)
+        or len(error_message) > 2048
+    ):
+        return None
+    details = error_message or "no further details"
+    return (
+        "CAPTURE_WORKER_BOOTSTRAP_FAILED: bundled capture worker failed before "
+        f"scanner dispatch ({error_type}): {details}"
+    )
+
+
 class CaptureProcessAdapter:
     """Launch one hash-pinned worker process per scanner attempt.
 
@@ -1350,6 +1527,7 @@ class CaptureProcessAdapter:
         python_executable: str = sys.executable,
         runner: ProcessRunner = _run_subprocess,
         launcher: Sequence[str] | None = None,
+        bootstrap_module: str | None = None,
         verify_worker_source: bool = True,
         expected_bundle_sha256: str | None = None,
         manifest_payload: bytes | None = None,
@@ -1373,6 +1551,11 @@ class CaptureProcessAdapter:
         )
         if not self._launcher:
             raise ValueError("capture worker launcher cannot be empty")
+        if bootstrap_module is not None and (
+            not isinstance(bootstrap_module, str) or not bootstrap_module
+        ):
+            raise ValueError("capture worker bootstrap module must be a non-empty string")
+        self._bootstrap_module = bootstrap_module
         self._verify_worker_source = bool(verify_worker_source)
         self._expected_worker_sha256 = expected_worker_sha256
         if expected_bundle_sha256 is not None and not _is_sha256(
@@ -1421,11 +1604,7 @@ class CaptureProcessAdapter:
         if spec is None or spec.origin is None:
             raise CaptureIntegrityError("packaged capture worker module is missing")
         worker_path = Path(spec.origin).resolve()
-        launcher = (
-            (sys.executable, CAPTURE_HELPER_FLAG)
-            if frozen
-            else (sys.executable, "-I", "-m", PACKAGED_WORKER_MODULE)
-        )
+        launcher = (sys.executable, CAPTURE_HELPER_FLAG) if frozen else (sys.executable,)
         return cls(
             worker_path=worker_path,
             attempts_root=attempts_root,
@@ -1433,6 +1612,7 @@ class CaptureProcessAdapter:
             manifest_path=worker_path.with_name(CANONICAL_MANIFEST_FILENAME),
             runner=runner,
             launcher=launcher,
+            bootstrap_module=None if frozen else PACKAGED_WORKER_MODULE,
             verify_worker_source=not frozen,
             expected_bundle_sha256=CAPTURE_BUNDLE_SHA256,
             manifest_payload=manifest_payload,
@@ -1638,6 +1818,22 @@ class CaptureProcessAdapter:
                 "batch capture worker did not leave a completed child process"
             ) from monitor_error
 
+        bootstrap_error = self._verified_bootstrap_failure(
+            paths=paths,
+            argv=prepared.argv,
+            journal_path=paths.session_journal,
+            returncode=returncode,
+        )
+        if bootstrap_error is not None:
+            raise CaptureBatchProcessError(
+                bootstrap_error,
+                outcome=CaptureOutcome.BOOTSTRAP_FAILED,
+                paths=paths,
+                frames=handled,
+                returncode=returncode,
+                session_journal=None,
+            ) from monitor_error
+
         try:
             session_journal = self._load_and_validate_batch_session_journal(
                 prepared,
@@ -1779,8 +1975,10 @@ class CaptureProcessAdapter:
             journal=directory / "journal.json",
             plan=directory / CANONICAL_PLAN_FILENAME,
             manifest=directory / CANONICAL_MANIFEST_FILENAME,
+            bootstrap_status=directory / WORKER_BOOTSTRAP_STATUS_FILENAME,
             stdout=directory / "stdout.txt",
             stderr=directory / "stderr.txt",
+            bootstrap_nonce=secrets.token_hex(32),
         )
 
     def _prepare_batch_session_paths(
@@ -1799,9 +1997,11 @@ class CaptureProcessAdapter:
             first_plan=directory / CANONICAL_PLAN_FILENAME,
             continuation_plan=(directory / CANONICAL_CONTINUATION_PLAN_FILENAME),
             manifest=directory / CANONICAL_MANIFEST_FILENAME,
+            bootstrap_status=directory / WORKER_BOOTSTRAP_STATUS_FILENAME,
             session_journal=directory / "session-journal.json",
             stdout=directory / "stdout.txt",
             stderr=directory / "stderr.txt",
+            bootstrap_nonce=secrets.token_hex(32),
         )
 
     def _verify_worker(self) -> None:
@@ -1884,11 +2084,74 @@ class CaptureProcessAdapter:
             )
         _write_exclusive(destination, payload)
 
+    def _worker_launcher(
+        self,
+        *,
+        bootstrap_status: Path,
+        bootstrap_nonce: str,
+        worker_argv: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return the only launch prefix allowed for this worker attempt.
+
+        Source and wheel builds use the stdlib bootstrap under the bundled
+        interpreter's isolated mode. Frozen builds retain their signed helper
+        dispatch, which cannot safely be wrapped as a Python module process.
+        """
+        if self._bootstrap_module is None:
+            return self._launcher
+        worker_argv_sha256 = _worker_argv_sha256(worker_argv)
+        return (
+            *self._launcher,
+            "-I",
+            "-B",
+            "-c",
+            _PACKAGED_WORKER_BOOTSTRAP,
+            str(bootstrap_status),
+            self._bootstrap_module,
+            bootstrap_nonce,
+            worker_argv_sha256,
+        )
+
+    def _verified_bootstrap_failure(
+        self,
+        *,
+        paths: AttemptPaths | BatchSessionPaths,
+        argv: Sequence[str],
+        journal_path: Path,
+        returncode: int,
+    ) -> str | None:
+        """Validate a launcher receipt against this exact parent-owned argv."""
+
+        if self._bootstrap_module is None:
+            return None
+        prefix = (
+            *self._launcher,
+            "-I",
+            "-B",
+            "-c",
+            _PACKAGED_WORKER_BOOTSTRAP,
+            str(paths.bootstrap_status),
+            self._bootstrap_module,
+            paths.bootstrap_nonce,
+        )
+        digest_index = len(prefix)
+        if tuple(argv[:digest_index]) != prefix or len(argv) <= digest_index:
+            return None
+        expected_digest = _worker_argv_sha256(argv[digest_index + 1 :])
+        if argv[digest_index] != expected_digest:
+            return None
+        return _read_verified_bootstrap_failure(
+            status_path=paths.bootstrap_status,
+            journal_path=journal_path,
+            returncode=returncode,
+            nonce=paths.bootstrap_nonce,
+            worker_argv_sha256=expected_digest,
+        )
+
     def _build_argv(
         self, request: CaptureRequest, paths: AttemptPaths
     ) -> tuple[str, ...]:
-        argv = [
-            *self._launcher,
+        worker_argv = [
             "--plan",
             str(paths.plan),
             "--manifest",
@@ -1902,11 +2165,11 @@ class CaptureProcessAdapter:
             "--live",
         ]
         if request.mode is CaptureMode.PREVIEW:
-            argv.append("--preview-only")
+            worker_argv.append("--preview-only")
         elif request.mode is CaptureMode.METER_ONLY:
-            argv.extend(("--frame", str(request.selected_slot), "--meter-only"))
+            worker_argv.extend(("--frame", str(request.selected_slot), "--meter-only"))
         else:
-            argv.extend(
+            worker_argv.extend(
                 (
                     "--frame",
                     str(request.selected_slot),
@@ -1917,17 +2180,26 @@ class CaptureProcessAdapter:
             )
         if request.expected_usb_bus is not None:
             assert request.expected_usb_address is not None
-            argv.extend(("--expected-usb-bus", str(request.expected_usb_bus)))
-            argv.extend(("--expected-usb-address", str(request.expected_usb_address)))
+            worker_argv.extend(("--expected-usb-bus", str(request.expected_usb_bus)))
+            worker_argv.extend(("--expected-usb-address", str(request.expected_usb_address)))
         if self._expected_bundle_sha256 is not None:
-            argv.extend(
+            worker_argv.extend(
                 ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
             )
-        if "--expected-frame-count" in argv:
+        if "--expected-frame-count" in worker_argv:
             raise AssertionError(
                 "exposure-count hints must never cross the capture boundary"
             )
-        return tuple(argv)
+        return tuple(
+            (
+                *self._worker_launcher(
+                    bootstrap_status=paths.bootstrap_status,
+                    bootstrap_nonce=paths.bootstrap_nonce,
+                    worker_argv=worker_argv,
+                ),
+                *worker_argv,
+            )
+        )
 
     def _batch_job_bytes(
         self,
@@ -1974,8 +2246,7 @@ class CaptureProcessAdapter:
         *,
         expected_job_sha256: str,
     ) -> tuple[str, ...]:
-        argv = [
-            *self._launcher,
+        worker_argv = [
             "--batch-job",
             str(paths.job),
             "--expected-batch-job-sha256",
@@ -1991,10 +2262,19 @@ class CaptureProcessAdapter:
             "--live",
         ]
         if self._expected_bundle_sha256 is not None:
-            argv.extend(
+            worker_argv.extend(
                 ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
             )
-        return tuple(argv)
+        return tuple(
+            (
+                *self._worker_launcher(
+                    bootstrap_status=paths.bootstrap_status,
+                    bootstrap_nonce=paths.bootstrap_nonce,
+                    worker_argv=worker_argv,
+                ),
+                *worker_argv,
+            )
+        )
 
     def _batch_frame_paths(
         self,
@@ -2011,8 +2291,10 @@ class CaptureProcessAdapter:
             journal=directory / "journal.json",
             plan=prepared.paths.first_plan,
             manifest=prepared.paths.manifest,
+            bootstrap_status=prepared.paths.bootstrap_status,
             stdout=prepared.paths.stdout,
             stderr=prepared.paths.stderr,
+            bootstrap_nonce=prepared.paths.bootstrap_nonce,
         )
 
     def _wait_for_batch_frame(
@@ -2576,6 +2858,24 @@ class CaptureProcessAdapter:
         stdout: str,
         stderr: str,
     ) -> CaptureAttemptResult:
+        bootstrap_error = self._verified_bootstrap_failure(
+            paths=paths,
+            argv=argv,
+            journal_path=paths.journal,
+            returncode=returncode,
+        )
+        if bootstrap_error is not None:
+            return CaptureAttemptResult(
+                outcome=CaptureOutcome.BOOTSTRAP_FAILED,
+                request=request,
+                paths=paths,
+                argv=argv,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                journal=None,
+                journal_error=bootstrap_error,
+            )
         try:
             journal = self._load_and_validate_journal(paths, request, returncode)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:

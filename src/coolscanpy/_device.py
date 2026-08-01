@@ -532,6 +532,25 @@ class Device:
         finally:
             self._release_io_lock()
 
+    def film_present(self) -> bool | None:
+        """Return whether the scanner currently reports film gripped.
+
+        This is a motion-free raw-USB TEST UNIT READY query. ``None`` means
+        the status could not be determined (for example, an active capture
+        owns the interface or the scanner returned an unrecognised sense);
+        it must never be interpreted as film absent. A parked short strip can
+        still report ``True`` because this is a presence signal, not a motion
+        readiness signal.
+        """
+
+        self._acquire_io_lock("film status")
+        try:
+            from coolscanpy.transport.adapter_status import probe_adapter_status
+
+            return probe_adapter_status(device_id=self._info.id).film_present
+        finally:
+            self._release_io_lock()
+
     def close(self) -> None:
         """Idempotent. Releases any transport claim this Device holds."""
 

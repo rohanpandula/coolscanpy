@@ -21,6 +21,7 @@ from coolscanpy._device import Device, get_devices, open
 from coolscanpy._roll import Roll
 from coolscanpy.exceptions import (
     BatchIntegrityError,
+    CaptureWorkerBootstrapFailed,
     DeviceBusy,
     DeviceNotFound,
     EjectFailed,
@@ -99,6 +100,7 @@ __all__ = [
     "EjectFailed",
     "SafeStopRequested",
     "FeederParked",
+    "CaptureWorkerBootstrapFailed",
     "RollMismatch",
     "FingerprintRefused",
     "ManualReviewRequired",

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+C-41 fine scans now expose RGB the way Nikon Scan would. The meter loop's
+own converged solve consistently landed 6–9 % brighter than Nikon's
+rendering of the same physical frame, and matched-pair analysis against
+Nikon's internal state traced the whole midtone gap to that exposure-policy
+difference rather than to any colour mathematics. The final metering pass
+therefore now derives a Nikon-like per-channel target from the settled
+pass-3 raster and commands the guarded result — capped at the reviewed
+64,880 q99.99 highlight threshold and clamped to the scanner's exposure
+bounds, both journaled — as the fine-scan RGB contract by default. Infrared
+stays with the existing controller unchanged. Every frame journal records
+an `active_exposure_authority` block binding the active solve, the guarded
+candidate, and the commanded wire contract together, and both the roll
+publication consumer and the single-pass finalize validator verify that
+chain instead of the old commanded-equals-active invariant. The uncapped
+Nikon-like diagnostic value is journal-only and structurally unable to
+reach a scanner command, which the fail-closed tests pin. A parity
+calculation failure refuses the fine scan loudly rather than silently
+falling back to the previous behaviour. Validated live on three frames with
+matched Nikon Scan output: the midtone bias fell from +6…+9.6 % to within
+about ±1 % on green and blue, with red retaining +2…+3 % pending a wire
+measurement of Nikon's red fine exposure.
+
+The scanner's film-presence state is now readable without moving film.
+`adapter_status` issues a bare TEST UNIT READY — no data phase, no
+transport motion — and maps the two captured verdicts (`000000` ready with
+medium, `023a00` medium not present) to a typed answer, refusing to guess
+on any other sense. A companion USB selector translates local device
+identifiers into exact bus/address locations and deliberately fails closed
+on remote SANE identifiers, so a status probe can never wander to a
+different scanner than the one that was opened. The probe answers presence
+only; it cannot promise a subsequent movement will succeed, and its
+docstring says so.
+
 Frame-selection legality no longer inherits the SEND(0x8f) page capacity.
 The physically addressable prefix and the fixed 37-record firmware page are
 two different things, but `_addressable_frame_origins` silently truncated
