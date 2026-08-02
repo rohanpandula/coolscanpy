@@ -20,9 +20,15 @@ Nikon-like diagnostic value is journal-only and structurally unable to
 reach a scanner command, which the fail-closed tests pin. A parity
 calculation failure refuses the fine scan loudly rather than silently
 falling back to the previous behaviour. Validated live on three frames with
-matched Nikon Scan output: the midtone bias fell from +6…+9.6 % to within
-about ±1 % on green and blue, with red retaining +2…+3 % pending a wire
-measurement of Nikon's red fine exposure.
+matched Nikon Scan output using v3 fine-scan fractions R 0.950337,
+G 0.987481, and B 0.983639. Nikon-referenced full-scale channel biases were
+R +0.823…+2.086 %, G +0.146…+1.033 %, and B -0.391…+0.822 %; mean absolute
+bias was 0.9129 %. Under the explicitly defined complement statistic
+(100 % minus mean absolute full-scale channel bias), that is 99.0871 %
+average full-scale RGB-channel agreement. Mean 8x8-smoothed ΔE00 improved
+from 2.8469 to 2.1413 (-24.8 %). These figures describe this three-frame
+validation set, not byte identity or a universal perceptual-accuracy
+percentage.
 
 The scanner's film-presence state is now readable without moving film.
 `adapter_status` issues a bare TEST UNIT READY — no data phase, no
