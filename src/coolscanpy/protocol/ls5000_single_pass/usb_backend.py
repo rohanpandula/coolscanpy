@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 
-_LIBUSB_BASENAMES = ("libusb-1.0.dylib", "libusb-1.0.0.dylib")
+_LIBUSB_BASENAMES = (
+    "libusb-1.0.dylib",
+    "libusb-1.0.0.dylib",
+    "libusb-1.0.so.0",
+    "libusb-1.0.so",
+)
 
 
 class LibusbBackendUnavailable(RuntimeError):
@@ -76,6 +81,9 @@ def get_libusb_backend() -> Any:
     Homebrew prefixes, or ambient dynamic-loader variables.
     """
 
+    import ctypes
+    import ctypes.util
+
     import usb.backend.libusb1
 
     if getattr(sys, "frozen", False):
@@ -84,7 +92,13 @@ def get_libusb_backend() -> Any:
             find_library=lambda _name: str(library)
         )
     else:
-        backend = usb.backend.libusb1.get_backend()
+        host_library = ctypes.util.find_library("usb-1.0")
+        if host_library is not None:
+            backend = usb.backend.libusb1.get_backend(
+                find_library=lambda _name: host_library
+            )
+        else:
+            backend = usb.backend.libusb1.get_backend()
     if backend is None:
         scope = "bundled" if getattr(sys, "frozen", False) else "host"
         raise LibusbBackendUnavailable(

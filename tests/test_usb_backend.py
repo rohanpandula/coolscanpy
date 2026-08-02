@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes.util
 import sys
 from pathlib import Path
 
@@ -55,3 +56,46 @@ def test_source_backend_uses_pyusb_host_lookup(monkeypatch: pytest.MonkeyPatch) 
 
     assert usb_backend.get_libusb_backend() is sentinel
     assert calls == [None]
+
+
+def test_frozen_bundle_resolver_finds_linux_so_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frameworks = tmp_path / "NegPy.app" / "Contents" / "Frameworks"
+    executable = tmp_path / "NegPy.app" / "Contents" / "MacOS" / "NegPy"
+    frameworks.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"app")
+    library = frameworks / "coolscanpy" / "_native" / "libusb-1.0.so.0"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"libusb")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+
+    assert usb_backend.bundled_libusb_path() == library.resolve()
+
+
+def test_source_backend_tries_find_library_before_pyusb_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    fake_library = "/fake/libusb-1.0.so.0"
+    captured: list[object] = []
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(
+        "ctypes.util.find_library",
+        lambda name: fake_library if name == "usb-1.0" else None,
+    )
+    monkeypatch.setattr(
+        "usb.backend.libusb1.get_backend",
+        lambda find_library=None: captured.append(find_library) or sentinel,
+    )
+
+    assert usb_backend.get_libusb_backend() is sentinel
+    assert len(captured) == 1
+    resolver = captured[0]
+    assert resolver is not None
+    assert resolver("usb-1.0") == fake_library
