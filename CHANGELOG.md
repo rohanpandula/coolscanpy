@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Whole-roll preview now keeps a content-supported leading frame when an
+otherwise valid feed places its fitted start exactly one 97-dpi preview row
+before the captured raster. The thumbnail is clamped to row zero, its
+same-capture transport origin is inferred from the validated interior mapping,
+and the frame remains blocked on explicit manual review; clips of two or more
+rows are still excluded fail-closed. This prevents a six-exposure strip from
+being silently presented as five after a one-row feed variation.
+
 C-41 fine scans now expose RGB the way Nikon Scan would. The meter loop's
 own converged solve consistently landed 6–9 % brighter than Nikon's
 rendering of the same physical frame, and matched-pair analysis against
