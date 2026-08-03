@@ -49,6 +49,7 @@ def test_source_backend_uses_pyusb_host_lookup(monkeypatch: pytest.MonkeyPatch) 
     sentinel = object()
     calls: list[object] = []
     monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr("ctypes.util.find_library", lambda _name: None)
     monkeypatch.setattr(
         "usb.backend.libusb1.get_backend",
         lambda find_library=None: calls.append(find_library) or sentinel,
