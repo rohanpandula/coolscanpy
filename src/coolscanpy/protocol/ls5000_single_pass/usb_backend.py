@@ -97,6 +97,10 @@ def get_libusb_backend() -> Any:
             backend = usb.backend.libusb1.get_backend(
                 find_library=lambda _name: host_library
             )
+            if backend is None:
+                # A stale/unloadable find_library candidate must not block
+                # PyUSB's default discovery.
+                backend = usb.backend.libusb1.get_backend()
         else:
             backend = usb.backend.libusb1.get_backend()
     if backend is None:
