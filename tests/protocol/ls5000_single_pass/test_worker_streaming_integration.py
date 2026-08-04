@@ -771,7 +771,7 @@ def _drive_two_frame_batch(
     )
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
-        worker_module, "_validate_scanner_identity", lambda _payload: None
+        worker_module, "_validate_scanner_identity", lambda _payload: "Nikon LS-5000 ED 1.03"
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_a: preview_windows

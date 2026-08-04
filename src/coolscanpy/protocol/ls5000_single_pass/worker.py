@@ -89,8 +89,11 @@ from .roll_index import (
 from .window import WindowBlock, decode_window_block
 from .streaming_sidecar import FineStreamSession
 
+from coolscanpy._logging import get_logger
 
 HERE = Path(__file__).resolve().parent
+LOGGER = get_logger(__name__)
+LOGGER = get_logger(__name__)
 DATA_PACKAGE = "coolscanpy.protocol.ls5000_single_pass.data"
 
 EXPECTED_FINE_CDB = "280000000001032c0080"
@@ -2652,7 +2655,16 @@ def _validate_live_meter_windows(
     return decoded
 
 
-def _validate_scanner_identity(payload: bytes) -> None:
+def _validate_scanner_identity(payload: bytes) -> str:
+    """Validate the standard INQUIRY identity and return its label.
+
+    Accepts a genuine Nikon ``LS-5000 ED`` at any firmware revision (1.02 and
+    1.03 are minor steps of the same command table; the synchronized-protocol
+    window checks that follow this gate remain in force and fail closed on any
+    real behavioral divergence). Keeps the exact 36-byte INQUIRY length check
+    and hard-fails any other vendor/product so genuinely unknown devices stay
+    rejected.
+    """
     if len(payload) != 36:
         raise SynchronizedProtocolError(
             f"standard INQUIRY returned {len(payload)} bytes, expected 36"
@@ -2660,11 +2672,12 @@ def _validate_scanner_identity(payload: bytes) -> None:
     vendor = payload[8:16].decode("ascii", errors="replace").strip()
     product = payload[16:32].decode("ascii", errors="replace").strip()
     revision = payload[32:36].decode("ascii", errors="replace").strip()
-    if (vendor, product, revision) != ("Nikon", "LS-5000 ED", "1.03"):
+    if (vendor, product) != ("Nikon", "LS-5000 ED"):
         raise SynchronizedProtocolError(
             "unexpected scanner identity "
             f"vendor={vendor!r} product={product!r} revision={revision!r}"
         )
+    return f"Nikon LS-5000 ED {revision}"
 
 
 def _validate_live_fine_windows(
@@ -3778,8 +3791,14 @@ def _run_live_continuation_frame(
     density_evidence: NikonDensityEvidence,
     actual_usb_bus: int,
     actual_usb_address: int,
+    scanner_identity: str = "Nikon LS-5000 ED 1.03",
 ) -> dict[str, Any]:
-    """Capture one later frame without reconnecting, reserving, or releasing."""
+    """Capture one later frame without reconnecting, reserving, or releasing.
+
+    ``scanner_identity`` carries the revision validated on the batch's first
+    INQUIRY (Lane A: any Nikon LS-5000 ED revision is accepted), so every
+    per-frame journal records the scanner's real firmware revision.
+    """
 
     if density_calibration.session_id != batch_job.session_id:
         raise ProtocolError(
@@ -3860,7 +3879,7 @@ def _run_live_continuation_frame(
         "completed_bytes": 0,
         "stall_recoveries": 0,
         "started_unix": time.time(),
-        "scanner_identity": "Nikon LS-5000 ED 1.03",
+        "scanner_identity": scanner_identity,
         "preview_geometry_validated_before_reads": True,
         "live_frame_selection": selection.diagnostics(),
         "manual_review_approval": (
@@ -4588,6 +4607,7 @@ def run_live_capture(
     reserved = False
     scan_active = False
     ready_required = False
+    scanner_identity: str | None = None
     meter_output = None
     fine_stream: FineStreamSession | None = None
     density_calibration_reads: list[DensityCalibrationRead] = []
@@ -4770,8 +4790,12 @@ def run_live_capture(
                     ready_required=ready_required,
                 )
                 if entry["seq"] == 1:
-                    _validate_scanner_identity(result.payload)
-                    journal["scanner_identity"] = "Nikon LS-5000 ED 1.03"
+                    scanner_identity = _validate_scanner_identity(result.payload)
+                    journal["scanner_identity"] = scanner_identity
+                    if session_journal is not None and session_journal_path is not None:
+                        session_journal["scanner_identity"] = scanner_identity
+                        _write_journal(session_journal_path, session_journal)
+                    LOGGER.info("scanner identity validated: %s", scanner_identity)
                 if entry["seq"] in DENSITY_CALIBRATION_SEQUENCES:
                     density_calibration_reads.append(
                         decode_density_calibration_read(
@@ -5522,6 +5546,7 @@ def run_live_capture(
                         density_evidence=density_evidence,
                         actual_usb_bus=actual_usb_bus,
                         actual_usb_address=actual_usb_address,
+                        scanner_identity=scanner_identity,
                     )
                     completed_slots.append(frame_spec.slot)
                     session_journal.update(
