@@ -126,6 +126,11 @@ class Thumbnail:
     spacing_offset: int
     needs_approval: bool
     warnings: tuple[str, ...]
+    # Lane C (D2): ``True`` when the frame's crop overlaps the preview so that
+    # >=90% of its height is inside but not 100% (a frame running off the top
+    # or bottom edge). ``None``/omitted for every full-cover frame -- strictly
+    # additive, so the wire only ever carries ``partial:true`` when it is set.
+    partial: bool | None = None
 
 
 @dataclass(frozen=True)

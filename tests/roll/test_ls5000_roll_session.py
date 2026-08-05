@@ -25,8 +25,11 @@ from coolscanpy.protocol.ls5000_single_pass.density import (
     build_nikon_density_evidence,
 )
 from coolscanpy.roll.preview_session import (
+    PARTIAL_FRAME_MIN_COVERAGE,
     CaptureRoute,
     RollSessionIntegrityError,
+    _crop_coverage,
+    _crop_state,
     _preview_binding_contract,
     build_roll_preview_session,
     reload_thumbnail,
@@ -301,6 +304,24 @@ def _preview_fixture(
         journal=journal,
     )
     return PreviewFixture(result=result, rgb=rgb)
+
+
+def test_c1_partial_frame_coverage_threshold() -> None:
+    # Lane C / D2: a frame with >=90% of its height inside the preview is
+    # partial (exposed), strictly below stays REFEED_REQUIRED.
+    # #19's exact shape: 1000-row frame with 923 rows inside -> 92.3%.
+    assert _crop_coverage(0, 1000, 923) == pytest.approx(0.923)
+    assert _crop_coverage(0, 1000, 850) == pytest.approx(0.85)
+    assert _crop_coverage(0, 1000, 1000) == 1.0
+    # A frame running off the TOP edge is partial too, not just the bottom.
+    assert _crop_coverage(-77, 1000, 1000) == pytest.approx(1000 / 1077)
+
+    assert _crop_state(0, 1000, 923) == "partial"
+    assert _crop_state(0, 1000, 850) == "refeed"
+    assert _crop_state(0, 1000, 1000) == "full"
+    # The >=90% boundary is partial (not refeed).
+    assert _crop_state(0, 1000, int(PARTIAL_FRAME_MIN_COVERAGE * 1000)) == "partial"
+    assert PARTIAL_FRAME_MIN_COVERAGE == 0.90
 
 
 def test_complete_preview_builds_fixed_order_session_with_exact_transport_origins(
