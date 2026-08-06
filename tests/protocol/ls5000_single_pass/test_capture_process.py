@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import FrozenInstanceError, dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -543,6 +546,84 @@ def test_batch_request_is_one_immutable_ordered_full_capture_unit() -> None:
         setattr(request, "frames", ())
 
 
+def _one_frame_batch_request(
+    exposure_override_10ns: object = None,
+) -> capture.CaptureBatchRequest:
+    return capture.CaptureBatchRequest(
+        frames=(
+            capture.CaptureRequest(
+                mode=capture.CaptureMode.FULL,
+                selected_slot=1,
+                boundary_offset_rows=0,
+            ),
+        ),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+        exposure_override_10ns=exposure_override_10ns,
+    )
+
+
+def test_batch_request_exposure_override_defaults_to_none_and_is_byte_identical() -> None:
+    """API surface default: omitting exposure_override_10ns is today's
+    behavior, unchanged."""
+
+    request = _one_frame_batch_request()
+
+    assert request.exposure_override_10ns is None
+
+
+def test_batch_request_accepts_a_valid_exposure_override() -> None:
+    request = _one_frame_batch_request((97_482, 195_597, 180_705))
+
+    assert request.exposure_override_10ns == (97_482, 195_597, 180_705)
+
+
+@pytest.mark.parametrize(
+    ("bad_override", "channel"),
+    [
+        ((0, 90_000, 90_000), "red"),
+        ((90_000, 0, 90_000), "green"),
+        ((90_000, 90_000, 0), "blue"),
+        ((-1, 90_000, 90_000), "red"),
+        ((90_000, -1, 90_000), "green"),
+        ((90_000, 90_000, -1), "blue"),
+        ((49_999, 90_000, 90_000), "red"),
+        ((90_000, 49_999, 90_000), "green"),
+        ((90_000, 90_000, 49_999), "blue"),
+        ((400_001, 90_000, 90_000), "red"),
+        ((90_000, 400_001, 90_000), "green"),
+        ((90_000, 90_000, 400_001), "blue"),
+    ],
+)
+def test_batch_request_refuses_exposure_override_ticks_outside_metered_bounds(
+    bad_override: tuple[int, int, int],
+    channel: str,
+) -> None:
+    """Validation reuses the AE contract machinery's own metered-tick
+    bounds (EXPOSURE_MIN/EXPOSURE_MAX in meter.py, currently [50_000,
+    400_000]) rather than inventing new ones, and names the offending
+    channel."""
+
+    with pytest.raises(ValueError, match=channel):
+        _one_frame_batch_request(bad_override)
+
+
+@pytest.mark.parametrize(
+    "bad_override",
+    [
+        (90_000, 90_000),
+        (90_000, 90_000, 90_000, 90_000),
+        "90000,90000,90000",
+        (90_000, 90_000, True),
+        (90_000, 90_000, 90_000.0),
+    ],
+)
+def test_batch_request_refuses_malformed_exposure_override_shape(bad_override: object) -> None:
+    with pytest.raises(ValueError, match="exposure_override_10ns"):
+        _one_frame_batch_request(bad_override)
+
+
 def test_roll_fingerprint_accepts_harmless_reread_noise_but_rejects_reordered_film() -> (
     None
 ):
@@ -807,6 +888,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
         "expected_usb_address": 2,
         "expected_usb_bus": 1,
+        "exposure_override_10ns": None,
         "frames": [
             {
                 "ack": "frame-017/parent-ack.json",
@@ -842,6 +924,38 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert hashlib.sha256(prepared.paths.job.read_bytes()).hexdigest() == (
         prepared.job_sha256
     )
+
+
+def test_prepare_batch_session_threads_exposure_override_into_the_batch_job(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """The exposure_override_10ns choke point on this side of the process
+    boundary: it must reach the published batch-job.json unchanged (as a
+    3-element array -- JSON has no tuple type), the one hand-off
+    capture_process.py owns between CaptureBatchRequest and the worker
+    subprocess that reads it back via load_validated_batch_job."""
+
+    runner = FakeRunner(binding.worker_sha256)
+    adapter = _adapter(tmp_path, binding, runner)
+    request = capture.CaptureBatchRequest(
+        frames=(
+            capture.CaptureRequest(
+                mode=capture.CaptureMode.FULL,
+                selected_slot=1,
+                boundary_offset_rows=0,
+            ),
+        ),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+        exposure_override_10ns=(97_482, 195_597, 180_705),
+    )
+
+    prepared = adapter.prepare_batch_session(request)
+    job = json.loads(prepared.paths.job.read_text(encoding="utf-8"))
+
+    assert job["exposure_override_10ns"] == [97_482, 195_597, 180_705]
 
 
 @pytest.mark.parametrize(
@@ -2443,3 +2557,1209 @@ def test_roll_fingerprint_rejects_all_sliver_rolls() -> None:
             source_preview_sha256="1" * 64,
             source_table_sha256="2" * 64,
         )
+
+
+# ===========================================================================
+# Held preview: begin_held_preview / resume_held_session / release_held_session
+#
+# These cover the refeed-elimination fix's five required scenarios directly
+# against the adapter (below Roll, mirroring this file's own FakeRunner/
+# inline-FakeBatchProcess convention): (a) a held preview never releases;
+# (b) resuming it launches no second worker process (i.e. no fresh
+# RESERVE_UNIT/command-64 -- both only ever happen inside a freshly spawned
+# child); (c) a cold run_batch_session's own argv is untouched by any of
+# this; (d) a held session that turns out to be dead maps to
+# HeldSessionExpired; (e) an explicit release publishes exactly one
+# release decision.
+# ===========================================================================
+
+
+@dataclass
+class FakeHeldBatchProcess:
+    """RunningBatchProcess double for a ``--preview-and-hold`` launch.
+
+    Mirrors the real worker's own two-phase shape (see
+    ``run_live_capture``'s ``preview_and_hold`` branch): writes an
+    ``awaiting-hold-job`` journal immediately, then ``poll()`` returns
+    ``None`` until ``hold-ack.json`` appears. ``"release"`` finalizes the
+    attempt journal as a released preview and exits; ``"scan"`` reads the
+    now-published ``hold-job.json`` and emits/acks frames exactly like this
+    file's own batch fakes (e.g. ``test_batch_parent_finalizes_each_frame_
+    before_acknowledging_the_next``'s local ``FakeBatchProcess``).
+    """
+
+    output_path: Path
+    journal_path: Path
+    hold_job_path: Path
+    hold_ack_path: Path
+    worker_sha256: str
+    hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
+    events: list[str] = field(default_factory=list)
+    journal_overrides: dict[str, Any] | None = None
+    _job: dict[str, Any] | None = field(default=None, init=False)
+    _frame_index: int = field(default=0, init=False)
+    _returncode: int | None = field(default=None, init=False)
+    # Set by _poll_batch() when a frame ack is "continue_hold": poll()
+    # notices this on the very next call, drops the finished batch, and
+    # resets hold_job_path/hold_ack_path/hold_session_id to the fresh
+    # round this names -- mirroring the real worker looping the same
+    # child back into wait_for_hold_decision.
+    held_resume: dict[str, str] | None = field(default=None, init=False)
+    # Where a "release"/"eject" hold-ack's completion receipt is written.
+    # Round 0 is journal_path itself (pre-populated by __post_init__
+    # below); a later round (after a continue_hold reset) is a fresh,
+    # dedicated file named by that round's own hold_resume -- matching
+    # the real worker's hold_wait_release_receipt_path.
+    _release_journal_path: Path = field(default=None, init=False)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.output_path.write_bytes(b"")
+        journal = {
+            "status": "awaiting-hold-job",
+            "capture_mode": "preview-and-hold",
+            "hold_session_id": self.hold_session_id,
+            "requested_frame": None,
+            "requested_boundary_offset_rows": 0,
+            "expected_frame_count": None,
+            "expected_reads": 0,
+            "completed_reads": 0,
+            "expected_bytes": 0,
+            "completed_bytes": 0,
+            "disk_bytes": 0,
+            "unit_released": False,
+            "recovery_required": None,
+            "output": str(self.output_path.resolve()),
+            "output_sha256": hashlib.sha256(b"").hexdigest(),
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "capture_engine_sha256": self.worker_sha256,
+        }
+        # journal_overrides corrupts exactly one published field while the
+        # child stays parked at the hold boundary -- the shape of every
+        # integrity refusal _wait_for_held_preview_ready can raise. The
+        # child itself keeps behaving normally (it minted a real
+        # hold_session_id and is still blocked on hold-ack.json), which is
+        # the whole point: the reservation is live while the parent refuses.
+        if self.journal_overrides is not None:
+            journal.update(self.journal_overrides)
+        self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        self.events.append("preview-hold-ready")
+        self._release_journal_path = self.journal_path
+
+    def die(self, returncode: int = 1) -> None:
+        """Simulate the child having already exited (crash, power cycle,
+        or an auto-eject the worker itself detected and gave up on) --
+        discovered only when a resume/release is attempted next."""
+
+        self._returncode = returncode
+
+    def poll(self) -> int | None:
+        if self._returncode is not None:
+            return self._returncode
+        if self._job is not None:
+            if self.held_resume is not None:
+                # The batch's own terminal frame ack was "continue_hold":
+                # it published a fresh hold_resume and is done polling.
+                # Drop it and reset to hold-wait at the paths it named --
+                # mirroring the real worker looping the same child back
+                # into wait_for_hold_decision.
+                resume = self.held_resume
+                self.held_resume = None
+                self._job = None
+                self._frame_index = 0
+                self.hold_job_path = Path(resume["hold_job_path"])
+                self.hold_ack_path = Path(resume["hold_ack_path"])
+                self.hold_session_id = resume["hold_session_id"]
+                self._release_journal_path = Path(resume["hold_release_journal_path"])
+                return None
+            return self._poll_batch()
+        if not self.hold_ack_path.exists():
+            return None
+        ack = json.loads(self.hold_ack_path.read_text(encoding="utf-8"))
+        self.events.append(f"hold-ack-{ack['action']}")
+        if ack["hold_session_id"] != self.hold_session_id:
+            # worker.wait_for_hold_decision exact-matches the id it minted
+            # and raises SynchronizedProtocolError otherwise. That lands in
+            # run_live_capture's synchronized-cleanup path, which still
+            # releases the unit but finalizes a failed journal and exits
+            # non-zero -- the honest outcome for a decision the parent could
+            # only publish unbound, and still an exit rather than a child
+            # left holding the reservation for the wait's full timeout.
+            journal = json.loads(self.journal_path.read_text(encoding="utf-8"))
+            journal.update(
+                status="failed",
+                error="SynchronizedProtocolError: hold decision has an "
+                "unexpected hold_session_id",
+                recovery_required="none",
+                unit_released=True,
+            )
+            self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+            self.events.append("hold-ack-refused")
+            self._returncode = 1
+            return 1
+        if ack["action"] == "release":
+            journal = (
+                json.loads(self._release_journal_path.read_text(encoding="utf-8"))
+                if self._release_journal_path.exists()
+                else {}
+            )
+            journal.update(
+                status="complete",
+                capture_mode="preview-and-hold",
+                hold_outcome="released",
+                unit_released=True,
+            )
+            self._release_journal_path.write_text(
+                json.dumps(journal), encoding="utf-8"
+            )
+            self._returncode = 0
+            return 0
+        if ack["action"] == "eject":
+            # Mirrors "release" (still a preview-and-hold attempt that never
+            # scanned) but with the traced eject sequence's own evidence
+            # recorded, exactly as worker.py's real teardown does.
+            journal = (
+                json.loads(self._release_journal_path.read_text(encoding="utf-8"))
+                if self._release_journal_path.exists()
+                else {}
+            )
+            journal.update(
+                status="complete",
+                capture_mode="preview-and-hold",
+                hold_outcome="ejected",
+                unit_released=True,
+                eject={
+                    "eject_cdb_status": "0000000000000000",
+                    "eject_execute_status": "0000000000000000",
+                    "terminal_sense": "023a00",
+                    "wait_polls": 5,
+                    "stall_recoveries": 0,
+                },
+            )
+            self._release_journal_path.write_text(
+                json.dumps(journal), encoding="utf-8"
+            )
+            self._returncode = 0
+            return 0
+        self._job = json.loads(self.hold_job_path.read_text(encoding="utf-8"))
+        # The real worker overwrites the session journal to "capturing"
+        # immediately on processing "scan", strictly before it captures
+        # anything -- sequentially before the frame this round's own
+        # frame-complete journal reports. That ordering is what keeps a
+        # later round's own _resolve_held_after_batch poll from ever
+        # observing a *previous* round's stale "held" entry still sitting
+        # in the same file: by the time the parent sees this round's frame
+        # complete, "capturing" has already superseded it. Mirror that
+        # here, or a third (or later) round-ending continue_hold can race
+        # and validate against the wrong round's session_id.
+        session_journal_path = self.hold_job_path.with_name("session-journal.json")
+        session_journal_path.write_text(
+            json.dumps(
+                {
+                    **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+                    "completed_slots": [],
+                    "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+                    "plan_sha256": CANONICAL_PLAN_SHA256,
+                    "recovery_required": None,
+                    "reservation_acquired": True,
+                    "selected_slots": [item["slot"] for item in self._job["frames"]],
+                    "session_id": self._job["session_id"],
+                    "status": "capturing",
+                    "unit_release_attempts": 0,
+                    "unit_released": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._emit_frame()
+        return None
+
+    def _emit_frame(self) -> None:
+        assert self._job is not None
+        frame = self._job["frames"][self._frame_index]
+        directory = self.hold_job_path.parent
+        output = directory / frame["output"]
+        frame_journal = directory / frame["journal"]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("xb") as stream:
+            stream.truncate(CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES)
+        density, preview_sha, table_sha = _batch_density_frame_provenance(
+            self.hold_job_path,
+            output=output,
+            frame_index=self._frame_index + 1,
+            selected_slot=frame["slot"],
+        )
+        frame_journal.write_text(
+            json.dumps(
+                {
+                    **_density_calibration_provenance(self._job["session_id"]),
+                    **density,
+                    "ack_nonce": f"nonce-{frame['slot']}",
+                    "batch_session": {
+                        "frame_index": self._frame_index + 1,
+                        "frame_total": len(self._job["frames"]),
+                        "selected_slots": [item["slot"] for item in self._job["frames"]],
+                        "session_id": self._job["session_id"],
+                    },
+                    "capture_engine_sha256": self.worker_sha256,
+                    "capture_mode": "full",
+                    "completed_bytes": CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES,
+                    "completed_reads": CANONICAL_FINE_READ_COUNT,
+                    "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+                    "disk_bytes": CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES,
+                    "expected_bytes": CANONICAL_FINE_READ_COUNT * CANONICAL_FINE_READ_BYTES,
+                    "expected_reads": CANONICAL_FINE_READ_COUNT,
+                    "frame_complete": True,
+                    "live_frame_selection": {
+                        "frame": frame["slot"],
+                        "preview_sha256": preview_sha,
+                        "table_sha256": table_sha,
+                        "roll_identity": _roll_identity_evidence(
+                            self._job["reviewed_roll_fingerprint"]["binding_sha256"],
+                            slot=frame["slot"],
+                        ),
+                    },
+                    "manual_review_approval": frame["manual_review_approval"],
+                    "output": str(output.resolve()),
+                    "output_sha256": "a" * 64,
+                    "plan_sha256": CANONICAL_PLAN_SHA256,
+                    "recovery_required": None,
+                    "requested_boundary_offset_rows": frame["boundary_offset_rows"],
+                    "requested_frame": frame["slot"],
+                    "reviewed_roll_fingerprint_sha256": (
+                        self._job["reviewed_roll_fingerprint"]["binding_sha256"]
+                    ),
+                    "session_reservation_retained": True,
+                    "status": "frame-complete",
+                    "unit_released": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.events.append(f"ready-{frame['slot']}")
+
+    def _poll_batch(self) -> int | None:
+        assert self._job is not None
+        frame = self._job["frames"][self._frame_index]
+        ack_path = self.hold_job_path.parent / frame["ack"]
+        if not ack_path.exists():
+            return None
+        ack = json.loads(ack_path.read_text(encoding="utf-8"))
+        self.events.append(f"ack-{frame['slot']}-{ack['action']}")
+        if ack["action"] == "continue" and self._frame_index + 1 < len(self._job["frames"]):
+            self._frame_index += 1
+            self._emit_frame()
+            return None
+        completed = [item["slot"] for item in self._job["frames"][: self._frame_index + 1]]
+        if ack["action"] == "continue_hold":
+            # This batch's own terminal frame chose to keep the
+            # reservation held instead of releasing: publish a fresh
+            # round's hold_resume into the session journal (status
+            # "held", unit_released False) and record it on self so the
+            # very next poll() resets to a fresh hold-wait -- see poll()'s
+            # own held_resume branch above.
+            next_hold_session_id = secrets.token_hex(16)
+            next_hold_job_path = self.hold_job_path.with_name(
+                f"hold-job-{next_hold_session_id}.json"
+            )
+            next_hold_ack_path = self.hold_job_path.with_name(
+                f"hold-ack-{next_hold_session_id}.json"
+            )
+            resume = {
+                "hold_session_id": next_hold_session_id,
+                "hold_job_path": str(next_hold_job_path),
+                "hold_ack_path": str(next_hold_ack_path),
+                "hold_release_journal_path": str(
+                    self.hold_job_path.with_name(
+                        f"hold-release-{next_hold_session_id}.json"
+                    )
+                ),
+            }
+            session_journal_path = self.hold_job_path.with_name("session-journal.json")
+            session_journal = {
+                **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+                "completed_slots": completed,
+                "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+                "plan_sha256": CANONICAL_PLAN_SHA256,
+                "recovery_required": None,
+                "reservation_acquired": True,
+                "selected_slots": [item["slot"] for item in self._job["frames"]],
+                "session_id": self._job["session_id"],
+                "status": "held",
+                "unit_release_attempts": 0,
+                "unit_released": False,
+                "hold_resume": resume,
+            }
+            session_journal_path.write_text(
+                json.dumps(session_journal), encoding="utf-8"
+            )
+            self.held_resume = resume
+            return None
+        session_journal_path = self.hold_job_path.with_name("session-journal.json")
+        ejected = ack["action"] == "eject"
+        session_journal: dict[str, Any] = {
+            **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+            "completed_slots": completed,
+            "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "recovery_required": "none",
+            "reservation_acquired": True,
+            "selected_slots": [item["slot"] for item in self._job["frames"]],
+            "session_id": self._job["session_id"],
+            "status": "ejected" if ejected else ("stopped" if ack["action"] == "stop" else "complete"),
+            "unit_release_attempts": 1,
+            "unit_released": True,
+        }
+        if ejected:
+            # Mirrors worker.py's own _perform_vendor_eject evidence shape.
+            session_journal["eject"] = {
+                "eject_cdb_status": "0000000000000000",
+                "eject_execute_status": "0000000000000000",
+                "terminal_sense": "023a00",
+                "wait_polls": 5,
+                "stall_recoveries": 0,
+            }
+        session_journal_path.write_text(json.dumps(session_journal), encoding="utf-8")
+        self._returncode = 0
+        return 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        while self.poll() is None:
+            pass
+        return int(self._returncode)
+
+
+def _held_spawner(
+    spawn_calls: list[tuple[str, ...]],
+    worker_sha256: str,
+    *,
+    children: list[FakeHeldBatchProcess] | None = None,
+    journal_overrides: dict[str, Any] | None = None,
+):
+    def spawn(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+    ) -> FakeHeldBatchProcess:
+        del cwd, stdout, stderr
+        spawn_calls.append(tuple(argv))
+        hold_job_path = Path(_argument(argv, "--hold-job"))
+        child = FakeHeldBatchProcess(
+            output_path=Path(_argument(argv, "--output")),
+            journal_path=Path(_argument(argv, "--journal")),
+            hold_job_path=hold_job_path,
+            hold_ack_path=hold_job_path.with_name("hold-ack.json"),
+            worker_sha256=worker_sha256,
+            journal_overrides=journal_overrides,
+        )
+        if children is not None:
+            children.append(child)
+        return child
+
+    return spawn
+
+
+def _held_adapter(
+    tmp_path: Path,
+    binding: Binding,
+    spawn_calls: list[tuple[str, ...]],
+    *,
+    children: list[FakeHeldBatchProcess] | None = None,
+    journal_overrides: dict[str, Any] | None = None,
+) -> capture.CaptureProcessAdapter:
+    return capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        batch_spawner=_held_spawner(
+            spawn_calls,
+            binding.worker_sha256,
+            children=children,
+            journal_overrides=journal_overrides,
+        ),
+        batch_poll_seconds=0,
+    )
+
+
+def test_begin_held_preview_never_releases(tmp_path: Path, binding: Binding) -> None:
+    """(a) A held preview's own attempt journal must report the reservation
+    is still held, never released -- run_attempt(PREVIEW)'s worker.py path
+    always calls _release_unit; --preview-and-hold's must not."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    assert held.preview_attempt.outcome is capture.CaptureOutcome.COMPLETE
+    assert held.preview_attempt.journal is not None
+    assert held.preview_attempt.journal["status"] == "awaiting-hold-job"
+    assert held.preview_attempt.journal["unit_released"] is False
+    assert "--preview-and-hold" in held.preview_attempt.argv
+    assert "--preview-only" not in held.preview_attempt.argv
+    assert held.process.poll() is None
+    assert len(spawn_calls) == 1
+    assert held.usable is True
+
+
+def test_resume_held_session_launches_no_new_worker_process(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(b) Resuming a held preview into scan_many's batch must not spawn a
+    second worker process -- RESERVE_UNIT and command 64 only ever happen
+    inside a freshly spawned child's own preamble walk, so "one spawn total"
+    is this hardware-free suite's faithful proxy for "neither was repeated"."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    assert len(spawn_calls) == 1
+
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE
+    )
+
+    assert len(spawn_calls) == 1, "resume must reuse the held child, not spawn another"
+    assert result.outcome is capture.CaptureOutcome.COMPLETE
+    assert result.session_journal["reservation_acquired"] is True
+    assert result.session_journal["unit_released"] is True
+    assert result.session_journal["unit_release_attempts"] == 1
+
+
+def test_cold_run_batch_session_argv_is_unchanged_by_held_preview_support(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(c) A batch prepared with no held preview involved at all must keep
+    launching with exactly the pre-existing --batch-job argv shape -- no
+    --hold-job, no --preview-and-hold -- proving begin_held_preview/
+    resume_held_session are purely additive to the cold path."""
+
+    adapter = _adapter(tmp_path, binding, FakeRunner(binding.worker_sha256))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+
+    prepared = adapter.prepare_batch_session(request)
+
+    assert "--hold-job" not in prepared.argv
+    assert "--preview-and-hold" not in prepared.argv
+    assert _argument(prepared.argv, "--batch-job") == str(prepared.paths.job)
+    assert _argument(prepared.argv, "--session-journal") == str(prepared.paths.session_journal)
+
+
+def test_resume_held_session_after_child_death_raises_held_session_expired(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(d) If the held child is no longer running by the time a resume is
+    attempted (auto-eject, crash, power cycle), resume_held_session must
+    fail closed with HeldSessionExpired rather than assume the reservation
+    is still good -- Roll._scan_many maps this to RefeedRequired."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    assert isinstance(held.process, FakeHeldBatchProcess)
+    held.process.die(returncode=1)
+
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    with pytest.raises(capture.HeldSessionExpired):
+        adapter.resume_held_session(
+            held, request, frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE
+        )
+    assert len(spawn_calls) == 1, "a dead held child must never trigger a fresh spawn either"
+
+
+def test_release_held_session_publishes_exactly_one_release_decision(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(e) An explicit release must publish exactly one release decision
+    and leave the child's own journal honestly reporting the release --
+    mirroring the pinned worker's own _release_unit-is-sent-once contract."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    journal = adapter.release_held_session(held)
+
+    assert journal["status"] == "complete"
+    assert journal["capture_mode"] == "preview-and-hold"
+    assert journal["hold_outcome"] == "released"
+    assert journal["unit_released"] is True
+    ack = json.loads(held.hold_ack_path.read_text(encoding="utf-8"))
+    assert ack == {
+        "action": "release",
+        "hold_session_id": held.hold_session_id,
+        "schema_version": 1,
+    }
+    # The exclusive-publish primitive underneath is the actual "exactly
+    # once" guarantee (release_held_session itself is safely idempotent on
+    # top of it, since a second call sees the child already exited and
+    # skips republishing) -- calling it directly proves a second decision
+    # for this session can never land.
+    with pytest.raises(FileExistsError):
+        adapter._publish_hold_ack(held, action="release")
+    # release_held_session itself stays idempotent: a second call is a
+    # harmless re-confirmation, not a second RELEASE_UNIT.
+    assert adapter.release_held_session(held) == journal
+
+
+def test_eject_held_session_publishes_exactly_one_eject_decision(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """The "operator saw the preview, wants out" case: eject_held_session
+    is release_held_session's sibling, not a parameterization of it -- a
+    different hold-ack action, a different terminal hold_outcome."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    journal = adapter.eject_held_session(held)
+
+    assert journal["status"] == "complete"
+    assert journal["capture_mode"] == "preview-and-hold"
+    assert journal["hold_outcome"] == "ejected"
+    assert journal["unit_released"] is True
+    assert journal["eject"]["terminal_sense"] == "023a00"
+    ack = json.loads(held.hold_ack_path.read_text(encoding="utf-8"))
+    assert ack == {
+        "action": "eject",
+        "hold_session_id": held.hold_session_id,
+        "schema_version": 1,
+    }
+    with pytest.raises(FileExistsError):
+        adapter._publish_hold_ack(held, action="eject")
+    # eject_held_session itself stays idempotent: a second call is a
+    # harmless re-confirmation, not a second eject sequence.
+    assert adapter.eject_held_session(held) == journal
+
+
+def test_eject_held_session_surfaces_worker_recovery_diagnosis_on_failure(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """A suspected transport wedge (worker.EjectWedgeSuspected) exits the
+    held child non-zero with recovery_required forced to the power-cycle
+    string even though the defensive release still succeeded (see that
+    exception's own docstring). eject_held_session must surface exactly
+    that diagnosis in its raised message -- callers (Roll.eject()) match
+    on it to translate into FeederParked, the same idiom this package
+    already uses elsewhere for worker-diagnosis translation."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    @dataclass
+    class _WedgedEjectProcess:
+        hold_ack_path: Path
+        journal_path: Path
+        hold_session_id: str
+        _returncode: int | None = field(default=None, init=False)
+
+        def poll(self) -> int | None:
+            if self._returncode is not None:
+                return self._returncode
+            if not self.hold_ack_path.exists():
+                return None
+            ack = json.loads(self.hold_ack_path.read_text(encoding="utf-8"))
+            assert ack == {
+                "action": "eject",
+                "hold_session_id": self.hold_session_id,
+                "schema_version": 1,
+            }
+            journal = json.loads(self.journal_path.read_text(encoding="utf-8"))
+            journal.update(
+                status="failed",
+                capture_mode="preview-and-hold",
+                error=(
+                    "EjectWedgeSuspected: eject wait: no motion observed "
+                    "within 36s of the eject command (sense stayed "
+                    "000000); matches the documented "
+                    "accepted-without-actuation wedge signature -- power "
+                    "cycle required, do not retry"
+                ),
+                recovery_required="power-cycle scanner before another attempt",
+                # The defensive release inside _cleanup_synchronized still
+                # succeeded -- this is the exact combination the wedge
+                # diagnosis must survive, not get masked by.
+                unit_released=True,
+            )
+            self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
+            self._returncode = 1
+            return 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            while self.poll() is None:
+                pass
+            return int(self._returncode)
+
+    wedged_held = replace(
+        held,
+        process=_WedgedEjectProcess(
+            hold_ack_path=held.hold_ack_path,
+            journal_path=held.preview_attempt.paths.journal,
+            hold_session_id=held.hold_session_id,
+        ),
+    )
+
+    with pytest.raises(
+        capture.CaptureProcessError,
+        match="power-cycle scanner before another attempt",
+    ):
+        adapter.eject_held_session(wedged_held)
+
+
+def test_resume_held_session_with_eject_frame_handler_marks_batch_result_ejected(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(c) task requirement: batch + eject_after ends with eject-then-
+    release ordering pinned, at the level this hardware-free suite can
+    prove it -- the worker's own byte-level ordering is pinned separately
+    in test_worker.py. frame_handler returning EJECT (Roll.scan_many's
+    eject_after on the last requested slot) must mark the returned
+    CaptureBatchResult ejected -- distinct from, and mutually exclusive
+    with, stopped -- and the session journal's status must say "ejected",
+    not "complete" or "stopped"."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _frame: capture.BatchAckAction.EJECT
+    )
+
+    assert result.outcome is capture.CaptureOutcome.COMPLETE
+    assert result.ejected is True
+    assert result.stopped is False
+    assert result.session_journal["status"] == "ejected"
+    assert result.session_journal["unit_released"] is True
+    assert result.session_journal["eject"]["terminal_sense"] == "023a00"
+
+
+def test_resume_held_session_with_continue_hold_returns_held_again(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """Multi-batch-per-feed, the core new contract: frame_handler
+    returning CONTINUE_HOLD on a batch's terminal frame must not release
+    -- the returned CaptureBatchResult carries a fresh held_again
+    (mutually exclusive with stopped/ejected), and the session journal
+    reports the reservation still held (unit_released False), never
+    "complete"/"stopped"/"ejected"."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE_HOLD
+    )
+
+    assert len(spawn_calls) == 1, "held_again must reuse the same child, not spawn another"
+    assert result.outcome is capture.CaptureOutcome.COMPLETE
+    assert result.stopped is False
+    assert result.ejected is False
+    assert result.session_journal["status"] == "held"
+    assert result.session_journal["unit_released"] is False
+    assert result.held_again is not None
+    assert result.held_again.usable is True
+    assert result.held_again.process is held.process
+    assert result.held_again.hold_session_id != held.hold_session_id
+    assert result.held_again.hold_job_path != held.hold_job_path
+    assert result.held_again.hold_ack_path != held.hold_ack_path
+    assert result.held_again.directory == held.directory
+
+
+def test_resume_held_session_can_be_called_again_after_continue_hold(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(a) task requirement: a second resume_held_session() on the
+    held_again from a first CONTINUE_HOLD batch resumes the very same
+    child a second time -- still no new spawn -- and completes normally
+    when its own terminal frame answers CONTINUE this time."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    first_request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    first = adapter.resume_held_session(
+        held,
+        first_request,
+        frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE_HOLD,
+    )
+    assert first.held_again is not None
+
+    second_request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 2, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    second = adapter.resume_held_session(
+        first.held_again,
+        second_request,
+        frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE,
+    )
+
+    assert len(spawn_calls) == 1, "the second resume must reuse the one held child"
+    assert second.outcome is capture.CaptureOutcome.COMPLETE
+    assert second.stopped is False
+    assert second.ejected is False
+    assert second.held_again is None
+    assert second.session_journal["status"] == "complete"
+    assert second.session_journal["unit_released"] is True
+    assert second.session_journal["unit_release_attempts"] == 1
+    assert second.session_journal["selected_slots"] == [2]
+    assert second.session_journal["completed_slots"] == [2]
+
+
+def test_three_resumes_then_eject_ends_with_one_eject_and_one_release(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(b) task requirement: three separate resumes on one held child --
+    the first two ending with CONTINUE_HOLD, the third with EJECT -- must
+    produce exactly one eject and one release, only on the third, with
+    the reservation reported held (never released) after the first two."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    def request_for(slot: int) -> capture.CaptureBatchRequest:
+        return capture.CaptureBatchRequest(
+            (capture.CaptureRequest(capture.CaptureMode.FULL, slot, 0),),
+            reviewed_fingerprint=_reviewed_fingerprint(),
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        )
+
+    first = adapter.resume_held_session(
+        held, request_for(1), frame_handler=lambda _f: capture.BatchAckAction.CONTINUE_HOLD
+    )
+    assert first.held_again is not None
+    assert first.session_journal["unit_released"] is False
+
+    second = adapter.resume_held_session(
+        first.held_again,
+        request_for(2),
+        frame_handler=lambda _f: capture.BatchAckAction.CONTINUE_HOLD,
+    )
+    assert second.held_again is not None
+    assert second.session_journal["unit_released"] is False
+
+    third = adapter.resume_held_session(
+        second.held_again,
+        request_for(3),
+        frame_handler=lambda _f: capture.BatchAckAction.EJECT,
+    )
+
+    assert len(spawn_calls) == 1, "all three resumes share the one held child"
+    assert third.held_again is None
+    assert third.ejected is True
+    assert third.stopped is False
+    assert third.session_journal["status"] == "ejected"
+    assert third.session_journal["unit_released"] is True
+    assert third.session_journal["unit_release_attempts"] == 1
+    assert third.session_journal["eject"]["terminal_sense"] == "023a00"
+
+
+def test_release_held_session_works_on_a_held_again_session(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(c) task requirement: release_held_session (Roll.release()'s own
+    adapter call) works unmodified on a held_again session from a prior
+    CONTINUE_HOLD batch, exactly like it already does on the original
+    preview's own held session -- same validated receipt shape, read from
+    the fresh per-round file this round's own hold_resume named, not the
+    original (unrelated) preview attempt journal."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _f: capture.BatchAckAction.CONTINUE_HOLD
+    )
+    held_again = result.held_again
+    assert held_again is not None
+
+    journal = adapter.release_held_session(held_again)
+
+    assert journal["status"] == "complete"
+    assert journal["capture_mode"] == "preview-and-hold"
+    assert journal["hold_outcome"] == "released"
+    assert journal["unit_released"] is True
+    # release_held_session itself stays idempotent, exactly like the
+    # original held session's own contract.
+    assert adapter.release_held_session(held_again) == journal
+
+
+def test_eject_held_session_works_on_a_held_again_session(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(c)/(f) task requirement: eject_held_session (Roll.eject() between
+    batches) works unmodified on a held_again session too."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _f: capture.BatchAckAction.CONTINUE_HOLD
+    )
+    held_again = result.held_again
+    assert held_again is not None
+
+    journal = adapter.eject_held_session(held_again)
+
+    assert journal["status"] == "complete"
+    assert journal["capture_mode"] == "preview-and-hold"
+    assert journal["hold_outcome"] == "ejected"
+    assert journal["unit_released"] is True
+    assert journal["eject"]["terminal_sense"] == "023a00"
+
+
+def test_resume_after_continue_hold_and_child_death_raises_held_session_expired(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(d) task requirement: if the held child dies between batches (auto-
+    eject, crash, power cycle) after a CONTINUE_HOLD, the next
+    resume_held_session on that held_again must fail closed with
+    HeldSessionExpired -- the same contract the original preview's held
+    session already has, now proven across a batch boundary too."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    adapter = _held_adapter(tmp_path, binding, spawn_calls)
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    result = adapter.resume_held_session(
+        held, request, frame_handler=lambda _f: capture.BatchAckAction.CONTINUE_HOLD
+    )
+    held_again = result.held_again
+    assert held_again is not None
+    assert isinstance(held_again.process, FakeHeldBatchProcess)
+    held_again.process.die(returncode=1)
+
+    second_request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 2, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    with pytest.raises(capture.HeldSessionExpired):
+        adapter.resume_held_session(
+            held_again,
+            second_request,
+            frame_handler=lambda _f: capture.BatchAckAction.CONTINUE,
+        )
+    assert len(spawn_calls) == 1, "a dead held_again child must never trigger a fresh spawn"
+
+
+def test_load_and_validate_batch_session_journal_accepts_ejected_status(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """A successfully ejected batch's own status must be "ejected", not
+    "complete" -- proves _load_and_validate_batch_session_journal's
+    expected_status computation, independent of the fuller resume flow
+    above."""
+
+    adapter = _adapter(tmp_path, binding, FakeRunner(binding.worker_sha256))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    prepared = adapter.prepare_batch_session(request)
+    handled = [SimpleNamespace(request=SimpleNamespace(selected_slot=17))]
+    prepared.paths.session_journal.write_text(
+        json.dumps(
+            {
+                **_batch_session_provenance(prepared.paths.job, binding.worker_sha256),
+                "completed_slots": [17],
+                "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+                "plan_sha256": CANONICAL_PLAN_SHA256,
+                "recovery_required": "none",
+                "reservation_acquired": True,
+                "selected_slots": [17],
+                "session_id": prepared.session_id,
+                "status": "ejected",
+                "unit_release_attempts": 1,
+                "unit_released": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = adapter._load_and_validate_batch_session_journal(
+        prepared,
+        returncode=0,
+        handled=handled,
+        stopped=False,
+        ejected=True,
+    )
+
+    assert payload["status"] == "ejected"
+
+
+def test_load_and_validate_batch_session_journal_tolerates_wedge_after_clean_release_only_when_ejected(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """(d) task requirement: the exact dangerous combination this feature
+    introduces -- unit_released=True (the defensive RELEASE_UNIT
+    succeeded) alongside recovery_required=power-cycle (the transport
+    itself may still be wedged) -- must be accepted ONLY when this batch
+    actually requested an eject. For every other caller (ejected=False,
+    every batch that existed before this feature), that exact combination
+    must still fail closed as internally inconsistent, unchanged."""
+
+    adapter = _adapter(tmp_path, binding, FakeRunner(binding.worker_sha256))
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 17, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+    prepared = adapter.prepare_batch_session(request)
+    handled = [SimpleNamespace(request=SimpleNamespace(selected_slot=17))]
+    journal_payload = {
+        **_batch_session_provenance(prepared.paths.job, binding.worker_sha256),
+        "completed_slots": [17],
+        "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+        "plan_sha256": CANONICAL_PLAN_SHA256,
+        "recovery_required": capture.POWER_CYCLE_RECOVERY,
+        "reservation_acquired": True,
+        "selected_slots": [17],
+        "session_id": prepared.session_id,
+        "status": "failed",
+        "unit_release_attempts": 1,
+        "unit_released": True,
+    }
+    prepared.paths.session_journal.write_text(json.dumps(journal_payload), encoding="utf-8")
+
+    # ejected=True: this is the one caller allowed to see this exact
+    # combination -- worker.py's own EjectWedgeSuspected override.
+    payload = adapter._load_and_validate_batch_session_journal(
+        prepared,
+        returncode=1,
+        handled=handled,
+        stopped=False,
+        ejected=True,
+    )
+    assert payload["recovery_required"] == capture.POWER_CYCLE_RECOVERY
+    assert payload["unit_released"] is True
+
+    # ejected=False: the exact same journal content must still be rejected
+    # -- the relaxation must never widen to a batch that never asked to
+    # eject in the first place.
+    with pytest.raises(capture.CaptureProcessError, match="internally inconsistent"):
+        adapter._load_and_validate_batch_session_journal(
+            prepared,
+            returncode=1,
+            handled=handled,
+            stopped=False,
+            ejected=False,
+        )
+
+
+# ===========================================================================
+# begin_held_preview refusing a child that already reached the hold boundary
+#
+# _wait_for_held_preview_ready validates four journal fields only after the
+# child reports awaiting-hold-job -- i.e. while that child is alive, blocked
+# in wait_for_hold_decision, and holding the scanner's reservation. Each
+# refusal raises CaptureIntegrityError out of begin_held_preview, which
+# returns no session at all, so no caller can ever be handed a handle to
+# release that child with. Roll.preview()'s own orphan fix cannot reach this
+# case for exactly that reason: it can only track a session that was
+# returned. The release has to happen inside the adapter, before the raise
+# leaves begin_held_preview.
+# ===========================================================================
+
+
+def test_bad_hold_session_id_releases_the_held_child_instead_of_orphaning_it(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """A malformed hold_session_id is the one refusal with no well-formed
+    release decision available -- the parent cannot echo an id it just
+    rejected as invalid. It must still publish the decision it has and reap
+    the child: an unbound decision fails the worker's wait closed through
+    the synchronized-cleanup path that releases the unit, whereas publishing
+    nothing leaves the reservation held until wait_for_hold_decision's own
+    half-hour timeout. Orphaning it was the defect."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    adapter = _held_adapter(
+        tmp_path,
+        binding,
+        spawn_calls,
+        children=children,
+        journal_overrides={"hold_session_id": "too-short"},
+    )
+
+    with pytest.raises(capture.CaptureIntegrityError, match="hold_session_id") as excinfo:
+        adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    assert len(children) == 1
+    child = children[0]
+    assert child.poll() is not None, (
+        "the refused child must be reaped, not left alive holding the "
+        "scanner's reservation"
+    )
+    assert child.events == [
+        "preview-hold-ready",
+        "hold-ack-release",
+        "hold-ack-refused",
+    ], "the child must be told to release before the refusal propagates"
+    ack = json.loads(child.hold_ack_path.read_text(encoding="utf-8"))
+    assert ack == {
+        "action": "release",
+        "hold_session_id": "too-short",
+        "schema_version": 1,
+    }
+    assert len(spawn_calls) == 1, "a refusal must never trigger a fresh spawn"
+    assert any(
+        "held preview child" in note for note in getattr(excinfo.value, "__notes__", [])
+    ), "the propagating refusal must record what happened to the child"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"capture_mode": "preview"}, "capture_mode"),
+        ({"output": "/not/this/attempt/preview.raw"}, "output path"),
+        ({"plan_sha256": "0" * 64}, "canonical plan"),
+    ],
+    ids=["capture-mode", "output-path", "plan-sha256"],
+)
+def test_refused_held_preview_journal_cleanly_releases_the_held_child(
+    tmp_path: Path,
+    binding: Binding,
+    overrides: dict[str, Any],
+    match: str,
+) -> None:
+    """The other three refusals all happen after hold_session_id validated,
+    so the still-valid id in the journal buys a properly bound release: the
+    child takes the decision, releases the unit, and exits 0, exactly as an
+    explicit release_held_session would have driven it. The refusal itself
+    still propagates unchanged."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    adapter = _held_adapter(
+        tmp_path, binding, spawn_calls, children=children, journal_overrides=overrides
+    )
+
+    with pytest.raises(capture.CaptureIntegrityError, match=match):
+        adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    assert len(children) == 1
+    child = children[0]
+    assert child.events == ["preview-hold-ready", "hold-ack-release"]
+    assert child.poll() == 0
+    journal = json.loads(child.journal_path.read_text(encoding="utf-8"))
+    assert journal["hold_outcome"] == "released"
+    assert journal["unit_released"] is True
+    assert len(spawn_calls) == 1
+
+
+def test_a_refused_held_preview_leaves_the_adapter_able_to_start_another(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """The release happens under the same _attempt_lock begin_held_preview
+    already holds, so a refusal must not deadlock or poison the adapter: a
+    caller that catches CaptureIntegrityError and retries gets a normal
+    held session, with the refused child already gone."""
+
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    overrides: dict[str, Any] = {"hold_session_id": "too-short"}
+    adapter = _held_adapter(
+        tmp_path,
+        binding,
+        spawn_calls,
+        children=children,
+        journal_overrides=overrides,
+    )
+
+    with pytest.raises(capture.CaptureIntegrityError):
+        adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+    # The spawner holds this exact dict by reference, so emptying it is what
+    # makes only the first child publish a bad journal.
+    overrides.clear()
+    held = adapter.begin_held_preview(capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW))
+
+    assert held.usable is True
+    assert held.process.poll() is None
+    assert children[0].poll() is not None, "the refused child stays reaped"
+    assert len(spawn_calls) == 2

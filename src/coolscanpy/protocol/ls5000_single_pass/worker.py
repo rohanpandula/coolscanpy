@@ -228,6 +228,63 @@ def _meter_layout_receipt() -> dict[str, object]:
         "row_tail_bytes": 312,
     }
 
+# End-of-session eject, traced byte-exact from the vendor's own Nikon Scan 4
+# USB capture (negfit/data/usb-oracle/oracle-ice-on-1.pcapng, sha256
+# 5e3a890fa7c61f4f6c9cf597f55c0e7ea71628818d449aa9c53760fb017d07be; decoded
+# with negfit/data/wire/analyze_ice_on.py, independently re-run for this
+# feature -- see reverse_engineering/.analysis/ for the extraction). Command
+# 9843 in that capture (766.703135s, 15 sequences and ~26s of idle TEST UNIT
+# READY polling after the third and final fine-scan READ ended at command
+# 9828): `e0 00 d0 00 00 00 00 00 09 00` with a 9-byte OUT payload, sent
+# *inside* the session's single RESERVE_UNIT (command 17) -- the capture
+# contains zero RELEASE_UNIT commands anywhere, including after this EJECT.
+# Immediately followed (command 9844, +1.76ms) by `c1 00 00 00 00 00`
+# (EXECUTE), the same "arm the vendor sub-command" pairing already used by
+# AUTOFOCUS_EXEC (VARIABLE_FRAME_TABLE_SEQUENCE's sibling, AUTOFOCUS_SEQUENCE
+# above) elsewhere in this same capture.
+VENDOR_EJECT_CDB = "e000d000000000000900"
+# Opaque vendor parameter block, byte-exact from the same command 9843.
+# Unlike AUTOFOCUS_EXEC's 9-byte payload (a decoded X/Y pair -- see the "A"
+# continuation step above), this block's semantics were not established by
+# any tool read for this feature: VENDOR_E0:sub_0xb4 (a related, still-
+# undecoded vendor sub-command) appears elsewhere in the same capture with
+# two different payloads across its own three occurrences, so a payload
+# differing across contexts is already a known pattern for this command
+# family, not evidence this one is safe to alter. There is exactly one
+# EJECT in the entire 9,977-command capture -- no second sample exists to
+# test whether this block varies. Replayed verbatim rather than computed.
+VENDOR_EJECT_DATA_OUT = "0000000000031ad070"
+EXECUTE_CDB = "c10000000000"
+# The traced post-EJECT TEST UNIT READY sense chain, command 9845-9968:
+# 020401 (repeated, ~13.6s) -> 063f04 -> 062800 -> 023a00 (terminal, medium
+# not present -- confirmed 3x more before the vendor's own idle
+# housekeeping and the capture's end). Deliberately a distinct set from
+# STARTUP_UNIT_ATTENTION_SENSES (062800/062900/063f03): eject's own chain
+# uses ascq 063f04, one different from the startup chain's 063f03, and this
+# wait must never treat a lone "000000" as an allowed intermediate the way
+# a startup/idle re-read might -- see EJECT_TERMINAL_SENSE's docstring on
+# _wait_eject_clear for why.
+EJECT_MOTION_SENSES = frozenset({"020401", "063f04", "062800"})
+EJECT_TERMINAL_SENSE = "023a00"
+# shortstrip-lab/INCIDENT-20260719-eject-from-park.md's 2026-07-24
+# reopening recorded a *different* live eject attempt against an
+# already-wedged transport: the CDB was accepted (sense 000000) but sense
+# never left 000000 across 13 polls over 36s, and no mechanical motion was
+# observed -- "eject accepted but not executed". The same document's
+# separately-recorded *good* live trial (coolscanpy-filmstate's
+# vendor_eject.py, 2026-07-19) first saw progress (020401) immediately and
+# reached clear (023a00) at t+57s, over a 36-exposure roll -- both readings
+# are the incident doc's own, not re-derived here. This module's vendor
+# pcap trace (above) shows an even faster clear, ~14.2s. Given known-good
+# runs spanning roughly 0.1s-57s before first progress and 14.2s-57s to
+# clear, the 36s first-progress deadline is the incident doc's own
+# conservative figure (documented headroom over its fastest observed
+# case); the completion deadline mirrors this module's existing
+# READY_POLL_DEADLINE_SECONDS convention, over 2x the slowest observed good
+# clear.
+EJECT_FIRST_PROGRESS_DEADLINE_SECONDS = 36.0
+EJECT_COMPLETION_DEADLINE_SECONDS = 120.0
+
 
 class ProtocolError(RuntimeError):
     pass
@@ -243,6 +300,24 @@ class DesynchronizedProtocolError(ProtocolError):
 
 class TransactionDeadlineExceeded(TimeoutError):
     """No further USB stage fits inside the transaction's absolute deadline."""
+
+
+class EjectWedgeSuspected(SynchronizedProtocolError):
+    """The eject CDB/EXECUTE were accepted but the traced post-eject sense
+    chain did not progress or complete as observed live in every known-good
+    session (see EJECT_FIRST_PROGRESS_DEADLINE_SECONDS/
+    EJECT_COMPLETION_DEADLINE_SECONDS above).
+
+    This is a ``SynchronizedProtocolError`` -- every TEST UNIT READY poll
+    that raises it completed its own status phase cleanly, so another CDB
+    (a defensive RELEASE_UNIT) is safe to attempt -- but the transport's
+    *mechanical* state is a separate fact a clean SCSI-level release cannot
+    prove or fix. shortstrip-lab/INCIDENT-20260719-eject-from-park.md's
+    2026-07-24 reopening: "Power cycle remains the only demonstrated reset
+    for the 022b4b wedge." ``main()``'s failure handler forces
+    ``recovery_required`` to the power-cycle string for this exception
+    specifically, regardless of whether a defensive release succeeds.
+    """
 
 
 class CountedBulkReadError(OSError):
@@ -441,6 +516,7 @@ class LiveBatchJob:
     plan_sha256: str
     continuation_plan_sha256: str
     job_sha256: str
+    exposure_override_10ns: tuple[int, int, int] | None = None
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -1679,6 +1755,7 @@ def load_validated_batch_job(
     expected_keys = set(expected_top_level) | {
         "expected_usb_address",
         "expected_usb_bus",
+        "exposure_override_10ns",
         "frames",
         "reviewed_roll_fingerprint",
         "session_id",
@@ -1693,6 +1770,32 @@ def load_validated_batch_job(
             raise ProtocolError(
                 f"batch job {key}={payload.get(key)!r}, expected {expected!r}"
             )
+    raw_exposure_override = payload.get("exposure_override_10ns")
+    exposure_override_10ns: tuple[int, int, int] | None = None
+    if raw_exposure_override is not None:
+        if (
+            not isinstance(raw_exposure_override, (list, tuple))
+            or len(raw_exposure_override) != 3
+        ):
+            raise ProtocolError(
+                "batch job exposure_override_10ns must be a 3-element "
+                "(red, green, blue) array of raw 10ns tick counts"
+            )
+        parsed_ticks: list[int] = []
+        for channel, raw in zip(("red", "green", "blue"), raw_exposure_override):
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ProtocolError(
+                    f"batch job exposure_override_10ns {channel} tick count "
+                    f"must be an int, got {raw!r}"
+                )
+            if not EXPOSURE_MIN <= raw <= EXPOSURE_MAX:
+                raise ProtocolError(
+                    f"batch job exposure_override_10ns {channel} tick count "
+                    f"{raw} is outside the allowed range "
+                    f"[{EXPOSURE_MIN}, {EXPOSURE_MAX}]"
+                )
+            parsed_ticks.append(raw)
+        exposure_override_10ns = (parsed_ticks[0], parsed_ticks[1], parsed_ticks[2])
     session_id = payload.get("session_id")
     if (
         not isinstance(session_id, str)
@@ -1805,6 +1908,7 @@ def load_validated_batch_job(
         plan_sha256=expected_plan_sha256,
         continuation_plan_sha256=expected_continuation_sha256,
         job_sha256=actual_job_sha256,
+        exposure_override_10ns=exposure_override_10ns,
     )
 
 
@@ -1818,7 +1922,17 @@ def wait_for_parent_ack(
     timeout_seconds: float = 1_800.0,
     poll_seconds: float = 0.1,
 ) -> str:
-    """Wait at a transaction boundary for one exact continue/stop decision."""
+    """Wait at a transaction boundary for one exact continue/stop/eject/
+    continue_hold decision. ``"eject"`` and ``"continue_hold"`` are each
+    only ever legal on the last frame the parent intends to request in
+    this batch -- see ``Roll.scan_many``'s ``eject_after`` parameter and
+    its default (neither a safe-stop nor ``eject_after``) when this batch
+    resumed a held session -- but both are accepted here regardless of
+    position: whichever frame receives one stops the batch from advancing
+    further, exactly like ``"stop"``. ``"eject"`` replays the traced eject
+    sequence at teardown; ``"continue_hold"`` skips teardown's release
+    entirely and instead loops the same child back into a fresh hold-wait
+    (see ``run_live_capture``'s own ``hold_requested`` handling)."""
 
     if timeout_seconds < 0 or poll_seconds < 0:
         raise ValueError("parent ACK timing values cannot be negative")
@@ -1854,7 +1968,7 @@ def wait_for_parent_ack(
                         f"{payload.get(key)!r}, expected {required!r}"
                     )
             action = payload.get("action")
-            if action not in ("continue", "stop"):
+            if action not in ("continue", "stop", "eject", "continue_hold"):
                 raise SynchronizedProtocolError(
                     f"parent ACK for slot {slot} has invalid action {action!r}"
                 )
@@ -1862,6 +1976,71 @@ def wait_for_parent_ack(
         if time.monotonic() >= deadline:
             raise SynchronizedProtocolError(
                 f"parent ACK for slot {slot} did not arrive before timeout"
+            )
+        if poll_seconds:
+            time.sleep(poll_seconds)
+
+
+def wait_for_hold_decision(
+    path: Path,
+    *,
+    hold_session_id: str,
+    timeout_seconds: float = 1_800.0,
+    poll_seconds: float = 0.1,
+) -> str:
+    """Wait at the post-preview transaction boundary for a resume/release
+    decision, without a bound frame or slot yet.
+
+    This is deliberately a sibling of :func:`wait_for_parent_ack`, not a
+    reuse of it: that function's schema is exact-matched against a real
+    frame's ``frame_index``/``slot``, and this moment has neither yet (the
+    whole point of holding is that the operator has not chosen a frame).
+    Overloading its schema with sentinel frame/slot values would weaken the
+    exact-match guarantee it gives every real batch frame.  ``action`` is
+    ``"scan"`` (a batch job has been durably published at the path the
+    caller told the parent to write to), ``"release"`` (give up the
+    reservation; no job is coming), or ``"eject"`` (the operator decided,
+    having seen the preview and without ever scanning, to end the session
+    by replaying the traced vendor eject sequence before releasing).
+    """
+
+    if timeout_seconds < 0 or poll_seconds < 0:
+        raise ValueError("hold decision timing values cannot be negative")
+    path = Path(path).expanduser().resolve()
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SynchronizedProtocolError(
+                    f"hold decision is unreadable: {error}"
+                ) from error
+            expected = {
+                "hold_session_id": hold_session_id,
+                "schema_version": 1,
+            }
+            if not isinstance(payload, dict):
+                raise SynchronizedProtocolError("hold decision must be an object")
+            if set(payload) != {*expected, "action"}:
+                raise SynchronizedProtocolError(
+                    "hold decision has an unexpected schema"
+                )
+            for key, required in expected.items():
+                if payload.get(key) != required:
+                    raise SynchronizedProtocolError(
+                        f"hold decision has {key}={payload.get(key)!r}, "
+                        f"expected {required!r}"
+                    )
+            action = payload.get("action")
+            if action not in ("scan", "release", "eject"):
+                raise SynchronizedProtocolError(
+                    f"hold decision has invalid action {action!r}"
+                )
+            return action
+        if time.monotonic() >= deadline:
+            raise SynchronizedProtocolError(
+                "hold decision did not arrive before timeout"
             )
         if poll_seconds:
             time.sleep(poll_seconds)
@@ -2597,6 +2776,56 @@ def _resolve_parity_active_exposures(
         "device_exposure_bounds_raw_10ns": [EXPOSURE_MIN, EXPOSURE_MAX],
     }
     return commanded
+
+
+def _apply_exposure_override(
+    metered_controller_exposures: dict[str, int],
+    exposure_override_10ns: tuple[int, int, int] | None,
+) -> tuple[dict[str, int], dict[str, object] | None]:
+    """Resolve the controller exposures that build the fine-scan plan.
+
+    This is the single choke point where a caller's forced ticks (if any)
+    replace the AE meter's own accepted proposal -- strictly at plan-build
+    time, after the meter has already run its full unmodified sequence and
+    reached an accepted answer. ``metered_controller_exposures`` is that
+    answer (``R``/``G``/``B``/``IR`` raw 10ns ticks, in ``CONTROLLER_CHANNELS``
+    order); it is returned unchanged, with no provenance, when
+    ``exposure_override_10ns`` is ``None``.
+
+    When an override is given, ``R``/``G``/``B`` are forced to its ticks and
+    ``IR`` is retained from the meter (there is no override concept for IR,
+    and the four-channel fine window contract requires all four channels).
+    The second return value is ``None`` when there is no override, or a
+    provenance dict recording both the metered and forced values plus an
+    explicit ``applied`` flag -- the caller persists this into the journal's
+    ``exposure_override`` evidence (mirroring the ``meter_final_exposures``/
+    ``meter_pass_commanded_exposures`` evidence-dict style already used
+    elsewhere in this module) so the substitution is always auditable.
+    """
+
+    if exposure_override_10ns is None:
+        return metered_controller_exposures, None
+    forced_red, forced_green, forced_blue = exposure_override_10ns
+    forced_controller: dict[str, int] = {
+        "R": forced_red,
+        "G": forced_green,
+        "B": forced_blue,
+        "IR": metered_controller_exposures["IR"],
+    }
+    provenance = {
+        "applied": True,
+        "forced_10ns": {
+            "red": forced_red,
+            "green": forced_green,
+            "blue": forced_blue,
+        },
+        "metered_10ns": {
+            "red": metered_controller_exposures["R"],
+            "green": metered_controller_exposures["G"],
+            "blue": metered_controller_exposures["B"],
+        },
+    }
+    return forced_controller, provenance
 
 
 def _validate_live_meter_windows(
@@ -3580,6 +3809,143 @@ def _wait_post_scan_ready(
     )
 
 
+def _vendor_eject_cdb(ep_out: Any, ep_in: Any) -> TransactionResult:
+    """The traced end-of-session EJECT CDB itself (command 9843 in the
+    oracle capture; see VENDOR_EJECT_CDB's module-level docstring). A clean
+    ``000000`` sense here means *accepted*, not complete -- the mechanical
+    motion is confirmed separately by :func:`_wait_eject_clear`."""
+
+    entry = {
+        "seq": "teardown-eject",
+        "name": "VENDOR_E0:EJECT",
+        "cdb": VENDOR_EJECT_CDB,
+        "data_out": VENDOR_EJECT_DATA_OUT,
+        "expected_phase": 0x02,
+        "expected_sense": "000000",
+    }
+    return _perform_with_busy_retry(
+        ep_out, ep_in, entry, data_timeout_ms=30_000, deadline_seconds=30.0
+    )
+
+
+def _vendor_eject_execute(ep_out: Any, ep_in: Any) -> TransactionResult:
+    """The EXECUTE that arms the eject sub-command, traced immediately
+    (+1.76ms) after the EJECT CDB itself (command 9844) -- the same E0 +
+    EXECUTE pairing already used for AUTOFOCUS_EXEC elsewhere in this
+    module."""
+
+    entry = {
+        "seq": "teardown-eject-execute",
+        "name": "EXECUTE",
+        "cdb": EXECUTE_CDB,
+        "expected_phase": 0x01,
+        "expected_sense": "000000",
+    }
+    return _perform_with_busy_retry(
+        ep_out, ep_in, entry, data_timeout_ms=30_000, deadline_seconds=30.0
+    )
+
+
+def _wait_eject_clear(ep_out: Any, ep_in: Any) -> tuple[int, int]:
+    """Poll TEST UNIT READY until the traced terminal sense (medium not
+    present) is reached, replaying the oracle capture's own post-eject
+    state machine: 020401 (motion, repeated) -> 063f04 -> 062800 -> 023a00
+    (terminal), commands 9845-9968.
+
+    Deliberately NOT a call to :func:`_perform_ready_group`: that helper's
+    own ``terminal_sense == "023a00"`` special case ("a scanner that
+    already reports ready-with-media is a stronger startup state", used by
+    session-open code paths) treats a bare ``000000`` reply as an
+    acceptable substitute for the traced terminal state. Reusing it here
+    would silently turn the exact documented eject-from-park wedge
+    symptom -- sense pinned at ``000000`` forever, no motion, no untraced
+    sense to object to -- into a false success. This function instead
+    tracks first-motion and completion as two separate, explicit
+    deadlines, exactly as shortstrip-lab/INCIDENT-20260719-eject-from-park.md
+    (2026-07-24 reopening) prescribes for this exact failure mode: "Unit
+    attentions do not establish motion and must not start the completion
+    budget," and a conservative first-progress deadline distinct from the
+    completion deadline.
+
+    Raises :class:`EjectWedgeSuspected` -- never spins forever, and never
+    treats "no motion yet" as success -- on any untraced sense, or if
+    either deadline is exceeded.
+    """
+
+    first_progress_deadline = time.monotonic() + EJECT_FIRST_PROGRESS_DEADLINE_SECONDS
+    completion_deadline = time.monotonic() + EJECT_COMPLETION_DEADLINE_SECONDS
+    template = {
+        "seq": "teardown-eject-wait",
+        "name": "TEST_UNIT_READY",
+        "cdb": "000000000000",
+        "expected_phase": 0x01,
+    }
+    polls = 0
+    stalls = 0
+    first_progress_observed = False
+    while True:
+        result = perform_transaction(ep_out, ep_in, template, data_timeout_ms=30_000)
+        polls += 1
+        stalls += result.stall_recoveries
+        if result.phase != template["expected_phase"]:
+            raise EjectWedgeSuspected(
+                f"eject wait: phase 0x{result.phase:02x} != expected "
+                f"0x{template['expected_phase']:02x}"
+            )
+        if result.sense == EJECT_TERMINAL_SENSE:
+            return polls, stalls
+        if result.sense in EJECT_MOTION_SENSES:
+            first_progress_observed = True
+        elif result.sense != "000000":
+            raise EjectWedgeSuspected(
+                f"eject wait: untraced sense {result.sense}; expected "
+                f"motion {sorted(EJECT_MOTION_SENSES)}, terminal "
+                f"{EJECT_TERMINAL_SENSE}, or a not-yet-progressed 000000"
+            )
+        now = time.monotonic()
+        if not first_progress_observed and now >= first_progress_deadline:
+            raise EjectWedgeSuspected(
+                "eject wait: no motion observed within "
+                f"{EJECT_FIRST_PROGRESS_DEADLINE_SECONDS:.0f}s of the eject "
+                "command (sense stayed 000000); matches the documented "
+                "accepted-without-actuation wedge signature -- power cycle "
+                "required, do not retry"
+            )
+        if now >= completion_deadline:
+            raise EjectWedgeSuspected(
+                f"eject wait: terminal sense {EJECT_TERMINAL_SENSE} not "
+                f"reached within {EJECT_COMPLETION_DEADLINE_SECONDS:.0f}s "
+                f"of the eject command (last sense {result.sense}) -- "
+                "power cycle required, do not retry"
+            )
+        time.sleep(READY_POLL_SECONDS)
+
+
+def _perform_vendor_eject(ep_out: Any, ep_in: Any) -> dict[str, Any]:
+    """Replay the complete traced end-of-session eject sequence: EJECT CDB,
+    its companion EXECUTE, then the post-eject sense-chain wait -- in that
+    order, matching the oracle capture exactly. Returns journal-ready
+    evidence; raises :class:`EjectWedgeSuspected` (never spinning forever)
+    on any deviation. Callers issue this *before* ``_release_unit`` -- the
+    traced capture contains no RELEASE_UNIT anywhere, including after its
+    own EJECT, so this only reproduces vendor motion; the RELEASE_UNIT that
+    follows it is this package's own teardown convention, not vendor wire
+    behavior (see the module docstring's session-contract notes)."""
+
+    eject_result = _vendor_eject_cdb(ep_out, ep_in)
+    execute_result = _vendor_eject_execute(ep_out, ep_in)
+    polls, stalls = _wait_eject_clear(ep_out, ep_in)
+    return {
+        "eject_cdb_status": eject_result.status.hex(),
+        "eject_execute_status": execute_result.status.hex(),
+        "terminal_sense": EJECT_TERMINAL_SENSE,
+        "wait_polls": polls,
+        "stall_recoveries": (
+            eject_result.stall_recoveries + execute_result.stall_recoveries + stalls
+        ),
+    }
+
+
 def _cleanup_synchronized(
     ep_out: Any,
     ep_in: Any,
@@ -3791,6 +4157,7 @@ def _run_live_continuation_frame(
     density_evidence: NikonDensityEvidence,
     actual_usb_bus: int,
     actual_usb_address: int,
+    expected_calibration_session_id: str,
     # Type-only: the caller's own local is `str | None` (set once the
     # batch's first INQUIRY validates it), so a `str`-only annotation here
     # was already an unsound accepted-argument type, not a runtime
@@ -3802,13 +4169,29 @@ def _run_live_continuation_frame(
     ``scanner_identity`` carries the revision validated on the batch's first
     INQUIRY (Lane A: any Nikon LS-5000 ED revision is accepted), so every
     per-frame journal records the scanner's real firmware revision.
+
+    ``expected_calibration_session_id`` is the reservation-wide
+    ``calibration_session_id`` established once, near this attempt's
+    start, from the one-time READ(0x8c) calibration -- deliberately
+    compared here instead of ``batch_job.session_id``. For a cold batch
+    the two happen to be equal (``calibration_session_id`` is seeded from
+    the batch job's own session id when one is already known at launch),
+    but for a preview-and-hold attempt they are not: ``batch_job`` does
+    not exist yet when calibration is captured, so
+    ``calibration_session_id`` gets its own independent
+    ``single-reservation-<token>`` identity, and ``batch_job.session_id``
+    is instead the (also independently minted) hold/resume session id --
+    a fresh one every round, in this package's multi-batch-per-feed
+    design. Comparing against ``batch_job.session_id`` would reject every
+    continuation frame of a resumed batch outright, for the very reason
+    resuming exists: it is not a fresh reservation.
     """
 
-    if density_calibration.session_id != batch_job.session_id:
+    if density_calibration.session_id != expected_calibration_session_id:
         raise ProtocolError(
             "continuation density calibration is from another reservation"
         )
-    if density_evidence.source_binding.session_id != batch_job.session_id:
+    if density_evidence.source_binding.session_id != expected_calibration_session_id:
         raise ProtocolError("continuation density preview is from another reservation")
     target = validate_plan(plan)
     if continuation_plan_sha256 != CANONICAL_CONTINUATION_PLAN_SHA256:
@@ -4182,22 +4565,54 @@ def _run_live_continuation_frame(
                                 observation=observation,
                                 final_result=final_result,
                             )
+                            fine_controller_exposures, exposure_override_provenance = (
+                                _apply_exposure_override(
+                                    commanded_exposures,
+                                    batch_job.exposure_override_10ns,
+                                )
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                commanded_exposures,
+                                fine_controller_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    commanded_exposures
+                                    fine_controller_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure
                                     for color, exposure in final_wire.items()
                                 },
                             }
+                            if exposure_override_provenance is not None:
+                                journal["exposure_override"] = (
+                                    exposure_override_provenance
+                                )
+                                # Keep the nikon-parity authority record's own
+                                # commanded-channels field consistent with the
+                                # contract actually armed for the fine scan --
+                                # see _read_exact_analyzer_source's (roll
+                                # publication consumer) and
+                                # single_pass_workflow._validate_completed_
+                                # capture's (finalize validator) shared binding
+                                # check, both of which read this field against
+                                # the real fine GET_WINDOW echo. Deliberately
+                                # NOT meter_controller_final_result.
+                                # final_exposures_raw_10ns: that field is
+                                # active_exposure_authority.
+                                # active_controller_channels_raw_10ns' own
+                                # binding target (the genuinely metered
+                                # answer, pre-override) and both validators
+                                # require it to stay the meter's true solve,
+                                # never the commanded/overridden one -- the
+                                # override is fully recorded, unabridged,
+                                # under exposure_override.metered_10ns above.
+                                journal["active_exposure_authority"][
+                                    "commanded_channels_raw_10ns"
+                                ] = dict(fine_controller_exposures)
                             final_controller_accepted = True
                             _write_journal(journal_path, journal)
 
@@ -4379,19 +4794,79 @@ def run_live_capture(
     continuation_plan: dict[str, Any] | None = None,
     continuation_plan_sha256: str | None = None,
     session_journal_path: Path | None = None,
+    preview_and_hold: bool = False,
+    hold_job_path: Path | None = None,
 ) -> None:
     target = validate_plan(plan)
     if meter_only and preview_only:
         raise ProtocolError("live capture cannot be both meter-only and preview-only")
-    batch_values = (
-        batch_job,
-        continuation_plan,
-        continuation_plan_sha256,
-        session_journal_path,
-    )
-    batch_mode = any(value is not None for value in batch_values)
-    if batch_mode and any(value is None for value in batch_values):
+    if preview_and_hold and (meter_only or preview_only):
+        raise ProtocolError(
+            "live capture cannot combine preview-and-hold with meter-only or preview-only"
+        )
+    if preview_and_hold and hold_job_path is None:
+        raise ProtocolError("preview-and-hold capture requires a hold-job path")
+    if not preview_and_hold and hold_job_path is not None:
+        raise ProtocolError("a hold-job path only applies to preview-and-hold capture")
+    # A held preview does not yet know its eventual frame(s): it needs the
+    # continuation plan materialized and verified up front (so the resumed
+    # first frame can fall through into the existing batch/continuation code
+    # without a second round trip to fetch it), but it does not yet have a
+    # batch_job or session_journal_path -- those only exist once a caller
+    # resumes the hold with an actual frame list. `batch_job` alone is the
+    # authority for "is this attempt already a fully specified batch".
+    batch_mode = batch_job is not None
+    # Set True by a hold decision or a batch parent ACK of "eject"; read at
+    # teardown to replay the traced vendor eject sequence before releasing
+    # instead of releasing directly. Independent of batch_stopped/hold_outcome
+    # bookkeeping below -- this is the one flag both teardown branches share.
+    eject_requested = False
+    # Set True by a batch parent ACK of "continue_hold" on whichever frame
+    # ends the current batch's own requested frames. Read just below the
+    # frame loop: instead of falling into the ordinary release teardown,
+    # the same still-running child loops back into a fresh hold-wait
+    # (mirroring the original preview-and-hold boundary), reset to False
+    # at the top of each loop iteration, and set again by that round's own
+    # terminal frame if the operator holds again. Never true outside
+    # batch_mode -- see the `hold_job_path is None` guard where the loop
+    # begins.
+    hold_requested = False
+    # Set only when a hold-wait's own decision (not a frame ack) was an
+    # explicit "release"/"eject" -- i.e. Roll.release()/Roll.eject() called
+    # between batches, not scan_many(eject_after=True) or a safe-stop mid-
+    # batch. Names the dedicated, never-before-used file this round's own
+    # hold_resume minted for exactly this purpose; written only after the
+    # teardown below actually releases, so it can never claim a release
+    # that has not happened yet. release_held_session/eject_held_session
+    # read this same path back through the HeldPreviewSession the parent
+    # constructed for this round -- see capture_process.py's
+    # _resolve_held_after_batch.
+    hold_wait_release_receipt_path: Path | None = None
+    if batch_mode and (
+        continuation_plan is None
+        or continuation_plan_sha256 is None
+        or session_journal_path is None
+    ):
         raise ProtocolError("live batch capture requires every batch component")
+    if preview_and_hold and (
+        continuation_plan is None or continuation_plan_sha256 is None
+    ):
+        raise ProtocolError(
+            "preview-and-hold capture requires the continuation plan up front"
+        )
+    if (
+        not batch_mode
+        and not preview_and_hold
+        and (
+            continuation_plan is not None
+            or continuation_plan_sha256 is not None
+            or session_journal_path is not None
+        )
+    ):
+        raise ProtocolError(
+            "continuation plan and session journal only apply to batch or "
+            "preview-and-hold capture"
+        )
     if batch_mode and (meter_only or preview_only):
         raise ProtocolError("live batch capture supports full frames only")
     if batch_mode:
@@ -4435,13 +4910,21 @@ def run_live_capture(
         raise ProtocolError("preview-only capture does not accept --frame")
     if preview_only and boundary_offset_rows != 0:
         raise ProtocolError("preview-only capture does not accept a boundary offset")
-    if not preview_only and frame is None:
+    if preview_and_hold and frame is not None:
+        raise ProtocolError("preview-and-hold capture does not accept --frame")
+    if preview_and_hold and boundary_offset_rows != 0:
+        raise ProtocolError("preview-and-hold capture does not accept a boundary offset")
+    if not preview_only and not preview_and_hold and frame is None:
         raise ProtocolError("live capture requires an explicit same-traversal --frame")
     if frame is not None:
         _validate_boundary_offset(frame, boundary_offset_rows)
     if preview_only and expected_frame_count is not None:
         raise ProtocolError(
             "preview-only capture does not accept an expected frame count"
+        )
+    if preview_and_hold and expected_frame_count is not None:
+        raise ProtocolError(
+            "preview-and-hold capture does not accept an expected frame count"
         )
     if (expected_usb_bus is None) != (expected_usb_address is None):
         raise ProtocolError("expected USB bus and address are inseparable")
@@ -4451,7 +4934,12 @@ def run_live_capture(
         assert expected_usb_address is not None
         if not 1 <= expected_usb_address <= 127:
             raise ProtocolError("expected USB address must be in 1..127")
-    if not preview_only and not batch_mode and expected_usb_bus is None:
+    if (
+        not preview_only
+        and not preview_and_hold
+        and not batch_mode
+        and expected_usb_bus is None
+    ):
         raise ProtocolError(
             "live full and meter capture require exact USB bus and address"
         )
@@ -4462,6 +4950,7 @@ def run_live_capture(
     if (
         not meter_only
         and not preview_only
+        and not preview_and_hold
         and (read_count != EXPECTED_FINE_READS or read_count != target["repeat"])
     ):
         raise ProtocolError(
@@ -4475,7 +4964,9 @@ def run_live_capture(
 
     artifact_paths = _live_index_artifact_paths(output_path)
     meter_sidecar_path = (
-        None if meter_only or preview_only else _full_capture_meter_path(output_path)
+        None
+        if meter_only or preview_only or preview_and_hold
+        else _full_capture_meter_path(output_path)
     )
     for artifact in artifact_paths.values():
         if artifact.exists():
@@ -4485,7 +4976,7 @@ def run_live_capture(
 
     expected_bytes = (
         0
-        if preview_only
+        if preview_only or preview_and_hold
         else (METER_CAPTURE_BYTES if meter_only else read_count * target["request_len"])
     )
     calibration_session_id = (
@@ -4508,7 +4999,13 @@ def run_live_capture(
         "meter_controller_sha256": _meter_controller_sha256(),
         "output": str(output_path.resolve()),
         "capture_mode": (
-            "preview-only" if preview_only else ("meter-only" if meter_only else "full")
+            "preview-only"
+            if preview_only
+            else (
+                "preview-and-hold"
+                if preview_and_hold
+                else ("meter-only" if meter_only else "full")
+            )
         ),
         "requested_frame": frame,
         "expected_frame_count": expected_frame_count,
@@ -4522,7 +5019,7 @@ def run_live_capture(
         "resolved_native_origin": None,
         "expected_reads": (
             0
-            if preview_only
+            if preview_only or preview_and_hold
             else (len(METER_READ_SEQUENCES) if meter_only else read_count)
         ),
         "expected_bytes": expected_bytes,
@@ -4613,6 +5110,21 @@ def run_live_capture(
     ready_required = False
     scanner_identity: str | None = None
     meter_output = None
+    # Predeclared so the exception/finally handling below can always safely
+    # check them, even if `_connect_device()` itself fails before the `with
+    # output_path.open(...)` block (where they are normally rebound) is ever
+    # reached.  `fine_output_path` mirrors `output_path` until the
+    # preview-and-hold "resume as batch frame 1" branch rebinds both to the
+    # real per-slot destination.
+    fine_output = None
+    fine_output_path = output_path
+    # `hold_ack_path` is a sibling of `hold_job_path`, published last (after
+    # the batch job itself) so the child never observes a "scan" decision
+    # without its job already durably present -- see the preview-and-hold
+    # branch below and CaptureProcessAdapter.resume_held_session.
+    hold_ack_path = (
+        None if hold_job_path is None else hold_job_path.with_name("hold-ack.json")
+    )
     fine_stream: FineStreamSession | None = None
     density_calibration_reads: list[DensityCalibrationRead] = []
     density_calibration: DensityCalibration | None = None
@@ -4652,6 +5164,13 @@ def run_live_capture(
         _write_journal(journal_path, journal)
 
         with output_path.open("xb") as output:
+            # `fine_output`/`fine_output_path` default to the outer
+            # with-managed placeholder and only diverge inside the
+            # preview-and-hold "resume as batch frame 1" branch below, once
+            # the real per-slot output is known.  Every other mode's fine
+            # READ loop writes to `output` exactly as before.
+            fine_output = output
+            fine_output_path = output_path
             if meter_sidecar_path is not None:
                 meter_output = meter_sidecar_path.open("xb")
             active_plan = [dict(entry) for entry in plan]
@@ -4986,6 +5505,265 @@ def run_live_capture(
                         journal["status"] = "preview-captured"
                         _write_journal(journal_path, journal)
                         break
+                    if preview_and_hold:
+                        # Persist the same preview-completion evidence
+                        # preview_only does, then pause at this transaction
+                        # boundary instead of releasing -- reusing the exact
+                        # file-based wait/ACK shape run_batch_session already
+                        # uses between frames (wait_for_parent_ack), just for
+                        # a decision that has no frame/slot yet.
+                        if startup_table is None:
+                            raise SynchronizedProtocolError(
+                                "preview completed without a validated startup frame table"
+                            )
+                        assert hold_job_path is not None
+                        assert hold_ack_path is not None
+                        assert continuation_plan is not None
+                        assert continuation_plan_sha256 is not None
+                        hold_session_id = secrets.token_hex(16)
+                        hold_receipt = {
+                            "status": "preview-and-hold-awaiting-job",
+                            "slot_capacity_hint": startup_table["count"],
+                            "slot_capacity_semantics": (
+                                "scanner-addressable preview slots; not an exposure count"
+                            ),
+                            "preview_bytes": len(preview_bytes),
+                            "preview_sha256": preview_sha256,
+                            "table_bytes": len(live_sub_8e_table),
+                            "table_sha256": table_sha256,
+                            "frame_detection": "deferred-offline",
+                            "startup_table": {
+                                "count": startup_table["count"],
+                                "sha256": startup_table["sha256"],
+                                "status": journal["live_startup_0x8f_status"],
+                            },
+                            "preview_binding": preview_binding.receipt(),
+                        }
+                        _write_json_exclusive(artifact_paths["mapping"], hold_receipt)
+                        journal["preview_only_receipt"] = hold_receipt
+                        journal["status"] = "awaiting-hold-job"
+                        journal["hold_session_id"] = hold_session_id
+                        journal["hold_ready_unix"] = time.time()
+                        # The placeholder output file is empty at this point
+                        # in every outcome (release, or resumed-as-batch --
+                        # either way the real fine-scan bytes land elsewhere,
+                        # never in this attempt's own placeholder), so its
+                        # digest is knowable now instead of only after this
+                        # attempt's own `with output_path.open(...)` block
+                        # eventually closes it.  Roll.preview() validates this
+                        # exact snapshot before any resume/release decision
+                        # exists, so it must already be present and correct.
+                        journal["output_sha256"] = hashlib.sha256(b"").hexdigest()
+                        # disk_bytes/unit_released are otherwise only stamped
+                        # by this function's own post-loop teardown (the
+                        # `disk_bytes = fine_output_path.stat().st_size` /
+                        # `journal["unit_released"] = True` code below) --
+                        # code this attempt has not reached yet and, for a
+                        # held preview, will not reach until long after a
+                        # resume/release decision exists.  Both facts are
+                        # already true and knowable right now (the
+                        # placeholder output file is genuinely 0 bytes on
+                        # disk, and the reservation is genuinely still held,
+                        # not released), so both must be recorded before
+                        # `wait_for_hold_decision` blocks below: the parent
+                        # (`CaptureProcessAdapter._wait_for_held_preview_ready`)
+                        # reads this exact on-disk snapshot while this
+                        # attempt is still blocked on that wait, not the
+                        # eventual release/resume outcome.
+                        journal["disk_bytes"] = 0
+                        journal["unit_released"] = False
+                        _write_journal(journal_path, journal)
+
+                        action = wait_for_hold_decision(
+                            hold_ack_path, hold_session_id=hold_session_id
+                        )
+                        if action == "release":
+                            journal["hold_outcome"] = "released"
+                            _write_journal(journal_path, journal)
+                            break
+                        if action == "eject":
+                            # The operator saw the preview and decided, without
+                            # ever scanning, to end the session here. Teardown
+                            # below (the `released_hold_without_scan` branch,
+                            # shared with plain "release") replays the traced
+                            # vendor eject sequence before releasing because
+                            # `eject_requested` is set -- see its own
+                            # docstring above.
+                            journal["hold_outcome"] = "ejected"
+                            eject_requested = True
+                            _write_journal(journal_path, journal)
+                            break
+
+                        # action == "scan": a batch job has been durably
+                        # published at hold_job_path.  Validate it exactly
+                        # as a fresh cold-batch launch would (session id must
+                        # additionally echo the one this held attempt minted,
+                        # since nothing else binds this specific decision to
+                        # this specific reservation), then fall through --
+                        # WITHOUT break -- into the existing frame-selection/
+                        # metering/fine-scan code below.  No RESERVE_UNIT, no
+                        # repeated command 64, no repeated preview: the
+                        # reservation and the preview_bytes/live_sub_8e_table
+                        # already captured above are reused as-is.
+                        loaded_batch_job = load_validated_batch_job(
+                            hold_job_path,
+                            # No CLI channel exists to hand an already-running
+                            # held child a parent-precomputed expected hash
+                            # (unlike a cold --batch-job launch's
+                            # --expected-batch-job-sha256): the job is
+                            # published only after this process is already
+                            # blocked in wait_for_hold_decision. Hash the
+                            # file's own just-published bytes and validate
+                            # against that -- every other check
+                            # load_validated_batch_job performs (schema,
+                            # session id, frame paths, boundary offsets)
+                            # still applies in full; only the
+                            # written-by-a-different-process integrity
+                            # comparison the cold path gets for free has
+                            # nothing independent left to compare against
+                            # here.
+                            expected_job_sha256=hashlib.sha256(
+                                hold_job_path.read_bytes()
+                            ).hexdigest(),
+                            expected_plan_sha256=plan_sha256,
+                            expected_continuation_sha256=continuation_plan_sha256,
+                        )
+                        if loaded_batch_job.session_id != hold_session_id:
+                            raise ProtocolError(
+                                "resumed batch job session id does not match "
+                                "this held preview"
+                            )
+                        derive_equivalent_continuation_blocks(continuation_plan)
+                        batch_job = loaded_batch_job
+                        batch_mode = True
+                        first_spec = batch_job.frames[0]
+                        frame = first_spec.slot
+                        boundary_offset_rows = first_spec.boundary_offset_rows
+                        journal["hold_outcome"] = "resumed-as-batch"
+                        _write_journal(journal_path, journal)
+
+                        expected_bytes = read_count * target["request_len"]
+                        meter_sidecar_path = _full_capture_meter_path(
+                            first_spec.output
+                        )
+                        session_journal_path = hold_job_path.parent / (
+                            "session-journal.json"
+                        )
+                        for candidate in (
+                            first_spec.output,
+                            first_spec.journal,
+                            first_spec.ack,
+                            meter_sidecar_path,
+                            session_journal_path,
+                        ):
+                            if candidate.exists():
+                                raise ProtocolError(
+                                    f"refusing to overwrite {candidate}"
+                                )
+                        # mkdir before the disk-usage probe (mirrors
+                        # _run_live_continuation_frame): `shutil.disk_usage`
+                        # requires an existing path, and this frame's own
+                        # subdirectory is guaranteed fresh by the check above.
+                        first_spec.output.parent.mkdir(parents=False, exist_ok=False)
+                        free_bytes = shutil.disk_usage(first_spec.output.parent).free
+                        required_free = expected_bytes + max(
+                            1_073_741_824, expected_bytes // 10
+                        )
+                        if free_bytes < required_free:
+                            raise ProtocolError(
+                                f"only {free_bytes} free bytes; resumed fine "
+                                f"capture requires {required_free}"
+                            )
+                        fine_output_path = first_spec.output
+                        fine_output = fine_output_path.open("xb")
+                        meter_output = meter_sidecar_path.open("xb")
+                        artifact_paths = _live_index_artifact_paths(fine_output_path)
+
+                        journal = {
+                            "status": "starting",
+                            "plan": str(plan_path.resolve()),
+                            "plan_sha256": plan_sha256,
+                            "continuation_plan_sha256": continuation_plan_sha256,
+                            "capture_engine_sha256": CAPTURE_WORKER_SHA256,
+                            "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
+                            "meter_controller_sha256": _meter_controller_sha256(),
+                            "output": str(fine_output_path.resolve()),
+                            "capture_mode": "full",
+                            "requested_frame": frame,
+                            "expected_frame_count": None,
+                            "requested_boundary_offset_rows": boundary_offset_rows,
+                            "applied_boundary_offset_rows": None,
+                            "resolved_lookup_row": None,
+                            "resolved_native_origin": None,
+                            "expected_reads": read_count,
+                            "expected_bytes": expected_bytes,
+                            "completed_reads": 0,
+                            "completed_bytes": 0,
+                            "stall_recoveries": 0,
+                            "started_unix": time.time(),
+                            "meter_evidence_path": str(meter_sidecar_path.resolve()),
+                            "ack_nonce": None,
+                            "batch_session": {
+                                "frame_index": 1,
+                                "frame_total": len(batch_job.frames),
+                                "selected_slots": list(batch_job.selected_slots),
+                                "session_id": batch_job.session_id,
+                            },
+                            "frame_complete": False,
+                            "manual_review_approval": (
+                                None
+                                if first_spec.manual_review_approval is None
+                                else first_spec.manual_review_approval.to_payload()
+                            ),
+                            "reviewed_roll_fingerprint_sha256": (
+                                batch_job.reviewed_fingerprint.binding_sha256
+                            ),
+                            "session_reservation_retained": True,
+                            "unit_released": False,
+                            "scanner_identity": "Nikon LS-5000 ED 1.03",
+                            "preview_geometry_validated_before_reads": True,
+                            "resumed_from_held_preview": True,
+                            # The later shared selection_receipt code below
+                            # (identical for a cold batch's own frame 1 and
+                            # this resumed one) reads this back from the
+                            # per-frame journal; a cold batch's journal
+                            # carries it forward from the same startup-table
+                            # validation because it never reassigns journal
+                            # the way this branch just did.
+                            "live_startup_0x8f_status": journal["live_startup_0x8f_status"],
+                        }
+                        journal_path = first_spec.journal
+                        session_journal = {
+                            "status": "capturing",
+                            "session_id": batch_job.session_id,
+                            "selected_slots": list(batch_job.selected_slots),
+                            "completed_slots": [],
+                            "active_frame_index": 1,
+                            "active_slot": first_spec.slot,
+                            "batch_job_sha256": batch_job.job_sha256,
+                            "capture_engine_sha256": CAPTURE_WORKER_SHA256,
+                            "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
+                            "plan_sha256": plan_sha256,
+                            "continuation_plan_sha256": continuation_plan_sha256,
+                            "manual_review_approval_sha256_by_slot": {
+                                str(spec.slot): (
+                                    None
+                                    if spec.manual_review_approval is None
+                                    else spec.manual_review_approval.binding_sha256
+                                )
+                                for spec in batch_job.frames
+                            },
+                            "reviewed_roll_fingerprint_sha256": (
+                                batch_job.reviewed_fingerprint.binding_sha256
+                            ),
+                            "reservation_acquired": True,
+                            "unit_release_attempts": 0,
+                            "unit_released": False,
+                            "recovery_required": None,
+                            "started_unix": time.time(),
+                        }
+                        _write_journal(session_journal_path, session_journal)
+                        _write_journal(journal_path, journal)
                     try:
                         if frame is None:
                             raise ProtocolError(
@@ -5268,22 +6046,47 @@ def run_live_capture(
                                 observation=observation,
                                 final_result=final_result,
                             )
+                            fine_controller_exposures, exposure_override_provenance = (
+                                _apply_exposure_override(
+                                    commanded_exposures,
+                                    (
+                                        batch_job.exposure_override_10ns
+                                        if batch_job is not None
+                                        else None
+                                    ),
+                                )
+                            )
                             final_wire = _patch_exposure_contract(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                commanded_exposures,
+                                fine_controller_exposures,
                             )
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
-                                    commanded_exposures
+                                    fine_controller_exposures
                                 ),
                                 "wire_colors_raw_10ns": {
                                     str(color): exposure
                                     for color, exposure in final_wire.items()
                                 },
                             }
+                            if exposure_override_provenance is not None:
+                                journal["exposure_override"] = (
+                                    exposure_override_provenance
+                                )
+                                # See the matching comment in
+                                # _run_live_continuation_frame: keeps the
+                                # nikon-parity authority record's commanded-
+                                # channels field bound to the contract
+                                # actually armed for the fine scan, without
+                                # touching meter_controller_final_result
+                                # (both validators require that field to stay
+                                # the meter's genuinely metered answer).
+                                journal["active_exposure_authority"][
+                                    "commanded_channels_raw_10ns"
+                                ] = dict(fine_controller_exposures)
                             final_controller_accepted = True
                             _write_journal(journal_path, journal)
                 entry_index += 1
@@ -5345,7 +6148,13 @@ def run_live_capture(
                     meter_evidence_persisted = True
                     _write_journal(journal_path, journal)
 
-            if meter_only or preview_only:
+            # A held preview that was explicitly released (never resumed into
+            # a batch) reaches here exactly like preview_only: preview_and_hold
+            # stays True the whole attempt, but batch_mode only becomes True
+            # inside the "scan" branch above, so this distinguishes the two
+            # preview_and_hold outcomes without a third top-level mode flag.
+            released_hold_without_scan = preview_and_hold and not batch_mode
+            if meter_only or preview_only or released_hold_without_scan:
                 fine_windows = []
             else:
                 if live_selection is None:
@@ -5388,7 +6197,7 @@ def run_live_capture(
                 }
                 for window in fine_windows
             ]
-            if not meter_only and not preview_only:
+            if not meter_only and not preview_only and not released_hold_without_scan:
                 journal["status"] = "fine-capture"
                 _write_journal(journal_path, journal)
                 fine_stream = _open_fine_stream_session(
@@ -5416,7 +6225,7 @@ def run_live_capture(
                     if read_count == target["repeat"] and read_index + 1 == read_count:
                         scan_active = False
                         ready_required = True
-                    written = output.write(result.payload)
+                    written = fine_output.write(result.payload)
                     if written != len(result.payload):
                         raise SynchronizedProtocolError(
                             f"short file write {written} of {len(result.payload)} bytes"
@@ -5431,9 +6240,11 @@ def run_live_capture(
                     if (read_index + 1) % 25 == 0:
                         _write_journal(journal_path, journal)
 
-            output.flush()
-            os.fsync(output.fileno())
-            _fsync_parent_directory(output_path)
+            fine_output.flush()
+            os.fsync(fine_output.fileno())
+            _fsync_parent_directory(fine_output_path)
+            if fine_output is not output:
+                fine_output.close()
             if meter_output is not None:
                 meter_output.close()
                 meter_output = None
@@ -5444,7 +6255,7 @@ def run_live_capture(
             raise SynchronizedProtocolError(
                 f"final size {journal['completed_bytes']} != expected {expected_bytes}"
             )
-        disk_bytes = output_path.stat().st_size
+        disk_bytes = fine_output_path.stat().st_size
         journal["disk_bytes"] = disk_bytes
         if disk_bytes != expected_bytes:
             raise SynchronizedProtocolError(
@@ -5514,9 +6325,17 @@ def run_live_capture(
                 slot=batch_job.frames[0].slot,
                 nonce=journal["ack_nonce"],
             )
+            # "eject" ends the batch here exactly like "stop" -- no further
+            # frames are captured -- but additionally arms the traced eject
+            # sequence at teardown below (`eject_requested`). "continue_hold"
+            # likewise ends the batch here, but arms a loop back into a
+            # fresh hold-wait after this batch's own frame loop instead of
+            # teardown's release (`hold_requested`).
             batch_stopped = action == "stop"
+            eject_requested = action == "eject"
+            hold_requested = action == "continue_hold"
 
-            if not batch_stopped:
+            if not (batch_stopped or eject_requested or hold_requested):
                 for frame_index, (frame_spec, selection) in enumerate(
                     zip(
                         batch_job.frames[1:],
@@ -5550,6 +6369,7 @@ def run_live_capture(
                         density_evidence=density_evidence,
                         actual_usb_bus=actual_usb_bus,
                         actual_usb_address=actual_usb_address,
+                        expected_calibration_session_id=calibration_session_id,
                         scanner_identity=scanner_identity,
                     )
                     completed_slots.append(frame_spec.slot)
@@ -5568,9 +6388,201 @@ def run_live_capture(
                         slot=frame_spec.slot,
                         nonce=frame_journal["ack_nonce"],
                     )
-                    if action == "stop":
-                        batch_stopped = True
+                    if action in ("stop", "eject", "continue_hold"):
+                        batch_stopped = action == "stop"
+                        eject_requested = action == "eject"
+                        hold_requested = action == "continue_hold"
                         break
+
+            # A terminal "continue_hold" from either the frame-1 ack above or
+            # this loop loops the same child back into a fresh hold-wait,
+            # any number of times, instead of falling into the release
+            # teardown below -- the vendor-traced shape this whole feature
+            # closes the gap on: one reservation, feed to eject, any number
+            # of fine scans in between. Reuses wait_for_hold_decision and
+            # load_validated_batch_job unchanged (both already sibling-
+            # tested at the original preview/first-batch boundary); every
+            # frame a later round captures goes through
+            # _run_live_continuation_frame -- there is no "special first
+            # frame" for a second-or-later round, since that shape only
+            # ever applies to the very first fine scan of the whole
+            # attempt, interleaved above with the preview/frame-table
+            # preamble.
+            while hold_requested:
+                hold_requested = False
+                if hold_job_path is None:
+                    raise ProtocolError(
+                        "continue_hold is only legal for an attempt "
+                        "launched with --preview-and-hold; this attempt "
+                        "has no hold plumbing"
+                    )
+                round_hold_session_id = secrets.token_hex(16)
+                round_root = hold_job_path.parent
+                round_hold_job_path = (
+                    round_root / f"hold-job-{round_hold_session_id}.json"
+                )
+                round_hold_ack_path = (
+                    round_root / f"hold-ack-{round_hold_session_id}.json"
+                )
+                round_hold_release_journal_path = (
+                    round_root / f"hold-release-{round_hold_session_id}.json"
+                )
+                session_journal.update(
+                    {
+                        "status": "held",
+                        "active_frame_index": None,
+                        "active_slot": None,
+                        "unit_release_attempts": 0,
+                        "unit_released": False,
+                        "recovery_required": None,
+                        "hold_resume": {
+                            "hold_session_id": round_hold_session_id,
+                            "hold_job_path": str(round_hold_job_path),
+                            "hold_ack_path": str(round_hold_ack_path),
+                            "hold_release_journal_path": str(
+                                round_hold_release_journal_path
+                            ),
+                        },
+                    }
+                )
+                _write_journal(session_journal_path, session_journal)
+
+                action = wait_for_hold_decision(
+                    round_hold_ack_path, hold_session_id=round_hold_session_id
+                )
+                if action == "release":
+                    hold_wait_release_receipt_path = round_hold_release_journal_path
+                    break
+                if action == "eject":
+                    eject_requested = True
+                    hold_wait_release_receipt_path = round_hold_release_journal_path
+                    break
+
+                # action == "scan": a fresh batch job has been durably
+                # published at round_hold_job_path -- validate it exactly
+                # as the original hold's own "scan" branch validates the
+                # first one (matching session id, same reviewed roll), then
+                # run every one of its frames as a continuation frame.  No
+                # RESERVE_UNIT, no repeated command 64, no repeated preview:
+                # the same retained reservation, preview raster, and frame
+                # table from above are reused as-is.
+                next_batch_job = load_validated_batch_job(
+                    round_hold_job_path,
+                    # Same reasoning as the original hold's own "scan"
+                    # branch above: no CLI channel exists to hand this
+                    # already-running child a precomputed expected hash for
+                    # a job published mid-run, so validate the file against
+                    # its own just-published bytes.
+                    expected_job_sha256=hashlib.sha256(
+                        round_hold_job_path.read_bytes()
+                    ).hexdigest(),
+                    expected_plan_sha256=plan_sha256,
+                    expected_continuation_sha256=continuation_plan_sha256,
+                )
+                if next_batch_job.session_id != round_hold_session_id:
+                    raise ProtocolError(
+                        "resumed batch job session id does not match this "
+                        "hold round"
+                    )
+                if next_batch_job.reviewed_fingerprint != batch_job.reviewed_fingerprint:
+                    raise ProtocolError(
+                        "resumed batch job belongs to a different reviewed "
+                        "roll preview"
+                    )
+                derive_equivalent_continuation_blocks(continuation_plan)
+                batch_job = next_batch_job
+                batch_selections = _derive_live_batch_selections(
+                    active_plan,
+                    preview_bytes,
+                    live_sub_8e_table,
+                    batch_job.frames,
+                    reviewed_fingerprint=batch_job.reviewed_fingerprint,
+                )
+                session_journal.update(
+                    {
+                        "session_id": batch_job.session_id,
+                        "batch_job_sha256": batch_job.job_sha256,
+                        "selected_slots": list(batch_job.selected_slots),
+                        "completed_slots": [],
+                        "active_frame_index": 1,
+                        "active_slot": batch_job.frames[0].slot,
+                        "manual_review_approval_sha256_by_slot": {
+                            str(spec.slot): (
+                                None
+                                if spec.manual_review_approval is None
+                                else spec.manual_review_approval.binding_sha256
+                            )
+                            for spec in batch_job.frames
+                        },
+                        "reviewed_roll_fingerprint_sha256": (
+                            batch_job.reviewed_fingerprint.binding_sha256
+                        ),
+                        "status": "capturing",
+                        "unit_release_attempts": 0,
+                        "unit_released": False,
+                        "recovery_required": None,
+                    }
+                )
+                _write_journal(session_journal_path, session_journal)
+                completed_slots = session_journal["completed_slots"]
+
+                for frame_index, (frame_spec, selection) in enumerate(
+                    zip(batch_job.frames, batch_selections, strict=True),
+                    start=1,
+                ):
+                    session_journal.update(
+                        {
+                            "active_frame_index": frame_index,
+                            "active_slot": frame_spec.slot,
+                            "status": "capturing",
+                        }
+                    )
+                    _write_journal(session_journal_path, session_journal)
+                    frame_journal = _run_live_continuation_frame(
+                        ep_out,
+                        ep_in,
+                        plan,
+                        plan_path,
+                        plan_sha256,
+                        continuation_plan,
+                        continuation_plan_sha256,
+                        frame_spec,
+                        selection,
+                        batch_job=batch_job,
+                        frame_index=frame_index,
+                        lifecycle=batch_lifecycle,
+                        density_calibration=density_calibration,
+                        density_evidence=density_evidence,
+                        actual_usb_bus=actual_usb_bus,
+                        actual_usb_address=actual_usb_address,
+                        expected_calibration_session_id=calibration_session_id,
+                        scanner_identity=scanner_identity,
+                    )
+                    completed_slots.append(frame_spec.slot)
+                    session_journal.update(
+                        {
+                            "active_frame_index": frame_index,
+                            "active_slot": frame_spec.slot,
+                            "status": "awaiting-parent-ack",
+                        }
+                    )
+                    _write_journal(session_journal_path, session_journal)
+                    action = wait_for_parent_ack(
+                        frame_spec.ack,
+                        session_id=batch_job.session_id,
+                        frame_index=frame_index,
+                        slot=frame_spec.slot,
+                        nonce=frame_journal["ack_nonce"],
+                    )
+                    if action in ("stop", "eject", "continue_hold"):
+                        batch_stopped = action == "stop"
+                        eject_requested = action == "eject"
+                        hold_requested = action == "continue_hold"
+                        break
+                # Falls back to the `while hold_requested:` top if this
+                # round's own terminal frame chose "continue_hold" again;
+                # otherwise exits the loop here (stop/eject from a frame
+                # ack, or release/eject from the hold-wait above).
 
             # Persist the attempt count before crossing the release boundary.
             # If release itself fails, the exception path must never retry it.
@@ -5583,6 +6595,12 @@ def run_live_capture(
             _write_journal(session_journal_path, session_journal)
             at_transaction_boundary = False
             batch_lifecycle.at_transaction_boundary = False
+            # A batch ack of "eject" (only ever legal as the terminal
+            # decision -- see wait_for_parent_ack's docstring) replays the
+            # traced vendor sequence here, still inside this attempt's
+            # original reservation, before the same RELEASE_UNIT every
+            # batch teardown already sends.
+            eject_evidence = _perform_vendor_eject(ep_out, ep_in) if eject_requested else None
             teardown = _release_unit(ep_out, ep_in)
             at_transaction_boundary = True
             batch_lifecycle.at_transaction_boundary = True
@@ -5593,21 +6611,61 @@ def run_live_capture(
                     "active_slot": None,
                     "finished_unix": time.time(),
                     "recovery_required": "none",
-                    "release_stall_recoveries": teardown.stall_recoveries,
+                    "release_stall_recoveries": (
+                        teardown.stall_recoveries
+                        + (eject_evidence["stall_recoveries"] if eject_evidence else 0)
+                    ),
                     "release_status": teardown.status.hex(),
-                    "status": "stopped" if batch_stopped else "complete",
+                    "status": (
+                        "ejected"
+                        if eject_requested
+                        else ("stopped" if batch_stopped else "complete")
+                    ),
                     "unit_released": True,
                 }
             )
+            if eject_evidence is not None:
+                session_journal["eject"] = eject_evidence
             _write_journal(session_journal_path, session_journal)
+            if hold_wait_release_receipt_path is not None:
+                # An explicit release/eject decision at a post-batch
+                # hold-wait (Roll.release()/Roll.eject() between two
+                # scan_many() calls, or close() finding one still held) --
+                # as opposed to a frame ack's "stop"/"eject" or a plain
+                # exhausted batch. release_held_session/eject_held_session
+                # validate exactly this shape (mirroring the original
+                # preview-hold's own completion receipt) against the
+                # dedicated, never-before-used file this round's own
+                # hold_resume named for exactly this purpose -- written
+                # only now, strictly after the RELEASE_UNIT above actually
+                # ran, so it can never claim a release that has not
+                # happened.
+                _write_json_exclusive(
+                    hold_wait_release_receipt_path,
+                    {
+                        "status": "complete",
+                        "capture_mode": "preview-and-hold",
+                        "hold_outcome": "ejected" if eject_requested else "released",
+                        "unit_released": True,
+                    },
+                )
         else:
             at_transaction_boundary = False
+            # Mirrors the batch branch above: a held preview released via
+            # the "eject" hold decision (never resumed into a scan) ends up
+            # here too, since batch_mode is False for it -- see
+            # `released_hold_without_scan`.
+            eject_evidence = _perform_vendor_eject(ep_out, ep_in) if eject_requested else None
             teardown = _release_unit(ep_out, ep_in)
             at_transaction_boundary = True
             reserved = False
-            journal["stall_recoveries"] += teardown.stall_recoveries
+            journal["stall_recoveries"] += teardown.stall_recoveries + (
+                eject_evidence["stall_recoveries"] if eject_evidence else 0
+            )
             journal["unit_released"] = True
             journal["status"] = "complete"
+            if eject_evidence is not None:
+                journal["eject"] = eject_evidence
             journal["finished_unix"] = time.time()
             _write_journal(journal_path, journal)
     except BaseException as error:
@@ -5658,6 +6716,16 @@ def run_live_capture(
         )
         if release_already_attempted and reserved:
             recovery_required = "power-cycle scanner before another attempt"
+        if isinstance(error, EjectWedgeSuspected):
+            # A defensive RELEASE_UNIT inside _cleanup_synchronized above can
+            # succeed even when the transport itself never actuated -- SCSI
+            # reservation release and physical eject motion are independent
+            # facts. Force the power-cycle diagnosis regardless of
+            # cleanup_complete so a clean release can never mask a
+            # suspected wedge (shortstrip-lab/INCIDENT-20260719-eject-from-
+            # park.md, 2026-07-24 reopening: "Power cycle remains the only
+            # demonstrated reset for the 022b4b wedge").
+            recovery_required = "power-cycle scanner before another attempt"
 
         if session_journal is not None and session_journal_path is not None:
             cleanup = journal.get("cleanup", {})
@@ -5685,6 +6753,35 @@ def run_live_capture(
             except Exception:
                 pass
 
+        if hold_wait_release_receipt_path is not None:
+            # An explicit release/eject decision at a post-batch hold-wait
+            # was already committed to ending the reservation here (see
+            # where this path is minted, above) when this exception struck
+            # mid-teardown -- most often EjectWedgeSuspected. The per-frame
+            # journals are each an earlier, unrelated frame's own immutable
+            # handoff (same reasoning as the block below); this dedicated
+            # file is what release_held_session/eject_held_session read for
+            # exactly this round, so it must carry the diagnosis instead of
+            # leaving them to find no file at all.
+            try:
+                _write_json_exclusive(
+                    hold_wait_release_receipt_path,
+                    {
+                        "status": (
+                            "interrupted"
+                            if isinstance(error, KeyboardInterrupt)
+                            else "failed"
+                        ),
+                        "error": f"{type(error).__name__}: {error}",
+                        "recovery_required": recovery_required,
+                        "capture_mode": "preview-and-hold",
+                        "hold_outcome": "ejected" if eject_requested else "released",
+                        "unit_released": False,
+                    },
+                )
+            except Exception:  # noqa: BLE001, S110 - best-effort diagnostic write must never mask the original exception
+                pass
+
         # A frame-complete journal is an immutable parent/child handoff.  The
         # parent may already have hashed, promoted, and deleted its scratch
         # stream, so a later ACK/continuation/release failure belongs only in
@@ -5702,6 +6799,11 @@ def run_live_capture(
                 pass
         raise
     finally:
+        if fine_output is not None:
+            try:
+                fine_output.close()
+            except Exception:
+                pass
         if meter_output is not None:
             try:
                 meter_output.close()
@@ -5748,6 +6850,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--session-journal",
         type=Path,
         help="durable batch-level release receipt required by --batch-job",
+    )
+    parser.add_argument(
+        "--hold-job",
+        type=Path,
+        help=(
+            "path a held preview-and-hold reservation will poll for a "
+            "resume (batch job) or release decision; need not exist at launch"
+        ),
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--journal", type=Path)
@@ -5821,6 +6931,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             "then release before frame binding or metering; does not accept --frame"
         ),
     )
+    mode.add_argument(
+        "--preview-and-hold",
+        action="store_true",
+        help=(
+            "capture and persist the whole-roll preview plus transport "
+            "table, then hold the reservation open at this transaction "
+            "boundary for a resume (batch job) or release decision at "
+            "--hold-job, instead of releasing; does not accept --frame"
+        ),
+    )
     parser.add_argument(
         "--live",
         action="store_true",
@@ -5833,15 +6953,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     batch_job: LiveBatchJob | None = None
     continuation_plan: dict[str, Any] | None = None
     continuation_plan_sha256: str | None = None
-    batch_requested = any(
-        value is not None
-        for value in (
-            args.batch_job,
-            args.expected_batch_job_sha256,
-            args.continuation_plan,
-            args.session_journal,
-        )
-    )
+    # `--continuation-plan` is shared between --batch-job (a fully specified
+    # batch launched fresh) and --preview-and-hold (a held preview that will
+    # only learn its frame list later); `batch_requested` intentionally does
+    # not include it, so a --preview-and-hold launch is never misrouted into
+    # the batch branch below just for also passing --continuation-plan.
+    batch_requested = args.batch_job is not None or args.session_journal is not None
     if batch_requested:
         if any(
             value is None
@@ -5866,6 +6983,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             or args.expected_usb_address is not None
             or args.meter_only
             or args.preview_only
+            or args.preview_and_hold
             or args.confirm_full_capture
         ):
             raise ProtocolError(
@@ -5920,6 +7038,54 @@ def main(argv: Sequence[str] | None = None) -> None:
             expected_usb_address=batch_job.expected_usb_address,
         )
         return
+    if args.preview_and_hold:
+        if args.hold_job is None:
+            raise ProtocolError("--preview-and-hold requires --hold-job")
+        if args.continuation_plan is None:
+            raise ProtocolError("--preview-and-hold requires --continuation-plan")
+        if (
+            args.frame is not None
+            or args.boundary_offset_rows != 0
+            or args.expected_frame_count is not None
+            or args.meter_only
+            or args.preview_only
+            or args.confirm_full_capture
+        ):
+            raise ProtocolError(
+                "preview-and-hold capture owns frame and mode arguments"
+            )
+        continuation_payload = args.continuation_plan.read_bytes()
+        continuation_plan_sha256 = hashlib.sha256(continuation_payload).hexdigest()
+        continuation_plan = verify_canonical_continuation_plan(continuation_payload)
+        output = args.output if args.output is not None else HERE / "rgbi4-roll-preview.bin"
+        journal = args.journal or output.with_suffix(".json")
+        print(
+            "validated preview-and-hold plan: persist whole-roll preview and "
+            "transport table, then hold the reservation open at this "
+            "transaction boundary for a resume/release decision"
+        )
+        if not args.live:
+            print("dry run only; scanner was not accessed")
+            return
+        run_live_capture(
+            plan,
+            args.plan,
+            plan_sha256,
+            output,
+            journal,
+            args.reads,
+            preview_and_hold=True,
+            hold_job_path=args.hold_job,
+            continuation_plan=continuation_plan,
+            continuation_plan_sha256=continuation_plan_sha256,
+            expected_usb_bus=args.expected_usb_bus,
+            expected_usb_address=args.expected_usb_address,
+        )
+        return
+    if args.continuation_plan is not None:
+        raise ProtocolError(
+            "--continuation-plan only applies to --batch-job or --preview-and-hold"
+        )
     if args.preview_only and args.frame is not None:
         raise ProtocolError("--preview-only does not accept --frame")
     if args.preview_only and args.boundary_offset_rows != 0:
