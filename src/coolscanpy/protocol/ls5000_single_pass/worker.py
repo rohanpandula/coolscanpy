@@ -5925,7 +5925,23 @@ def run_live_capture(
                                 live_selection,
                                 batch_job=batch_job,
                                 frame_index=1,
-                                frame_capture_attempt_id=output_path.parent.name,
+                                # `fine_output_path`, not `output_path`:
+                                # this receipt names the directory holding
+                                # *this frame's own* capture, which is what
+                                # every continuation frame records
+                                # (_run_live_continuation_frame's own
+                                # `output_path.parent.name`) and what the
+                                # parent re-derives from the frame paths it
+                                # handed the child. The two are the same
+                                # object for a cold batch -- output_path IS
+                                # the first frame spec's output there -- and
+                                # diverge only for a resume, whose
+                                # output_path is the held preview attempt's
+                                # own empty placeholder, one directory up
+                                # from the frame it is about to capture.
+                                frame_capture_attempt_id=(
+                                    fine_output_path.parent.name
+                                ),
                                 expected_calibration_session_id=calibration_session_id,
                             )
                         )

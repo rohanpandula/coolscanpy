@@ -6470,6 +6470,19 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     assert frame_7_journal["resumed_from_held_preview"] is True
     ownership = frame_7_journal["nikon_density_frame_ownership"]
     assert ownership["reservation_id"] == ownership["batch_session_id"]
+    # The receipt names the directory holding *this frame's* capture, not
+    # the held preview attempt one level up whose empty placeholder output
+    # this resumed attempt was launched with. The parent re-derives exactly
+    # this from the frame paths it published in the batch job
+    # (capture_process._validated_density_frame_ownership's
+    # `output_path.parent.name`), so a resumed frame 1 that names the
+    # attempt directory instead is refused with "density
+    # frame_capture_attempt_id changed at capture boundary" -- while every
+    # continuation frame of the same batch, which sources this from its own
+    # frame_spec.output, is accepted.
+    assert ownership["frame_capture_attempt_id"] == "frame-007"
+    assert frame_7.output.parent.name == "frame-007"
+    assert (root / "preview-placeholder.bin").parent.name != "frame-007"
 
     session_journal_path = root / "session-journal.json"
     session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
