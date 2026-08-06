@@ -3580,8 +3580,34 @@ def test_resume_held_session_with_continue_hold_returns_held_again(
         ({"session_id": "another-round"}, "session_id"),
         ({"unit_released": True}, "still held"),
         ({"hold_resume": {"hold_session_id": "short"}}, "hold_resume"),
+        # The identity invariants the release boundary has always checked
+        # and this one, until now, did not -- a reservation handed back for
+        # another round must prove the same things about itself.
+        (
+            {"density_calibration_session_id": "another-reservation"},
+            "density_calibration_session_id",
+        ),
+        ({"plan_sha256": "0" * 64}, "plan_sha256"),
+        ({"continuation_plan_sha256": "0" * 64}, "continuation_plan_sha256"),
+        ({"capture_engine_sha256": "0" * 64}, "capture_engine_sha256"),
+        ({"expected_usb_bus": 9}, "expected_usb_bus"),
+        (
+            {"manual_review_approval_sha256_by_slot": {"1": "0" * 64}},
+            "manual_review_approval_sha256_by_slot",
+        ),
     ],
-    ids=["completed-slots", "session-id", "already-released", "bad-rendezvous"],
+    ids=[
+        "completed-slots",
+        "session-id",
+        "already-released",
+        "bad-rendezvous",
+        "calibration-identity",
+        "plan-sha256",
+        "continuation-plan-sha256",
+        "capture-engine-sha256",
+        "usb-topology",
+        "manual-approvals",
+    ],
 )
 def test_refused_held_after_batch_journal_releases_the_child_instead_of_orphaning_it(
     tmp_path: Path,

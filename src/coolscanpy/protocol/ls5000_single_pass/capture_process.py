@@ -2338,18 +2338,46 @@ class CaptureProcessAdapter:
         carrying a well-formed rendezvous (``hold_resume``) for the next
         hold-wait round. Deliberately a narrower sibling of
         ``_load_and_validate_batch_session_journal``, not a reuse of it --
-        that method's own invariants (``unit_released`` True,
+        that method's own *release* invariants (``unit_released`` True,
         ``unit_release_attempts`` == 1, a status drawn from
         complete/stopped/ejected) describe a released reservation, the
-        opposite of what "held" means here."""
+        opposite of what "held" means here.
+
+        Its *identity* invariants have no such justification, and are
+        checked here too. A reservation that is about to be handed back for
+        another round has to prove the same things about itself that one
+        being released does -- reservation-wide calibration identity, code
+        and wire-resource identity, USB topology, per-slot approvals -- or
+        the hold boundary is the one place in a feed where an identity can
+        drift unobserved, which is precisely the class of defect the
+        2026-08-06 live session kept finding."""
 
         invariants: dict[str, object] = {
             "session_id": prepared.session_id,
+            # Not session_id: reservation-wide, and the whole point of a
+            # multi-round feed (see PreparedCaptureBatch's docstring).
+            "density_calibration_session_id": prepared.calibration_session_id,
             "batch_job_sha256": prepared.job_sha256,
             "selected_slots": list(prepared.request.selected_slots),
+            "capture_engine_sha256": self._expected_worker_sha256,
+            "capture_bundle_sha256": (
+                self._expected_bundle_sha256 or CAPTURE_BUNDLE_SHA256
+            ),
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "manual_review_approval_sha256_by_slot": {
+                str(frame.selected_slot): (
+                    None
+                    if frame.manual_review_approval is None
+                    else frame.manual_review_approval.binding_sha256
+                )
+                for frame in prepared.request.frames
+            },
             "reviewed_roll_fingerprint_sha256": (
                 prepared.request.reviewed_fingerprint.binding_sha256
             ),
+            "expected_usb_bus": prepared.request.expected_usb_bus,
+            "expected_usb_address": prepared.request.expected_usb_address,
         }
         for key, expected in invariants.items():
             if payload.get(key) != expected:
