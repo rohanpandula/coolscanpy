@@ -4114,8 +4114,23 @@ def _density_frame_ownership_receipt(
     batch_job: LiveBatchJob,
     frame_index: int,
     frame_capture_attempt_id: str,
+    expected_calibration_session_id: str,
 ) -> dict[str, object]:
-    """Close preview ownership for one frame in an uninterrupted batch."""
+    """Close preview ownership for one frame in an uninterrupted batch.
+
+    ``expected_calibration_session_id`` -- not ``batch_job.session_id`` --
+    is the identity bound into the receipt's ``batch_session_id``, for the
+    same reason ``_run_live_continuation_frame`` already compares its own
+    density checks against it instead of ``batch_job.session_id`` (see that
+    function's docstring): a preview-and-hold's density evidence is bound
+    to the reservation-wide calibration identity established once, before
+    any batch job exists, while ``batch_job.session_id`` is the (by design)
+    independently-minted hold/resume session id for this specific round.
+    They coincide for a cold batch and diverge for every held-and-resumed
+    one, so comparing against ``batch_job.session_id`` here would fail
+    density.py's reservation/batch identity check on every resumed batch's
+    first frame -- the exact defect this parameter closes.
+    """
 
     if selection.reviewed_fingerprint_sha256 is None:
         raise ProtocolError("density ownership has no reviewed roll identity")
@@ -4126,7 +4141,7 @@ def _density_frame_ownership_receipt(
     receipt = build_nikon_density_frame_ownership(
         evidence,
         reservation_id=evidence.source_binding.session_id,
-        batch_session_id=batch_job.session_id,
+        batch_session_id=expected_calibration_session_id,
         transport_table_sha256=selection.table_sha256,
         reviewed_fingerprint_sha256=selection.reviewed_fingerprint_sha256,
         fresh_fingerprint_sha256=selection.fresh_fingerprint.binding_sha256,
@@ -4239,6 +4254,7 @@ def _run_live_continuation_frame(
         batch_job=batch_job,
         frame_index=frame_index,
         frame_capture_attempt_id=output_path.parent.name,
+        expected_calibration_session_id=expected_calibration_session_id,
     )
     journal: dict[str, Any] = {
         "status": "starting",
@@ -5701,6 +5717,14 @@ def run_live_capture(
                             "completed_bytes": 0,
                             "stall_recoveries": 0,
                             "started_unix": time.time(),
+                            # Same field, same identity, a cold batch's own
+                            # per-frame journal carries from the shared
+                            # "starting" journal init above -- this branch
+                            # replaces `journal` wholesale rather than
+                            # updating it, so it has to be restated here too
+                            # (see the sibling note on session_journal just
+                            # below).
+                            "density_calibration_session_id": calibration_session_id,
                             "meter_evidence_path": str(meter_sidecar_path.resolve()),
                             "ack_nonce": None,
                             "batch_session": {
@@ -5736,6 +5760,16 @@ def run_live_capture(
                         session_journal = {
                             "status": "capturing",
                             "session_id": batch_job.session_id,
+                            # Same reservation-wide identity a cold batch's
+                            # own session_journal carries from launch (see
+                            # the batch_mode branch above) -- this resumed
+                            # batch's session_journal replaces that dict
+                            # wholesale rather than updating it, so it has
+                            # to be restated here too, or a reader (the
+                            # parent's CaptureProcessAdapter included) sees
+                            # it silently go missing on every resumed
+                            # batch's first frame.
+                            "density_calibration_session_id": calibration_session_id,
                             "selected_slots": list(batch_job.selected_slots),
                             "completed_slots": [],
                             "active_frame_index": 1,
@@ -5859,6 +5893,7 @@ def run_live_capture(
                                 batch_job=batch_job,
                                 frame_index=1,
                                 frame_capture_attempt_id=output_path.parent.name,
+                                expected_calibration_session_id=calibration_session_id,
                             )
                         )
                     journal["meter_observed_exposures_raw_10ns"] = []

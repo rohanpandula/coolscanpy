@@ -17,6 +17,7 @@ import gc
 import hashlib
 import functools
 import json
+import contextvars
 import secrets
 import struct
 import subprocess
@@ -199,6 +200,19 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+# _FakeBatchProcess.__post_init__ eagerly emits frame 1 (mirrors the real
+# worker writing it before any parent code can observe the child), so a
+# _FakeHeldWorkerProcess delegate's calibration_session_id has to be visible
+# *during* that construction, not after -- delegate_factory is an opaque
+# 2-arg callable each test defines, so there is no constructor kwarg to pass
+# it through. Set immediately before delegate_factory(...) and reset in a
+# finally, exactly the "implicit parameter for one specific callback" a
+# contextvar is for.
+_AMBIENT_CALIBRATION_SESSION_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("_ambient_calibration_session_id", default=None)
+)
+
+
 def _density_calibration_provenance(session_id: str) -> dict[str, object]:
     reads = [
         decode_density_calibration_read(
@@ -266,9 +280,19 @@ def _density_batch_frame_provenance(
     output: Path,
     frame_index: int,
     selected_slot: int,
+    calibration_session_id: str | None = None,
 ) -> tuple[dict[str, object], str, str]:
+    """``calibration_session_id`` defaults to the job's own session id --
+    correct for a cold batch -- so every existing cold-batch caller is
+    unaffected; a held/resumed caller (``_FakeBatchProcess`` acting as
+    ``_FakeHeldWorkerProcess``'s delegate) passes its own separately to
+    model the real divergence between a batch/round's own session id and
+    the reservation-wide calibration identity that held preview minted.
+    """
+
     job = json.loads(job_path.read_text(encoding="utf-8"))
     session_id = job["session_id"]
+    calibration_session_id = calibration_session_id or session_id
     selected_slots = tuple(frame["slot"] for frame in job["frames"])
     first_output = job_path.parent / job["frames"][0]["output"]
     calibration = assemble_density_calibration(
@@ -286,24 +310,24 @@ def _density_batch_frame_provenance(
                 start=1,
             )
         ],
-        session_id=session_id,
+        session_id=calibration_session_id,
     )
     source = _density_source_fixture()
     evidence = build_nikon_density_evidence(
         source,
         calibration=calibration,
         density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
-        session_id=session_id,
+        session_id=calibration_session_id,
         capture_attempt_id=first_output.parent.name,
-        scan_identity=f"{session_id}:density-97dpi:{_sha256(source)}",
+        scan_identity=f"{calibration_session_id}:density-97dpi:{_sha256(source)}",
     )
     if frame_index == 1:
         first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
     table_sha = "2" * 64
     ownership = build_nikon_density_frame_ownership(
         evidence,
-        reservation_id=session_id,
-        batch_session_id=session_id,
+        reservation_id=calibration_session_id,
+        batch_session_id=calibration_session_id,
         transport_table_sha256=table_sha,
         reviewed_fingerprint_sha256=job["reviewed_roll_fingerprint"]["binding_sha256"],
         fresh_fingerprint_sha256=job["reviewed_roll_fingerprint"]["binding_sha256"],
@@ -649,6 +673,12 @@ class _FakeBatchProcess:
     session_journal_path: Path
     events: list[str]
     stop_after_index: int | None = None
+    # Reservation-wide calibration identity, distinct from job["session_id"]
+    # (this batch/round's own, independently-minted id) whenever this
+    # instance is acting as _FakeHeldWorkerProcess's delegate for a resumed
+    # batch -- None (the default) falls back to job["session_id"], correct
+    # for a standalone cold-batch use of this fake.
+    calibration_session_id: str | None = None
     # Set by poll() when a frame ack is "continue_hold": the outer
     # _FakeHeldWorkerProcess (see its own poll()) notices this every poll
     # and resets itself back to a fresh hold-wait at the paths named here,
@@ -660,6 +690,8 @@ class _FakeBatchProcess:
         self.job = json.loads(self.job_path.read_text(encoding="utf-8"))
         self.index = 0
         self.returncode: int | None = None
+        if self.calibration_session_id is None:
+            self.calibration_session_id = _AMBIENT_CALIBRATION_SESSION_ID.get()
         # The real worker overwrites the session journal to "capturing"
         # immediately on processing "scan", strictly before it captures
         # anything -- sequentially before the frame this round's own
@@ -699,12 +731,15 @@ class _FakeBatchProcess:
                 output=output,
                 frame_index=self.index + 1,
                 selected_slot=frame["slot"],
+                calibration_session_id=self.calibration_session_id,
             )
         )
         if self.index == 0:
             self.density_evidence_receipt = density["nikon_density_evidence"]
         journal = {
-            **_density_calibration_provenance(self.job["session_id"]),
+            **_density_calibration_provenance(
+                self.calibration_session_id or self.job["session_id"]
+            ),
             **density,
             "ack_nonce": f"nonce-{frame['slot']}",
             "batch_session": {
@@ -952,7 +987,9 @@ class _FakeBatchProcess:
                 ),
             }
             session_journal = {
-                **_density_calibration_provenance(self.job["session_id"]),
+                **_density_calibration_provenance(
+                    self.calibration_session_id or self.job["session_id"]
+                ),
                 "nikon_density_evidence": self.density_evidence_receipt,
                 "batch_job_sha256": _sha256(self.job_path.read_bytes()),
                 "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
@@ -991,7 +1028,9 @@ class _FakeBatchProcess:
             return None
         ejected = ack["action"] == "eject" and not forced_stop
         session_journal: dict[str, Any] = {
-            **_density_calibration_provenance(self.job["session_id"]),
+            **_density_calibration_provenance(
+                self.calibration_session_id or self.job["session_id"]
+            ),
             "nikon_density_evidence": self.density_evidence_receipt,
             "batch_job_sha256": _sha256(self.job_path.read_bytes()),
             "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
@@ -1071,10 +1110,19 @@ class _RefusalBatchProcess:
 
     def __post_init__(self) -> None:
         job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        # Same ambient-identity handoff _FakeBatchProcess.__post_init__
+        # uses: set (only) while this instance is being constructed as
+        # _FakeHeldWorkerProcess's delegate, via delegate_factory -- see
+        # that class's poll(). Falls back to job["session_id"] outside a
+        # held-preview context (a standalone cold-batch refusal), where
+        # the two coincide.
+        calibration_session_id = (
+            _AMBIENT_CALIBRATION_SESSION_ID.get() or job["session_id"]
+        )
         self.session_journal_path.write_text(
             json.dumps(
                 {
-                    **_density_calibration_provenance(job["session_id"]),
+                    **_density_calibration_provenance(calibration_session_id),
                     "batch_job_sha256": _sha256(self.job_path.read_bytes()),
                     "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
                     "capture_engine_sha256": _sha256(_FAKE_WORKER_SOURCE),
@@ -1328,6 +1376,10 @@ class _FakeHeldWorkerProcess:
         self.journal_path.write_text(json.dumps(journal), encoding="utf-8")
         self.events.append("preview-hold-ready")
         self._release_journal_path = self.journal_path
+        # Stashed so poll() can hand it to every delegate this held
+        # reservation resumes into, across every round -- see poll()'s own
+        # delegate_factory call below.
+        self.density_session_id = density_session_id
 
     def die(self, returncode: int = 1) -> None:
         """Simulate the held child having already exited (crash, power
@@ -1410,7 +1462,20 @@ class _FakeHeldWorkerProcess:
         # ordering the real worker's wait_for_hold_decision/hold-ack.json
         # handshake requires too.
         session_journal_path = self.hold_job_path.with_name("session-journal.json")
-        self._delegate = self.delegate_factory(self.hold_job_path, session_journal_path)
+        # The delegate is this round's own resumed-batch double: it does not
+        # know the reservation-wide calibration identity this held preview
+        # minted (its own job.json only carries this round's independently-
+        # minted session id -- see PreparedCaptureBatch's docstring for why
+        # those two are not the same thing). _FakeBatchProcess.__post_init__
+        # emits frame 1 eagerly, synchronously inside delegate_factory(...)
+        # below -- there is no "after construction" moment early enough to
+        # set this directly, hence the ambient contextvar instead of a
+        # simple post-construction attribute set.
+        token = _AMBIENT_CALIBRATION_SESSION_ID.set(self.density_session_id)
+        try:
+            self._delegate = self.delegate_factory(self.hold_job_path, session_journal_path)
+        finally:
+            _AMBIENT_CALIBRATION_SESSION_ID.reset(token)
         return None
 
     def wait(self, timeout: float | None = None) -> int:

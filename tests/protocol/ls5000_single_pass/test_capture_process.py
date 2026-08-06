@@ -88,24 +88,39 @@ def _batch_density_frame_provenance(
     output: Path,
     frame_index: int,
     selected_slot: int,
+    calibration_session_id: str | None = None,
 ) -> tuple[dict[str, object], str, str]:
-    """Build exact density evidence/ownership for a synthetic batch frame."""
+    """Build exact density evidence/ownership for a synthetic batch frame.
+
+    ``calibration_session_id`` defaults to the job's own session id --
+    correct for a cold batch (see ``_batch_session_provenance``) -- so
+    every existing cold-batch caller is unaffected; a held/resumed caller
+    passes its own separately to model the real divergence between a
+    batch/round's own session id and the reservation-wide calibration
+    identity.
+    """
 
     job = json.loads(job_path.read_text(encoding="utf-8"))
     session_id = job["session_id"]
+    calibration_session_id = calibration_session_id or session_id
     selected_slots = tuple(frame["slot"] for frame in job["frames"])
     first_output = job_path.parent / job["frames"][0]["output"]
     calibration = single_pass.DensityCalibration.from_dict(
-        _density_calibration_provenance(session_id)["nikon_density_calibration"]
+        _density_calibration_provenance(calibration_session_id)[
+            "nikon_density_calibration"
+        ]
     )
     source = _density_source_fixture()
     evidence = single_pass.build_nikon_density_evidence(
         source,
         calibration=calibration,
         density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
-        session_id=session_id,
+        session_id=calibration_session_id,
         capture_attempt_id=first_output.parent.name,
-        scan_identity=f"{session_id}:density-97dpi:{hashlib.sha256(source).hexdigest()}",
+        scan_identity=(
+            f"{calibration_session_id}:density-97dpi:"
+            f"{hashlib.sha256(source).hexdigest()}"
+        ),
     )
     if frame_index == 1:
         first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
@@ -113,8 +128,8 @@ def _batch_density_frame_provenance(
     table_sha = "e" * 64
     ownership = single_pass.build_nikon_density_frame_ownership(
         evidence,
-        reservation_id=session_id,
-        batch_session_id=session_id,
+        reservation_id=calibration_session_id,
+        batch_session_id=calibration_session_id,
         transport_table_sha256=table_sha,
         reviewed_fingerprint_sha256=reviewed_sha,
         fresh_fingerprint_sha256="d" * 64,
@@ -237,7 +252,8 @@ def test_capture_boundary_invalidates_density_on_any_ownership_change(
         capture._validated_density_frame_ownership(
             journal,
             output_path=output,
-            expected_session_id=session_id,
+            expected_batch_session_id=session_id,
+            expected_calibration_session_id=session_id,
             expected_frame_index=1,
             expected_frame_total=1,
             expected_selected_slots=(4,),
@@ -368,10 +384,19 @@ class Binding:
 def _batch_session_provenance(
     job_path: Path,
     worker_sha256: str,
+    *,
+    calibration_session_id: str | None = None,
 ) -> dict[str, object]:
+    """``calibration_session_id`` defaults to the job's own session id --
+    correct for a cold batch, where they coincide (see
+    ``PreparedCaptureBatch``'s docstring) -- so every existing cold-batch
+    caller is unaffected. A held/resumed caller passes its own separately
+    to model the real divergence.
+    """
+
     job = json.loads(job_path.read_text(encoding="utf-8"))
     return {
-        **_density_calibration_provenance(job["session_id"]),
+        **_density_calibration_provenance(calibration_session_id or job["session_id"]),
         "batch_job_sha256": hashlib.sha256(job_path.read_bytes()).hexdigest(),
         "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
         "capture_engine_sha256": worker_sha256,
@@ -2594,6 +2619,14 @@ class FakeHeldBatchProcess:
     hold_ack_path: Path
     worker_sha256: str
     hold_session_id: str = field(default_factory=lambda: secrets.token_hex(16))
+    # Reservation-wide, unlike hold_session_id: minted once here and never
+    # reset across hold rounds (see poll()'s held_resume branch), exactly
+    # mirroring the real worker's calibration_session_id -- independently
+    # minted from any batch/round's own session id (PreparedCaptureBatch's
+    # docstring).
+    calibration_session_id: str = field(
+        default_factory=lambda: f"single-reservation-{secrets.token_hex(16)}"
+    )
     events: list[str] = field(default_factory=list)
     journal_overrides: dict[str, Any] | None = None
     _job: dict[str, Any] | None = field(default=None, init=False)
@@ -2618,6 +2651,7 @@ class FakeHeldBatchProcess:
             "status": "awaiting-hold-job",
             "capture_mode": "preview-and-hold",
             "hold_session_id": self.hold_session_id,
+            "density_calibration_session_id": self.calibration_session_id,
             "requested_frame": None,
             "requested_boundary_offset_rows": 0,
             "expected_frame_count": None,
@@ -2755,7 +2789,11 @@ class FakeHeldBatchProcess:
         session_journal_path.write_text(
             json.dumps(
                 {
-                    **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+                    **_batch_session_provenance(
+                        self.hold_job_path,
+                        self.worker_sha256,
+                        calibration_session_id=self.calibration_session_id,
+                    ),
                     "completed_slots": [],
                     "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
                     "plan_sha256": CANONICAL_PLAN_SHA256,
@@ -2787,11 +2825,12 @@ class FakeHeldBatchProcess:
             output=output,
             frame_index=self._frame_index + 1,
             selected_slot=frame["slot"],
+            calibration_session_id=self.calibration_session_id,
         )
         frame_journal.write_text(
             json.dumps(
                 {
-                    **_density_calibration_provenance(self._job["session_id"]),
+                    **_density_calibration_provenance(self.calibration_session_id),
                     **density,
                     "ack_nonce": f"nonce-{frame['slot']}",
                     "batch_session": {
@@ -2876,7 +2915,11 @@ class FakeHeldBatchProcess:
             }
             session_journal_path = self.hold_job_path.with_name("session-journal.json")
             session_journal = {
-                **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+                **_batch_session_provenance(
+                    self.hold_job_path,
+                    self.worker_sha256,
+                    calibration_session_id=self.calibration_session_id,
+                ),
                 "completed_slots": completed,
                 "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
                 "plan_sha256": CANONICAL_PLAN_SHA256,
@@ -2897,7 +2940,11 @@ class FakeHeldBatchProcess:
         session_journal_path = self.hold_job_path.with_name("session-journal.json")
         ejected = ack["action"] == "eject"
         session_journal: dict[str, Any] = {
-            **_batch_session_provenance(self.hold_job_path, self.worker_sha256),
+            **_batch_session_provenance(
+                self.hold_job_path,
+                self.worker_sha256,
+                calibration_session_id=self.calibration_session_id,
+            ),
             "completed_slots": completed,
             "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
             "plan_sha256": CANONICAL_PLAN_SHA256,
@@ -3034,6 +3081,22 @@ def test_resume_held_session_launches_no_new_worker_process(
     assert result.session_journal["reservation_acquired"] is True
     assert result.session_journal["unit_released"] is True
     assert result.session_journal["unit_release_attempts"] == 1
+    # Regression (2026-08-06 live failure): the resumed batch's session
+    # journal must carry the calibration's reservation-wide identity, and
+    # this package's own post-hoc validation (_load_and_validate_batch_
+    # session_journal, reached only via a COMPLETE outcome above) must
+    # accept it even though it genuinely differs from this round's own
+    # session_id -- held.hold_session_id is independently minted per hold
+    # round (see PreparedCaptureBatch's docstring), so a fixture where they
+    # coincided would not actually exercise this.
+    assert (
+        result.session_journal["density_calibration_session_id"]
+        == held.preview_attempt.journal["density_calibration_session_id"]
+    )
+    assert (
+        result.session_journal["session_id"]
+        != result.session_journal["density_calibration_session_id"]
+    )
 
 
 def test_cold_run_batch_session_argv_is_unchanged_by_held_preview_support(

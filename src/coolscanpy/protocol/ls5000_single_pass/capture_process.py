@@ -251,14 +251,25 @@ def _validated_density_frame_ownership(
     journal: dict[str, Any],
     *,
     output_path: Path,
-    expected_session_id: str,
+    expected_batch_session_id: str,
+    expected_calibration_session_id: str,
     expected_frame_index: int,
     expected_frame_total: int,
     expected_selected_slots: tuple[int, ...],
     expected_selected_slot: int,
     evidence: NikonDensityEvidence | None = None,
 ) -> NikonDensityFrameOwnershipReceipt:
-    """Validate one frame's exact reservation-preview ownership receipt."""
+    """Validate one frame's exact reservation-preview ownership receipt.
+
+    Two distinct identities, deliberately not one: ``expected_batch_session_id``
+    is this specific batch/round's own session id (a fresh one every held
+    round -- see ``worker._density_frame_ownership_receipt``'s docstring and
+    ``PreparedCaptureBatch``'s), checked against the journal's own
+    ``batch_session`` block. ``expected_calibration_session_id`` is the
+    reservation-wide identity the density receipt itself is bound to, which
+    persists across every round of one feed-to-eject reservation. They
+    coincide for a cold batch and diverge for a resumed one.
+    """
 
     receipt = NikonDensityFrameOwnershipReceipt.from_dict(
         journal.get("nikon_density_frame_ownership")
@@ -267,7 +278,7 @@ def _validated_density_frame_ownership(
         "frame_index": expected_frame_index,
         "frame_total": expected_frame_total,
         "selected_slots": list(expected_selected_slots),
-        "session_id": expected_session_id,
+        "session_id": expected_batch_session_id,
     }
     if journal.get("batch_session") != expected_batch:
         raise ValueError("density ownership batch journal identity is inconsistent")
@@ -278,8 +289,8 @@ def _validated_density_frame_ownership(
     if type(roll_identity) is not dict:
         raise ValueError("density ownership roll identity is missing")
     expected = {
-        "reservation_id": expected_session_id,
-        "batch_session_id": expected_session_id,
+        "reservation_id": expected_calibration_session_id,
+        "batch_session_id": expected_calibration_session_id,
         "preview_sha256": selection.get("preview_sha256"),
         "transport_table_sha256": selection.get("table_sha256"),
         "reviewed_fingerprint_sha256": roll_identity.get("reviewed_fingerprint_sha256"),
@@ -1156,13 +1167,28 @@ class BatchSessionPaths:
 
 @dataclass(frozen=True)
 class PreparedCaptureBatch:
-    """Hardware-free description of exactly one worker process."""
+    """Hardware-free description of exactly one worker process.
+
+    ``session_id`` and ``calibration_session_id`` coincide for a cold batch
+    (calibration runs inside that same batch) but diverge for a
+    preview-and-hold resume: ``session_id`` is this specific batch/round's
+    own identity (a fresh one every hold round, by design -- see
+    ``worker._density_frame_ownership_receipt``'s docstring), while
+    ``calibration_session_id`` is the reservation-wide identity the held
+    preview's density calibration was actually bound to, which persists
+    across every round of the same feed-to-eject reservation. Validators
+    that check the worker's density receipts must compare against
+    ``calibration_session_id``, not ``session_id`` -- confusing the two
+    here is what let a resumed batch's first frame reach the child
+    correctly but still fail this package's own post-hoc validation.
+    """
 
     request: CaptureBatchRequest
     paths: BatchSessionPaths
     argv: tuple[str, ...]
     job_sha256: str
     session_id: str
+    calibration_session_id: str
 
 
 @dataclass(frozen=True)
@@ -1195,7 +1221,12 @@ class CaptureAttemptResult:
             return None
         return _validated_density_calibration(
             self.journal,
-            expected_session_id=self.batch_session_id,
+            # Not self.batch_session_id: that is this batch/round's own
+            # session id, which diverges from the calibration's
+            # reservation-wide identity for a resumed batch (see
+            # PreparedCaptureBatch's docstring). The journal's own
+            # top-level field is the reservation-wide one.
+            expected_session_id=self.journal.get("density_calibration_session_id"),
         )
 
     @property
@@ -1225,7 +1256,10 @@ class CaptureAttemptResult:
         return _validated_density_frame_ownership(
             self.journal,
             output_path=self.paths.output,
-            expected_session_id=self.batch_session_id,
+            expected_batch_session_id=self.batch_session_id,
+            expected_calibration_session_id=(
+                self.journal.get("density_calibration_session_id")
+            ),
             expected_frame_index=self.batch_frame_index,
             expected_frame_total=self.batch_frame_total,
             expected_selected_slots=self.batch_selected_slots,
@@ -1781,6 +1815,12 @@ class CaptureProcessAdapter:
             argv=argv,
             job_sha256=job_sha256,
             session_id=session_id,
+            # Cold launch: calibration runs inside this same batch, seeded
+            # from this batch's own session id (mirrors worker.py's own
+            # `calibration_session_id = batch_job.session_id if batch_job
+            # is not None else ...`) -- the two coincide here by
+            # construction.
+            calibration_session_id=session_id,
         )
 
     def run_batch_session(
@@ -2675,6 +2715,23 @@ class CaptureProcessAdapter:
             job_path = held.hold_job_path
             session_journal_path = held.directory / "session-journal.json"
             payload = self._batch_job_bytes(request, session_id=held.hold_session_id)
+            # held.hold_session_id is this round's own (fresh, per-round)
+            # identity, not the reservation-wide one this held preview's
+            # density calibration is actually bound to -- see
+            # PreparedCaptureBatch's own docstring. The preview attempt's
+            # journal has carried the real one since preview completed
+            # (worker.py writes it unconditionally, not only in batch mode).
+            calibration_session_id = (
+                None
+                if held.preview_attempt.journal is None
+                else held.preview_attempt.journal.get("density_calibration_session_id")
+            )
+            if not isinstance(calibration_session_id, str) or not calibration_session_id:
+                self._release_held_session_locked(held)
+                raise CaptureProcessError(
+                    "held preview journal has no density calibration identity "
+                    "to resume against"
+                )
             try:
                 _write_exclusive(job_path, payload)
             except OSError as error:
@@ -2705,6 +2762,7 @@ class CaptureProcessAdapter:
                 argv=held.preview_attempt.argv,
                 job_sha256=hashlib.sha256(payload).hexdigest(),
                 session_id=held.hold_session_id,
+                calibration_session_id=calibration_session_id,
             )
             try:
                 self._publish_hold_ack(held, action="scan")
@@ -3397,7 +3455,7 @@ class CaptureProcessAdapter:
         try:
             _validated_density_calibration(
                 payload,
-                expected_session_id=prepared.session_id,
+                expected_session_id=prepared.calibration_session_id,
             )
         except ValueError as error:
             raise CaptureProcessError(
@@ -3541,7 +3599,8 @@ class CaptureProcessAdapter:
             _validated_density_frame_ownership(
                 payload,
                 output_path=paths.output,
-                expected_session_id=prepared.session_id,
+                expected_batch_session_id=prepared.session_id,
+                expected_calibration_session_id=prepared.calibration_session_id,
                 expected_frame_index=frame_index,
                 expected_frame_total=len(selected_slots),
                 expected_selected_slots=selected_slots,
@@ -3679,7 +3738,11 @@ class CaptureProcessAdapter:
             expected_completed.append(stopped_unhandled_slot)
         invariants: dict[str, object] = {
             "session_id": prepared.session_id,
-            "density_calibration_session_id": prepared.session_id,
+            # Not prepared.session_id: the calibration identity is
+            # reservation-wide and diverges from this batch/round's own
+            # session id for a resumed batch -- see PreparedCaptureBatch's
+            # docstring.
+            "density_calibration_session_id": prepared.calibration_session_id,
             "selected_slots": list(prepared.request.selected_slots),
             "batch_job_sha256": prepared.job_sha256,
             "capture_engine_sha256": self._expected_worker_sha256,
@@ -3767,7 +3830,7 @@ class CaptureProcessAdapter:
             try:
                 _validated_density_calibration(
                     payload,
-                    expected_session_id=prepared.session_id,
+                    expected_session_id=prepared.calibration_session_id,
                 )
             except ValueError as error:
                 raise CaptureProcessError(

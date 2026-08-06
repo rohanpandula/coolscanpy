@@ -5951,3 +5951,524 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     assert session_journal["unit_release_attempts"] == 1
     assert "eject" in session_journal
     assert session_journal["eject"]["terminal_sense"] == worker_module.EJECT_TERMINAL_SENSE
+
+
+def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the density identity mismatch a live preview+hold ->
+    scan_many() resume reproduced on 2026-08-06:
+    ``_density_frame_ownership_receipt`` bound the receipt's
+    ``batch_session_id`` to ``batch_job.session_id``, but a resumed batch's
+    ``batch_job.session_id`` is the independently-minted hold/resume round
+    token (see that function's own docstring), not the reservation-wide
+    ``calibration_session_id`` the held preview's density evidence is
+    actually bound to.  Every resumed batch's first frame therefore failed
+    density.py's reservation/batch identity check with "density reservation
+    and batch session identities disagree" -- reproducibly, on the very
+    first resume, before this test's own fix threaded
+    ``expected_calibration_session_id`` through instead.
+
+    Drives the real state machine one round deep (preview-and-hold, then one
+    scan_many()-shaped resume ending in eject) -- only the USB wire
+    transactions and the geometry-specific density/preview boundary this
+    shrunk fixture can't satisfy are faked, mirroring
+    test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after's
+    own fixture shape. Unlike that test, ``_density_frame_ownership_receipt``
+    is deliberately left unmocked here: the whole point is to exercise its
+    real identity threading end to end.
+    """
+
+    plan = load_canonical_plan()
+    canonical_target = worker_module.validate_plan(plan)
+    tiny_target = {
+        **canonical_target,
+        "repeat": 1,
+        "request_len": 1,
+        "request_parts": [1],
+    }
+    for sequence in worker_module.PREVIEW_READ_SEQUENCES:
+        entry = plan[sequence - 1]
+        entry["request_len"] = 1
+        entry["request_parts"] = [1]
+
+    records = tuple(
+        TransportRecord(
+            row=row,
+            code=6 * (row % 18),
+            selector=row // 18,
+            native_origin=42 * row,
+        )
+        for row in range(6_000)
+    )
+    origins = tuple(
+        NativeFrameOrigin(
+            frame=frame,
+            boundary_index=frame - 1,
+            boundary_output_row=row - 4,
+            lookup_row=row,
+            code=records[row].code,
+            selector=records[row].selector,
+            native_origin=records[row].native_origin,
+            method="direct-gap-trailing-row",
+            automatic=True,
+            manual_review=False,
+            review_reasons=(),
+            affine_residual_rows=0.0,
+        )
+        for frame, row in enumerate(
+            (100 + 143 * index for index in range(37)),
+            start=1,
+        )
+    )
+    base_mapping = TransportMapping(
+        6_000,
+        origins[0].native_origin - 42.0 * origins[0].boundary_output_row,
+        42.0,
+        0.0,
+        0.0,
+        origins,
+    )
+    combined, resolved = apply_batch_boundary_offsets(
+        base_mapping,
+        records,
+        ((7, 9),),
+    )
+    geometry = SimpleNamespace(
+        requested_resolution=97,
+        native_resolution=4_000,
+        pitch=41,
+        native_width=3_946,
+        native_height=250_278,
+        width=96,
+        height=len(worker_module.PREVIEW_READ_SEQUENCES),
+        block_bytes=1,
+        expected_stream_bytes=len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+
+    def selection_for(slot: int, offset: int, pair: tuple) -> SimpleNamespace:
+        base, selected, _rebase = pair
+        return SimpleNamespace(
+            frame=slot,
+            frame_count=len(combined.origins),
+            geometry=geometry,
+            mapping=combined,
+            base_selected=base,
+            selected=selected,
+            requested_boundary_offset_rows=offset,
+            applied_boundary_offset_rows=offset,
+            # _density_frame_ownership_receipt is unmocked in this test (see
+            # module docstring above), so -- unlike the two-round fixture
+            # this one is adapted from -- these fields have to be real
+            # digest-shaped strings: build_nikon_density_frame_ownership
+            # requires preview_sha256 to equal the density evidence's own
+            # wire_sha256 ("e" * 64 below), and reviewed_fingerprint_sha256/
+            # fresh_fingerprint.binding_sha256/table_sha256 all pass through
+            # density.py's `_require_digest` (64 lowercase hex characters).
+            preview_sha256="e" * 64,
+            table_sha256="c" * 64,
+            reviewed_fingerprint_sha256="a" * 64,
+            fresh_fingerprint=SimpleNamespace(binding_sha256="b" * 64),
+            diagnostics=lambda: {
+                "frame": slot,
+                "boundary_offset": {
+                    "requested_rows": offset,
+                    "applied_rows": offset,
+                },
+                "selected": {
+                    "frame": slot,
+                    "lookup_row": selected.lookup_row,
+                    "native_origin": selected.native_origin,
+                },
+            },
+        )
+
+    selection_7 = selection_for(7, 9, resolved[0])
+
+    root = tmp_path / "held-single-resume"
+    root.mkdir()
+    hold_job_path = root / "hold-job.json"
+    reviewed_fingerprint = _reviewed_fingerprint()
+
+    def _frame_spec(slot: int, offset: int) -> worker_module.BatchFrameSpec:
+        return worker_module.BatchFrameSpec(
+            slot,
+            offset,
+            root / f"frame-{slot:03d}" / "capture.bin",
+            root / f"frame-{slot:03d}" / "journal.json",
+            root / f"frame-{slot:03d}" / "parent-ack.json",
+        )
+
+    frame_7 = _frame_spec(7, 9)
+
+    def _job_bytes(*, session_id: str, frame: worker_module.BatchFrameSpec) -> bytes:
+        payload = {
+            "apply_all_boundary_offsets_before_first_frame": True,
+            "capture_plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+            "expected_usb_bus": 1,
+            "expected_usb_address": 2,
+            "exposure_override_10ns": None,
+            "frames": [
+                {
+                    "ack": f"frame-{frame.slot:03d}/parent-ack.json",
+                    "boundary_offset_rows": frame.boundary_offset_rows,
+                    "journal": f"frame-{frame.slot:03d}/journal.json",
+                    "manual_review_approval": None,
+                    "output": f"frame-{frame.slot:03d}/capture.bin",
+                    "slot": frame.slot,
+                },
+            ],
+            "parent_ack_required_after_every_frame": True,
+            "release_once_after_last_frame": True,
+            "reviewed_roll_fingerprint": reviewed_fingerprint.to_payload(),
+            "schema_version": 3,
+            "session_contract": "one-process-one-reservation",
+            "session_id": session_id,
+        }
+        return (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+
+    startup = _startup_frame_table(40)
+    header_8e = b"\0\x8e\0\0\0\x06"
+    reserves: list[int] = []
+    variable_frame_table_calls: list[int] = []
+    fine_reads: list[int] = []
+    ready_groups: list[tuple[int, ...]] = []
+    releases: list[tuple[object, object]] = []
+    ejects: list[str] = []
+    hold_decisions: list[str] = []
+
+    ep_out = SimpleNamespace(bEndpointAddress=0x01)
+    ep_in = SimpleNamespace(bEndpointAddress=0x82)
+    interface = SimpleNamespace(bInterfaceNumber=0)
+
+    class USBUtil:
+        @staticmethod
+        def release_interface(_device: object, _number: int) -> None:
+            pass
+
+        @staticmethod
+        def dispose_resources(_device: object) -> None:
+            pass
+
+    def derive_batch(
+        _plan: list[dict],
+        preview: bytes,
+        table: bytes,
+        frames: tuple,
+        *,
+        reviewed_fingerprint: ReviewedRollFingerprint,
+    ) -> tuple:
+        assert len(preview) == len(worker_module.PREVIEW_READ_SEQUENCES)
+        assert table == header_8e
+        assert len(frames) == 1
+        assert frames[0].slot == 7
+        return (selection_7,)
+
+    def perform(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        sequence = entry["seq"]
+        if sequence == 17:
+            reserves.append(sequence)
+        if sequence in (115, 116, 117):
+            payload = b"window"
+        elif sequence in worker_module.PREVIEW_READ_SEQUENCES:
+            payload = b"p"
+        elif sequence in (171, 172):
+            payload = header_8e
+        elif sequence in (
+            *worker_module.METER_GET_WINDOW_SEQUENCES,
+            *worker_module.FINE_GET_WINDOW_SEQUENCES,
+        ):
+            payload = bytes.fromhex(entry["expected_data_in"])
+        elif sequence in worker_module.METER_READ_SEQUENCES:
+            payload = b"m"
+        elif sequence == 607:
+            fine_reads.append(sequence)
+            payload = b"f"
+        else:
+            payload = bytes.fromhex(entry.get("expected_data_in", ""))
+        return TransactionResult(
+            phase=entry.get("expected_phase", 1),
+            payload=payload,
+            status=bytes.fromhex(entry.get("expected_status", "00" * 8)),
+            sense=entry.get("expected_sense", "000000"),
+            stall_recoveries=0,
+        )
+
+    def perform_startup(
+        _ep_out: object,
+        _ep_in: object,
+        entry: dict,
+        **_kwargs: object,
+    ) -> TransactionResult:
+        assert entry["seq"] == worker_module.VARIABLE_FRAME_TABLE_SEQUENCE
+        variable_frame_table_calls.append(entry["seq"])
+        return TransactionResult(
+            phase=3, payload=startup, status=bytes(8), sense="000000", stall_recoveries=0,
+        )
+
+    def ready(
+        _ep_out: object,
+        _ep_in: object,
+        entries: list[dict],
+        **_kwargs: object,
+    ) -> tuple[int, int]:
+        ready_groups.append(tuple(entry["seq"] for entry in entries))
+        return 1, 0
+
+    def release(ep_out_value: object, ep_in_value: object) -> TransactionResult:
+        releases.append((ep_out_value, ep_in_value))
+        return TransactionResult(1, b"", bytes(8), "000000", 0)
+
+    def fake_perform_vendor_eject(ep_out_value: object, ep_in_value: object) -> dict:
+        assert (ep_out_value, ep_in_value) == (ep_out, ep_in)
+        ejects.append("eject")
+        return {
+            "eject_cdb_status": "0000000000000000",
+            "eject_execute_status": "0000000000000000",
+            "terminal_sense": worker_module.EJECT_TERMINAL_SENSE,
+            "wait_polls": 5,
+            "stall_recoveries": 0,
+        }
+
+    nonce_counter = [0]
+
+    def fake_token_hex(_size: int) -> str:
+        nonce_counter[0] += 1
+        return f"nonce-{nonce_counter[0]:03d}"
+
+    real_wait_for_parent_ack = worker_module.wait_for_parent_ack
+
+    def acknowledge(
+        path: Path,
+        *,
+        session_id: str,
+        frame_index: int,
+        slot: int,
+        nonce: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        # One frame in this batch, and this test ends the whole reservation
+        # right there -- eject on its terminal frame ack.
+        path.write_text(
+            json.dumps(
+                {
+                    "ack_nonce": nonce,
+                    "action": "eject",
+                    "frame_index": frame_index,
+                    "schema_version": 1,
+                    "session_id": session_id,
+                    "slot": slot,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_wait_for_parent_ack(
+            path,
+            session_id=session_id,
+            frame_index=frame_index,
+            slot=slot,
+            nonce=nonce,
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+    def fake_wait_for_hold_decision(
+        path: Path,
+        *,
+        hold_session_id: str,
+        timeout_seconds: float = 1_800.0,
+        poll_seconds: float = 0.1,
+    ) -> str:
+        del timeout_seconds, poll_seconds
+        hold_decisions.append(str(path))
+        # The one and only hold-wait: the fixed hold_job_path this attempt
+        # was launched with. Publish slot 7's one-frame job, echoing back
+        # the hold_session_id this held preview minted -- exactly what a
+        # real Roll.scan_many() resume does -- and resume.
+        hold_job_path.write_text(
+            _job_bytes(session_id=hold_session_id, frame=frame_7).decode("utf-8"),
+            encoding="utf-8",
+        )
+        return "scan"
+
+    preview_windows = [
+        {
+            "color_id": color,
+            "resx": 97,
+            "resy": 97,
+            "upper_left_x": 0,
+            "upper_left_y": 0,
+            "width": 3_946,
+            "height": 250_278,
+            "bit_depth": 16,
+            "exposure_raw_10ns": 70_000 + color,
+        }
+        for color in (1, 2, 3)
+    ]
+    accepted_proposal = SimpleNamespace(
+        accepted=True,
+        proposed_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    accepted_final = SimpleNamespace(
+        accepted=True,
+        final_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+        refusals=(),
+        to_dict=lambda: {"accepted": True},
+    )
+    monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", 1)
+    monkeypatch.setattr(
+        worker_module,
+        "EXPECTED_PREVIEW_BYTES",
+        len(worker_module.PREVIEW_READ_SEQUENCES),
+    )
+    monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
+    monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
+    monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
+    monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(
+        worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
+    )
+    # Not a density-*evidence*-construction test: this fixture's shrunk plan/
+    # geometry/startup table (request_len=1, height=48) don't satisfy the real
+    # startup-record -> density-source-geometry binding, same boundary
+    # test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after's
+    # own fixture fakes. build_nikon_density_evidence still binds
+    # source_binding.session_id to whatever session_id it is actually called
+    # with -- calibration_session_id, in the real code -- so the identity
+    # this test exists to check flows through for real.
+    monkeypatch.setattr(
+        worker_module, "_validate_preview_density_source_contract", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        lambda *_args, **kwargs: SimpleNamespace(
+            # NikonDensityFrameOwnershipReceipt.validate_evidence (real,
+            # unmocked -- see below) requires calibration_binding/
+            # source_binding/exposure_binding/result to each carry the same
+            # session_id -- every sub-binding of one reservation's evidence
+            # is bound to that one reservation. All four echo
+            # calibration_session_id here exactly as the real
+            # build_nikon_density_evidence binds every sub-binding to its
+            # own `session_id=` argument.
+            calibration_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            source_binding=SimpleNamespace(
+                session_id=kwargs["session_id"], wire_sha256="e" * 64
+            ),
+            exposure_binding=SimpleNamespace(session_id=kwargs["session_id"]),
+            result=SimpleNamespace(session_id=kwargs["session_id"]),
+            preview_identity_sha256="d" * 64,
+            to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
+        ),
+    )
+    # build_nikon_density_frame_ownership (real, unmocked -- see below)
+    # requires `isinstance(evidence, NikonDensityEvidence)`; the fixture
+    # above returns a SimpleNamespace stand-in rather than hand-building all
+    # four nested, independently-validated density dataclasses. Widen the
+    # isinstance target for this test only, exactly the same way the fixture
+    # already fakes the geometry/replay boundary above -- everything this
+    # test actually exists to check (the identity comparison and
+    # density.py's own _require_digest/_require_identity/__post_init__
+    # checks on the receipt itself) still runs for real. Patched on
+    # density.py's own module object: build_nikon_density_frame_ownership's
+    # isinstance check resolves NikonDensityEvidence from its defining
+    # module's globals, not from worker_module's imported-name binding.
+    from coolscanpy.protocol.ls5000_single_pass import density as density_module
+
+    monkeypatch.setattr(density_module, "NikonDensityEvidence", SimpleNamespace)
+    # Deliberately NOT mocking _density_frame_ownership_receipt or
+    # build_nikon_density_frame_ownership: that real identity-binding path,
+    # end to end, is what this test exists to exercise.
+    monkeypatch.setattr(worker_module, "_derive_live_batch_selections", derive_batch)
+    monkeypatch.setattr(worker_module, "_perform_with_busy_retry", perform)
+    monkeypatch.setattr(
+        worker_module, "_perform_variable_frame_table_transaction", perform_startup
+    )
+    monkeypatch.setattr(worker_module, "_perform_ready_group", ready)
+    monkeypatch.setattr(worker_module, "_wait_post_scan_ready", lambda *_a, **_k: (1, 0))
+    monkeypatch.setattr(
+        worker_module,
+        "observe_meter_pass",
+        lambda *_a, **_k: _synthetic_meter_observation(),
+    )
+    monkeypatch.setattr(
+        worker_module, "propose_next_exposures", lambda *_a, **_k: accepted_proposal
+    )
+    monkeypatch.setattr(
+        worker_module, "verify_final_convergence", lambda *_a, **_k: accepted_final
+    )
+    monkeypatch.setattr(worker_module, "wait_for_parent_ack", acknowledge)
+    monkeypatch.setattr(worker_module, "wait_for_hold_decision", fake_wait_for_hold_decision)
+    monkeypatch.setattr(worker_module, "_release_unit", release)
+    monkeypatch.setattr(worker_module, "_perform_vendor_eject", fake_perform_vendor_eject)
+    monkeypatch.setattr(worker_module.secrets, "token_hex", fake_token_hex)
+    monkeypatch.setattr(
+        worker_module,
+        "_connect_device",
+        lambda **_kwargs: (
+            SimpleNamespace(bus=1, address=2),
+            interface,
+            ep_out,
+            ep_in,
+            USBUtil,
+        ),
+    )
+
+    worker_module.run_live_capture(
+        plan,
+        tmp_path / "plan.jsonl",
+        CANONICAL_PLAN_SHA256,
+        root / "preview-placeholder.bin",
+        root / "preview-placeholder.json",
+        1,
+        preview_and_hold=True,
+        hold_job_path=hold_job_path,
+        continuation_plan=load_canonical_continuation_plan(),
+        continuation_plan_sha256=worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
+    )
+
+    # --- the wire-level claim: one reservation, one resume, no re-reserve ---
+    assert reserves == [17], "exactly one RESERVE_UNIT"
+    assert len(variable_frame_table_calls) == 1, "exactly one command-64 transaction"
+    assert fine_reads == [607], "one fine READ for the resumed frame"
+    assert releases == [(ep_out, ep_in)], "exactly one RELEASE_UNIT"
+    assert ejects == ["eject"], "exactly one eject"
+    assert len(hold_decisions) == 1, "one hold-wait for the one resume"
+
+    # --- the identity claim this test exists to prove ---
+    frame_7_journal = json.loads(frame_7.journal.read_text(encoding="utf-8"))
+    assert frame_7_journal["status"] == "frame-complete"
+    assert frame_7_journal["resumed_from_held_preview"] is True
+    ownership = frame_7_journal["nikon_density_frame_ownership"]
+    assert ownership["reservation_id"] == ownership["batch_session_id"]
+
+    session_journal_path = root / "session-journal.json"
+    session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
+    assert session_journal["status"] == "ejected"
+    assert session_journal["completed_slots"] == [7]
+    assert session_journal["density_calibration_session_id"] is not None
+    assert (
+        ownership["batch_session_id"]
+        == session_journal["density_calibration_session_id"]
+    )
+    # The resumed batch's own session id is a separate, independently-minted
+    # per-round hold/resume token by design (see _density_frame_ownership_
+    # receipt's docstring) -- confirm this test actually exercises that
+    # divergence, not a coincidental match that would let the pre-fix bug
+    # slip through undetected.
+    assert (
+        session_journal["session_id"]
+        != session_journal["density_calibration_session_id"]
+    )
