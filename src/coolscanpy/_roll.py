@@ -1114,10 +1114,18 @@ class Roll:
                 except HeldSessionExpired:
                     # Fail-closed per the held-session contract: a dead or
                     # already-consumed child cannot prove the reservation is
-                    # still held, so this degrades to exactly the same
-                    # operator-facing signal a parked, never-held transport
-                    # already produces below (the "command 64" refusal
-                    # branch) -- physically refeed and retry.
+                    # still held. This is the one place in this package that
+                    # raises RefeedRequired, and the reason its docstring
+                    # says generic command-status text is not sufficient to
+                    # emit it: a lost held session is a positively-known
+                    # fact about the reservation, not an inference from a
+                    # nonzero status byte. (A command-64 end-stop status is
+                    # deliberately NOT translated here -- see a289074, which
+                    # restored mainline 586f575's taxonomy after the port
+                    # reintroduced that inference; such a status falls
+                    # through to the generic RollMismatch instead.)
+                    # Operator action either way: physically refeed and
+                    # retry.
                     frame_queue.put((
                         "error",
                         RefeedRequired(

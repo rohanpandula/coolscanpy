@@ -1357,6 +1357,53 @@ class CaptureBatchResult:
     # session -- see ``CaptureProcessAdapter._resolve_held_after_batch``.
     held_again: HeldPreviewSession | None = None
 
+    @property
+    def density_evidence(self) -> NikonDensityEvidence | None:
+        """Return the one reservation-preview bundle for owned batch frames."""
+
+        found: list[NikonDensityEvidence] = []
+        for frame in self.frames:
+            item = frame.density_evidence
+            if item is not None:
+                found.append(item)
+        evidence = tuple(found)
+        if not evidence:
+            return None
+        first = evidence[0]
+        if any(item != first for item in evidence[1:]):
+            raise ValueError("batch frames disagree on Nikon density evidence")
+        receipt = self.session_journal.get("nikon_density_evidence")
+        if first.to_dict() != receipt:
+            raise ValueError("batch density evidence disagrees with session receipt")
+        return first
+
+    @property
+    def density_ownership(self) -> tuple[NikonDensityFrameOwnershipReceipt, ...]:
+        """Return all frame receipts after enforcing one shared preview identity."""
+
+        receipts: list[NikonDensityFrameOwnershipReceipt] = []
+        for frame in self.frames:
+            receipt = frame.density_ownership
+            if receipt is None:
+                raise ValueError("batch frame has no Nikon density ownership receipt")
+            receipts.append(receipt)
+        if not receipts:
+            return ()
+        first_transport_identity = receipts[0].transport_identity_sha256
+        first_preview_identity = receipts[0].preview_identity_sha256
+        if any(
+            receipt.transport_identity_sha256 != first_transport_identity
+            or receipt.preview_identity_sha256 != first_preview_identity
+            for receipt in receipts[1:]
+        ):
+            raise ValueError("batch frames disagree on Nikon density ownership")
+        evidence = self.density_evidence
+        if evidence is None:
+            raise ValueError("owned batch has no Nikon density preview evidence")
+        for receipt in receipts:
+            receipt.validate_evidence(evidence)
+        return tuple(receipts)
+
 
 @dataclass(frozen=True)
 class HeldPreviewSession:
@@ -1421,53 +1468,6 @@ class _HeldPreviewLaunchFailed(Exception):
             "hold boundary"
         )
         self.returncode = returncode
-
-    @property
-    def density_evidence(self) -> NikonDensityEvidence | None:
-        """Return the one reservation-preview bundle for owned batch frames."""
-
-        found: list[NikonDensityEvidence] = []
-        for frame in self.frames:
-            item = frame.density_evidence
-            if item is not None:
-                found.append(item)
-        evidence = tuple(found)
-        if not evidence:
-            return None
-        first = evidence[0]
-        if any(item != first for item in evidence[1:]):
-            raise ValueError("batch frames disagree on Nikon density evidence")
-        receipt = self.session_journal.get("nikon_density_evidence")
-        if first.to_dict() != receipt:
-            raise ValueError("batch density evidence disagrees with session receipt")
-        return first
-
-    @property
-    def density_ownership(self) -> tuple[NikonDensityFrameOwnershipReceipt, ...]:
-        """Return all frame receipts after enforcing one shared preview identity."""
-
-        receipts: list[NikonDensityFrameOwnershipReceipt] = []
-        for frame in self.frames:
-            receipt = frame.density_ownership
-            if receipt is None:
-                raise ValueError("batch frame has no Nikon density ownership receipt")
-            receipts.append(receipt)
-        if not receipts:
-            return ()
-        first_transport_identity = receipts[0].transport_identity_sha256
-        first_preview_identity = receipts[0].preview_identity_sha256
-        if any(
-            receipt.transport_identity_sha256 != first_transport_identity
-            or receipt.preview_identity_sha256 != first_preview_identity
-            for receipt in receipts[1:]
-        ):
-            raise ValueError("batch frames disagree on Nikon density ownership")
-        evidence = self.density_evidence
-        if evidence is None:
-            raise ValueError("owned batch has no Nikon density preview evidence")
-        for receipt in receipts:
-            receipt.validate_evidence(evidence)
-        return tuple(receipts)
 
 
 class ProcessRunner(Protocol):

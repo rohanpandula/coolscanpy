@@ -3650,6 +3650,150 @@ def test_refused_held_after_batch_journal_releases_the_child_instead_of_orphanin
         assert any("left running rather than waited on" in note for note in notes), notes
 
 
+def test_batch_result_density_accessors_survive_the_held_preview_port(
+    tmp_path: Path,
+) -> None:
+    """``CaptureBatchResult.density_evidence``/``.density_ownership`` -- the
+    batch-level accessors that enforce one shared reservation preview across
+    every frame -- were re-parented onto ``_HeldPreviewLaunchFailed`` when
+    the held-preview classes were inserted between the dataclass body and
+    its properties. ``CaptureBatchResult`` silently lost both, and the
+    exception gained two that can only ``AttributeError`` on ``self.frames``.
+
+    Exercised in the resumed shape specifically, so the reservation's
+    density source raster lives in the held attempt's directory rather than
+    beside the frames -- the layout that has to reach these accessors
+    through ``CaptureAttemptResult.density_source_path``.
+    """
+
+    assert not hasattr(capture._HeldPreviewLaunchFailed(1), "density_evidence")
+
+    attempt_directory = tmp_path / "preview-held"
+    attempt_directory.mkdir()
+    source_path = attempt_directory / "capture-preview.bin"
+    source_path.write_bytes(_density_source_fixture())
+
+    calibration_session_id = "single-reservation-batch-accessors"
+    job_path = attempt_directory / "hold-job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "session_id": "round-two-token",
+                "frames": [
+                    {"slot": 4, "output": "frame-004/capture.bin"},
+                    {"slot": 9, "output": "frame-009/capture.bin"},
+                ],
+                "reviewed_roll_fingerprint": {"binding_sha256": "2" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    frames: list[capture.CaptureAttemptResult] = []
+    evidence_receipt: dict[str, object] | None = None
+    for index, slot in enumerate((4, 9), start=1):
+        output = attempt_directory / f"frame-{slot:03d}" / "capture.bin"
+        output.parent.mkdir()
+        density, preview_sha, table_sha = _batch_density_frame_provenance(
+            job_path,
+            output=output,
+            frame_index=index,
+            selected_slot=slot,
+            calibration_session_id=calibration_session_id,
+            density_source_path=source_path,
+        )
+        if index == 1:
+            evidence_receipt = density["nikon_density_evidence"]
+        frames.append(
+            capture.CaptureAttemptResult(
+                outcome=capture.CaptureOutcome.COMPLETE,
+                request=capture.CaptureRequest(capture.CaptureMode.FULL, slot, 0),
+                paths=capture.AttemptPaths(
+                    directory=output.parent,
+                    output=output,
+                    journal=output.parent / "journal.json",
+                    plan=attempt_directory / "plan.jsonl",
+                    manifest=attempt_directory / "manifest.json",
+                    bootstrap_status=attempt_directory / "worker-bootstrap.json",
+                    stdout=attempt_directory / "stdout.txt",
+                    stderr=attempt_directory / "stderr.txt",
+                ),
+                argv=(),
+                returncode=0,
+                stdout="",
+                stderr="",
+                journal={
+                    **density,
+                    "batch_session": {
+                        "frame_index": index,
+                        "frame_total": 2,
+                        "selected_slots": [4, 9],
+                        "session_id": "round-two-token",
+                    },
+                    "density_calibration_session_id": calibration_session_id,
+                    "live_frame_selection": {
+                        "frame": slot,
+                        "preview_sha256": preview_sha,
+                        "table_sha256": table_sha,
+                        "roll_identity": {
+                            "reviewed_fingerprint_sha256": "2" * 64,
+                            "fresh_fingerprint_sha256": "d" * 64,
+                        },
+                    },
+                    "session_reservation_retained": True,
+                },
+                batch_session_id="round-two-token",
+                batch_frame_index=index,
+                batch_frame_total=2,
+                batch_selected_slots=(4, 9),
+                density_source_path=source_path,
+            )
+        )
+
+    result = capture.CaptureBatchResult(
+        outcome=capture.CaptureOutcome.COMPLETE,
+        request=capture.CaptureBatchRequest(
+            (
+                capture.CaptureRequest(capture.CaptureMode.FULL, 4, 0),
+                capture.CaptureRequest(capture.CaptureMode.FULL, 9, 0),
+            ),
+            reviewed_fingerprint=_reviewed_fingerprint(),
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        ),
+        paths=_prepare_batch_paths_stub(attempt_directory, job_path),
+        frames=tuple(frames),
+        returncode=0,
+        stopped=False,
+        session_journal={"nikon_density_evidence": evidence_receipt},
+        stdout="",
+        stderr="",
+    )
+
+    evidence = result.density_evidence
+    assert evidence is not None
+    assert evidence.to_dict() == evidence_receipt
+    ownership = result.density_ownership
+    assert len(ownership) == 2
+    assert {receipt.selected_slot for receipt in ownership} == {4, 9}
+    assert len({receipt.transport_identity_sha256 for receipt in ownership}) == 1
+    assert len({receipt.preview_identity_sha256 for receipt in ownership}) == 1
+
+
+def _prepare_batch_paths_stub(directory: Path, job_path: Path) -> capture.BatchSessionPaths:
+    return capture.BatchSessionPaths(
+        directory=directory,
+        job=job_path,
+        first_plan=directory / "plan.jsonl",
+        continuation_plan=directory / "continuation.json",
+        manifest=directory / "manifest.json",
+        bootstrap_status=directory / "worker-bootstrap.json",
+        session_journal=directory / "session-journal.json",
+        stdout=directory / "stdout.txt",
+        stderr=directory / "stderr.txt",
+    )
+
+
 def test_resume_held_session_can_be_called_again_after_continue_hold(
     tmp_path: Path,
     binding: Binding,
