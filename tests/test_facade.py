@@ -208,8 +208,27 @@ def _sha256(payload: bytes) -> str:
 # it through. Set immediately before delegate_factory(...) and reset in a
 # finally, exactly the "implicit parameter for one specific callback" a
 # contextvar is for.
-_AMBIENT_CALIBRATION_SESSION_ID: contextvars.ContextVar[str | None] = (
-    contextvars.ContextVar("_ambient_calibration_session_id", default=None)
+@dataclass(frozen=True)
+class _ReservationDensity:
+    """Everything one feed-to-eject reservation establishes exactly once.
+
+    A cold batch establishes all three inside its own child, seeded from
+    that batch's own session id and written beside its own first frame. A
+    preview-and-hold reservation establishes them in the held preview's
+    attempt -- independently-minted calibration identity, raster persisted
+    in the *attempt* directory, f03 exposures read from that one traversal's
+    preview windows -- and every later round inherits all three unchanged.
+    Modelling any of them as per-round is what let the resume path's real
+    divergences pass this suite unnoticed.
+    """
+
+    calibration_session_id: str
+    source_path: Path
+    f03_exposures_raw_10ns: tuple[int, int, int]
+
+
+_AMBIENT_RESERVATION_DENSITY: contextvars.ContextVar[_ReservationDensity | None] = (
+    contextvars.ContextVar("_ambient_reservation_density", default=None)
 )
 
 
@@ -281,6 +300,8 @@ def _density_batch_frame_provenance(
     frame_index: int,
     selected_slot: int,
     calibration_session_id: str | None = None,
+    density_source_path: Path | None = None,
+    density_f03_exposures_raw_10ns: tuple[int, int, int] = (70_307, 136_614, 125_470),
 ) -> tuple[dict[str, object], str, str]:
     """``calibration_session_id`` defaults to the job's own session id --
     correct for a cold batch -- so every existing cold-batch caller is
@@ -288,6 +309,18 @@ def _density_batch_frame_provenance(
     ``_FakeHeldWorkerProcess``'s delegate) passes its own separately to
     model the real divergence between a batch/round's own session id and
     the reservation-wide calibration identity that held preview minted.
+
+    ``density_source_path`` is that divergence for the reservation's own
+    97-dpi density source raster (and the ``capture_attempt_id`` bound into
+    its evidence). A cold batch writes it inside its own first frame's
+    directory; a held preview wrote it in the preview attempt's directory,
+    and every resume inherits it from there. Defaulting a held caller to
+    the cold layout models a directory shape the real worker never
+    produces -- the exact reason this suite stayed green through the
+    2026-08-06 attempt-11 live failure. When that raster already exists,
+    its real bytes (and the caller's own f03 exposures) are what the
+    evidence is rebuilt from: one reservation has exactly one density
+    result, not one per round.
     """
 
     job = json.loads(job_path.read_text(encoding="utf-8"))
@@ -295,6 +328,11 @@ def _density_batch_frame_provenance(
     calibration_session_id = calibration_session_id or session_id
     selected_slots = tuple(frame["slot"] for frame in job["frames"])
     first_output = job_path.parent / job["frames"][0]["output"]
+    source_path = (
+        first_output.with_name(f"{first_output.stem}-preview.bin")
+        if density_source_path is None
+        else density_source_path
+    )
     calibration = assemble_density_calibration(
         [
             decode_density_calibration_read(
@@ -312,17 +350,21 @@ def _density_batch_frame_provenance(
         ],
         session_id=calibration_session_id,
     )
-    source = _density_source_fixture()
+    source = (
+        source_path.read_bytes()
+        if source_path.exists()
+        else _density_source_fixture()
+    )
     evidence = build_nikon_density_evidence(
         source,
         calibration=calibration,
-        density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
+        density_f03_exposures_raw_10ns=density_f03_exposures_raw_10ns,
         session_id=calibration_session_id,
-        capture_attempt_id=first_output.parent.name,
+        capture_attempt_id=source_path.parent.name,
         scan_identity=f"{calibration_session_id}:density-97dpi:{_sha256(source)}",
     )
-    if frame_index == 1:
-        first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
+    if frame_index == 1 and not source_path.exists():
+        source_path.write_bytes(source)
     table_sha = "2" * 64
     ownership = build_nikon_density_frame_ownership(
         evidence,
@@ -679,6 +721,12 @@ class _FakeBatchProcess:
     # batch -- None (the default) falls back to job["session_id"], correct
     # for a standalone cold-batch use of this fake.
     calibration_session_id: str | None = None
+    # The whole reservation-wide density identity (calibration id, source
+    # raster path, f03 exposures), handed over an ambient contextvar
+    # whenever this instance is acting as _FakeHeldWorkerProcess's
+    # delegate. None (the default) is a standalone cold batch, which
+    # establishes all three inside itself.
+    reservation_density: "_ReservationDensity | None" = None
     # Set by poll() when a frame ack is "continue_hold": the outer
     # _FakeHeldWorkerProcess (see its own poll()) notices this every poll
     # and resets itself back to a fresh hold-wait at the paths named here,
@@ -690,8 +738,12 @@ class _FakeBatchProcess:
         self.job = json.loads(self.job_path.read_text(encoding="utf-8"))
         self.index = 0
         self.returncode: int | None = None
-        if self.calibration_session_id is None:
-            self.calibration_session_id = _AMBIENT_CALIBRATION_SESSION_ID.get()
+        if self.reservation_density is None:
+            self.reservation_density = _AMBIENT_RESERVATION_DENSITY.get()
+        if self.calibration_session_id is None and self.reservation_density is not None:
+            self.calibration_session_id = (
+                self.reservation_density.calibration_session_id
+            )
         # The real worker overwrites the session journal to "capturing"
         # immediately on processing "scan", strictly before it captures
         # anything -- sequentially before the frame this round's own
@@ -732,6 +784,18 @@ class _FakeBatchProcess:
                 frame_index=self.index + 1,
                 selected_slot=frame["slot"],
                 calibration_session_id=self.calibration_session_id,
+                **(
+                    {}
+                    if self.reservation_density is None
+                    else {
+                        "density_source_path": (
+                            self.reservation_density.source_path
+                        ),
+                        "density_f03_exposures_raw_10ns": (
+                            self.reservation_density.f03_exposures_raw_10ns
+                        ),
+                    }
+                ),
             )
         )
         if self.index == 0:
@@ -1116,8 +1180,11 @@ class _RefusalBatchProcess:
         # that class's poll(). Falls back to job["session_id"] outside a
         # held-preview context (a standalone cold-batch refusal), where
         # the two coincide.
+        reservation_density = _AMBIENT_RESERVATION_DENSITY.get()
         calibration_session_id = (
-            _AMBIENT_CALIBRATION_SESSION_ID.get() or job["session_id"]
+            job["session_id"]
+            if reservation_density is None
+            else reservation_density.calibration_session_id
         )
         self.session_journal_path.write_text(
             json.dumps(
@@ -1378,8 +1445,15 @@ class _FakeHeldWorkerProcess:
         self._release_journal_path = self.journal_path
         # Stashed so poll() can hand it to every delegate this held
         # reservation resumes into, across every round -- see poll()'s own
-        # delegate_factory call below.
-        self.density_session_id = density_session_id
+        # delegate_factory call below. The source raster is the one
+        # persisted just above, in *this* attempt's directory: no later
+        # round of this reservation writes another, exactly as the real
+        # worker persists it once per feed and reuses it thereafter.
+        self.reservation_density = _ReservationDensity(
+            calibration_session_id=density_session_id,
+            source_path=preview_path,
+            f03_exposures_raw_10ns=density_exposures,
+        )
 
     def die(self, returncode: int = 1) -> None:
         """Simulate the held child having already exited (crash, power
@@ -1471,11 +1545,11 @@ class _FakeHeldWorkerProcess:
         # below -- there is no "after construction" moment early enough to
         # set this directly, hence the ambient contextvar instead of a
         # simple post-construction attribute set.
-        token = _AMBIENT_CALIBRATION_SESSION_ID.set(self.density_session_id)
+        token = _AMBIENT_RESERVATION_DENSITY.set(self.reservation_density)
         try:
             self._delegate = self.delegate_factory(self.hold_job_path, session_journal_path)
         finally:
-            _AMBIENT_CALIBRATION_SESSION_ID.reset(token)
+            _AMBIENT_RESERVATION_DENSITY.reset(token)
         return None
 
     def wait(self, timeout: float | None = None) -> int:

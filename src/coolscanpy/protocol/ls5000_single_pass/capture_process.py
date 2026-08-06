@@ -192,17 +192,52 @@ def _validated_density_calibration(
     return calibration
 
 
+def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
+    """Return one batch frame's own capture output, as the job names it.
+
+    The single source of truth for the ``frame-NNN/capture.bin`` layout the
+    parent writes into every batch job (``_batch_job_bytes``), hands to the
+    child, and re-derives when validating what came back
+    (``_batch_frame_paths``).
+    """
+
+    if type(selected_slot) is not int:
+        raise AssertionError("validated batch frame has no selected slot")
+    return batch_directory / f"frame-{selected_slot:03d}" / "capture.bin"
+
+
+def _density_source_path(output_path: Path) -> Path:
+    """Return the 97-dpi density source raster written beside ``output_path``.
+
+    The worker persists the reservation's density source (``_live_index_
+    artifact_paths``) next to whichever capture output was open when the
+    preview traversal completed. For a cold batch that is the batch child's
+    own first-frame output, so this derivation is exact. For a
+    preview-and-hold reservation the traversal completed in the *preview*
+    attempt, long before any frame directory existed -- that shape must
+    resolve the source from the held attempt's own output instead, which is
+    what ``PreparedCaptureBatch.density_source_path`` carries.
+    """
+
+    return output_path.with_name(f"{output_path.stem}-preview.bin")
+
+
 def _validated_density_evidence(
     journal: dict[str, Any],
     *,
-    output_path: Path,
+    source_path: Path,
 ) -> NikonDensityEvidence:
-    """Rebuild one bounded session receipt from its hash-bound preview bytes."""
+    """Rebuild one bounded session receipt from its hash-bound preview bytes.
+
+    ``source_path`` is the reservation's own 97-dpi density source raster --
+    always parent-derived, never read out of the journal under validation.
+    See ``_density_source_path`` for why it cannot simply be derived from the
+    frame output being validated.
+    """
 
     receipt = journal.get("nikon_density_evidence")
     if type(receipt) is not dict:
         raise ValueError("Nikon density evidence receipt is missing or malformed")
-    source_path = output_path.with_name(f"{output_path.stem}-preview.bin")
     try:
         stat = source_path.lstat()
     except OSError as error:
@@ -1181,6 +1216,14 @@ class PreparedCaptureBatch:
     ``calibration_session_id``, not ``session_id`` -- confusing the two
     here is what let a resumed batch's first frame reach the child
     correctly but still fail this package's own post-hoc validation.
+
+    ``density_source_path`` is that same distinction expressed as a path.
+    The reservation's 97-dpi density source raster is written wherever the
+    traversal that produced it was running: inside a cold batch's own first
+    frame directory, but inside the *held preview's attempt directory* for a
+    preview-and-hold reservation, which completed its traversal before any
+    frame directory existed. Deriving it from the frame under validation is
+    therefore correct only for a cold batch -- see ``_density_source_path``.
     """
 
     request: CaptureBatchRequest
@@ -1189,6 +1232,7 @@ class PreparedCaptureBatch:
     job_sha256: str
     session_id: str
     calibration_session_id: str
+    density_source_path: Path
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1252,14 @@ class CaptureAttemptResult:
     batch_frame_index: int | None = None
     batch_frame_total: int | None = None
     batch_selected_slots: tuple[int, ...] = ()
+    # Where this attempt's *reservation* wrote its 97-dpi density source
+    # raster. ``None`` means "beside this attempt's own output", which is
+    # exactly right for a standalone attempt, a held preview, and a cold
+    # batch's first frame -- every shape whose own traversal produced it. A
+    # batch frame resumed from a held preview inherits a raster captured in
+    # the held attempt's directory instead, and is handed that path
+    # explicitly (see ``PreparedCaptureBatch.density_source_path``).
+    density_source_path: Path | None = None
 
     @property
     def recovery_required(self) -> bool:
@@ -1237,8 +1289,16 @@ class CaptureAttemptResult:
             return None
         return _validated_density_evidence(
             self.journal,
-            output_path=self.paths.output,
+            source_path=self.reservation_density_source_path,
         )
+
+    @property
+    def reservation_density_source_path(self) -> Path:
+        """Return where this attempt's reservation kept its density source."""
+
+        if self.density_source_path is not None:
+            return self.density_source_path
+        return _density_source_path(self.paths.output)
 
     @property
     def density_ownership(self) -> NikonDensityFrameOwnershipReceipt | None:
@@ -1322,6 +1382,23 @@ class HeldPreviewSession:
     hold_session_id: str
     stdout_path: Path
     stderr_path: Path
+    # Where this reservation's 97-dpi density source raster actually lives.
+    # ``None`` means "beside this session's own preview attempt output",
+    # which is the truth for every session ``begin_held_preview`` returns:
+    # that attempt is the traversal that captured it. A session handed back
+    # by ``_resolve_held_after_batch`` (round two and later of the same
+    # feed-to-eject reservation) has no preview attempt of its own -- its
+    # ``preview_attempt`` is a synthesized view of the last completed batch
+    # frame -- so that path is carried forward explicitly instead.
+    density_source_path: Path | None = None
+
+    @property
+    def reservation_density_source_path(self) -> Path:
+        """Return this reservation's own density source raster path."""
+
+        if self.density_source_path is not None:
+            return self.density_source_path
+        return _density_source_path(self.preview_attempt.paths.output)
 
     @property
     def usable(self) -> bool:
@@ -1821,6 +1898,14 @@ class CaptureProcessAdapter:
             # is not None else ...`) -- the two coincide here by
             # construction.
             calibration_session_id=session_id,
+            # Cold launch: the whole-roll traversal that produces the
+            # density source runs inside this batch child, interleaved with
+            # its own first frame, so the raster lands beside that frame's
+            # output (worker.py binds `artifact_paths` to `output_path`,
+            # which main() sets to the first frame spec's output).
+            density_source_path=_density_source_path(
+                _batch_frame_output(paths.directory, request.frames[0].selected_slot)
+            ),
         )
 
     def run_batch_session(
@@ -2176,6 +2261,13 @@ class CaptureProcessAdapter:
                         hold_session_id=resume["hold_session_id"],
                         stdout_path=prepared.paths.stdout,
                         stderr_path=prepared.paths.stderr,
+                        # Same reservation, same 97-dpi density source: this
+                        # round captured no preview of its own, and neither
+                        # will the next. Carried forward explicitly because
+                        # the synthesized preview_attempt above is a batch
+                        # frame, so the "beside my own output" fallback would
+                        # point at a frame directory that has no raster in it.
+                        density_source_path=prepared.density_source_path,
                     )
                     return CaptureBatchResult(
                         outcome=CaptureOutcome.COMPLETE,
@@ -2763,6 +2855,15 @@ class CaptureProcessAdapter:
                 job_sha256=hashlib.sha256(payload).hexdigest(),
                 session_id=held.hold_session_id,
                 calibration_session_id=calibration_session_id,
+                # The reservation-wide density source raster, same
+                # distinction as calibration_session_id above expressed as a
+                # path: this resume captures no preview of its own, so the
+                # raster it owns is the one the held preview persisted in
+                # its own attempt directory -- never one beside this batch's
+                # frame outputs, which is where a cold batch's is and where
+                # this validator looked before (live failure 2026-08-06,
+                # attempt 11: "Nikon density source artifact is missing").
+                density_source_path=held.reservation_density_source_path,
             )
             try:
                 self._publish_hold_ack(held, action="scan")
@@ -3301,13 +3402,13 @@ class CaptureProcessAdapter:
         prepared: PreparedCaptureBatch,
         request: CaptureRequest,
     ) -> AttemptPaths:
-        slot = request.selected_slot
-        if slot is None:
-            raise AssertionError("validated batch frame has no selected slot")
-        directory = prepared.paths.directory / f"frame-{slot:03d}"
+        output = _batch_frame_output(
+            prepared.paths.directory, request.selected_slot
+        )
+        directory = output.parent
         return AttemptPaths(
             directory=directory,
-            output=directory / "capture.bin",
+            output=output,
             journal=directory / "journal.json",
             plan=prepared.paths.first_plan,
             manifest=prepared.paths.manifest,
@@ -3592,7 +3693,10 @@ class CaptureProcessAdapter:
             )
         try:
             density_evidence = (
-                _validated_density_evidence(payload, output_path=paths.output)
+                _validated_density_evidence(
+                    payload,
+                    source_path=prepared.density_source_path,
+                )
                 if frame_index == 1
                 else None
             )
@@ -3624,6 +3728,11 @@ class CaptureProcessAdapter:
             batch_frame_index=frame_index,
             batch_frame_total=len(selected_slots),
             batch_selected_slots=selected_slots,
+            # So ``CaptureAttemptResult.density_evidence`` -- which Roll's
+            # own frame handler reads on every frame -- resolves the same
+            # reservation raster this method just validated against, rather
+            # than re-deriving a frame-local path that only a cold batch has.
+            density_source_path=prepared.density_source_path,
         )
 
     def _write_batch_ack(

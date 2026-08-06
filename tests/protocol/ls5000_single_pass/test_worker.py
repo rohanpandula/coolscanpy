@@ -6538,6 +6538,13 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         job_sha256=hashlib.sha256(hold_job_path.read_bytes()).hexdigest(),
         session_id=captured["hold_session_id"],
         calibration_session_id=captured["calibration_session_id"],
+        # Beside the held preview attempt's own output, exactly where
+        # resume_held_session resolves it from -- never beside a frame of
+        # this resumed batch. Unused by
+        # _load_and_validate_batch_session_journal (which reads only the
+        # session journal), but stated rather than defaulted away because
+        # it is part of the contract this stand-in parent represents.
+        density_source_path=root / "preview-placeholder-preview.bin",
     )
     handled = (SimpleNamespace(request=SimpleNamespace(selected_slot=7)),)
 

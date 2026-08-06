@@ -89,6 +89,7 @@ def _batch_density_frame_provenance(
     frame_index: int,
     selected_slot: int,
     calibration_session_id: str | None = None,
+    density_source_path: Path | None = None,
 ) -> tuple[dict[str, object], str, str]:
     """Build exact density evidence/ownership for a synthetic batch frame.
 
@@ -98,6 +99,17 @@ def _batch_density_frame_provenance(
     passes its own separately to model the real divergence between a
     batch/round's own session id and the reservation-wide calibration
     identity.
+
+    ``density_source_path`` is the same divergence for the reservation's
+    97-dpi density source raster, and for the ``capture_attempt_id`` bound
+    into its evidence. A cold batch's whole-roll traversal runs inside the
+    batch child interleaved with its own first frame, so both live in that
+    frame's directory -- the default. A preview-and-hold reservation
+    completed its traversal in the *held preview attempt's* directory,
+    before any frame directory existed, and a resume inherits it from
+    there: a held caller must pass that path or this fixture models a
+    layout the real worker never produces (which is exactly how the
+    2026-08-06 attempt-11 live failure reached hardware with a green suite).
     """
 
     job = json.loads(job_path.read_text(encoding="utf-8"))
@@ -105,6 +117,11 @@ def _batch_density_frame_provenance(
     calibration_session_id = calibration_session_id or session_id
     selected_slots = tuple(frame["slot"] for frame in job["frames"])
     first_output = job_path.parent / job["frames"][0]["output"]
+    source_path = (
+        first_output.with_name(f"{first_output.stem}-preview.bin")
+        if density_source_path is None
+        else density_source_path
+    )
     calibration = single_pass.DensityCalibration.from_dict(
         _density_calibration_provenance(calibration_session_id)[
             "nikon_density_calibration"
@@ -116,14 +133,14 @@ def _batch_density_frame_provenance(
         calibration=calibration,
         density_f03_exposures_raw_10ns=(70_307, 136_614, 125_470),
         session_id=calibration_session_id,
-        capture_attempt_id=first_output.parent.name,
+        capture_attempt_id=source_path.parent.name,
         scan_identity=(
             f"{calibration_session_id}:density-97dpi:"
             f"{hashlib.sha256(source).hexdigest()}"
         ),
     )
-    if frame_index == 1:
-        first_output.with_name(f"{first_output.stem}-preview.bin").write_bytes(source)
+    if frame_index == 1 and not source_path.exists():
+        source_path.write_bytes(source)
     reviewed_sha = job["reviewed_roll_fingerprint"]["binding_sha256"]
     table_sha = "e" * 64
     ownership = single_pass.build_nikon_density_frame_ownership(
@@ -178,7 +195,7 @@ def test_capture_process_replays_37_record_density_geometry(tmp_path: Path) -> N
 
     rebuilt = capture._validated_density_evidence(
         {"nikon_density_evidence": evidence.to_dict()},
-        output_path=output,
+        source_path=capture._density_source_path(output),
     )
 
     assert rebuilt == evidence
@@ -2645,8 +2662,21 @@ class FakeHeldBatchProcess:
     # the real worker's hold_wait_release_receipt_path.
     _release_journal_path: Path = field(default=None, init=False)  # type: ignore[assignment]
 
+    @property
+    def density_source_path(self) -> Path:
+        """This reservation's 97-dpi density source raster, where the real
+        worker puts it for a preview-and-hold: beside the *preview
+        attempt's* own output, not beside any frame's."""
+
+        return self.output_path.with_name(f"{self.output_path.stem}-preview.bin")
+
     def __post_init__(self) -> None:
         self.output_path.write_bytes(b"")
+        # Persisted at preview time, exactly like the real worker's
+        # `_write_bytes_exclusive(artifact_paths["preview"], preview_bytes)`
+        # -- long before any frame directory exists, and never rewritten by
+        # any later round of the same reservation.
+        self.density_source_path.write_bytes(_density_source_fixture())
         journal = {
             "status": "awaiting-hold-job",
             "capture_mode": "preview-and-hold",
@@ -2826,6 +2856,7 @@ class FakeHeldBatchProcess:
             frame_index=self._frame_index + 1,
             selected_slot=frame["slot"],
             calibration_session_id=self.calibration_session_id,
+            density_source_path=self.density_source_path,
         )
         frame_journal.write_text(
             json.dumps(
