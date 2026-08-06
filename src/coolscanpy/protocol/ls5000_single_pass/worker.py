@@ -4315,6 +4315,25 @@ def _run_live_continuation_frame(
             },
         },
     }
+    if frame_index == 1:
+        # Frame 1 of every batch carries the reservation's density evidence
+        # receipt: that is the rule the parent validates against
+        # (capture_process._validate_batch_frame_result's own
+        # `frame_index == 1`), and the only frame it ever reads it from.
+        #
+        # For a cold batch, and for the first round resumed out of a held
+        # preview, frame 1 is captured by run_live_capture's own in-line
+        # preview branch, which stamps this from the traversal it just
+        # completed. A second-or-later round on the same held reservation
+        # has no such branch -- it captured its preview rounds ago, so
+        # every one of its frames, frame 1 included, arrives here instead.
+        # Omit this and that round's first frame is refused with "Nikon
+        # density evidence receipt is missing or malformed" while its own
+        # ownership receipt, stamped just above from this same evidence, is
+        # perfectly valid. Deliberately not stamped on frames 2..N, in
+        # either shape: the parent does not read it there, and a 6.25 MB
+        # raster does not need re-proving once per frame.
+        journal["nikon_density_evidence"] = density_evidence.to_dict()
     _write_journal(journal_path, journal)
 
     fine_stream: FineStreamSession | None = None

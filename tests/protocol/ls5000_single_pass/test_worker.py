@@ -5942,6 +5942,19 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     assert frame_18_journal["session_reservation_retained"] is True
     assert frame_18_journal["unit_released"] is False
 
+    # Round two's frame 1 (slot 18) is a *continuation* frame -- this round
+    # captured no preview of its own -- but it is still the frame the parent
+    # reads the reservation's density evidence receipt from, exactly like
+    # round one's frame 1 (slot 7, captured by the in-line preview branch).
+    # Without it, capture_process._validate_batch_frame_result refuses the
+    # second scan_many() of every multi-batch feed with "Nikon density
+    # evidence receipt is missing or malformed".
+    assert "nikon_density_evidence" in frame_18_journal
+    assert (
+        frame_18_journal["nikon_density_evidence"]
+        == frame_7_journal["nikon_density_evidence"]
+    ), "one reservation, one density result -- both rounds own the same one"
+
     session_journal_path = root / "session-journal.json"
     session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session_journal["status"] == "ejected"
