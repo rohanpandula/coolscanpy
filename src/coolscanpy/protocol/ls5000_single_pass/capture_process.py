@@ -2211,6 +2211,15 @@ class CaptureProcessAdapter:
         those three methods are unmodified and do not know or care whether
         the session they were handed came from a preview or from a prior
         batch's own CONTINUE_HOLD.
+
+        Every refusal below happens at the same moment
+        ``begin_held_preview``'s do -- the child is alive, parked at a hold
+        boundary, holding the reservation -- and raises instead of returning
+        the only handle that could release it. So, exactly like
+        ``begin_held_preview``, the child is best-effort released on the way
+        out (``_release_unreturnable_held_child``); without that, a refused
+        journal orphaned a live child on the scanner until
+        ``wait_for_hold_decision``'s own half-hour timeout expired.
         """
 
         session_journal_path = prepared.paths.session_journal
@@ -2223,9 +2232,34 @@ class CaptureProcessAdapter:
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     payload = None
                 if isinstance(payload, dict) and payload.get("status") == "held":
-                    session_journal = self._validate_held_after_batch_journal(
-                        prepared, payload, handled=handled
-                    )
+                    try:
+                        session_journal = self._validate_held_after_batch_journal(
+                            prepared, payload, handled=handled
+                        )
+                    except BaseException as error:
+                        rendezvous = payload.get("hold_resume")
+                        rendezvous = (
+                            rendezvous if isinstance(rendezvous, dict) else {}
+                        )
+                        # Read straight off the refused payload, not off the
+                        # validated journal there isn't one of: a refusal
+                        # for any *other* reason still names a perfectly
+                        # good rendezvous, and a refusal for a malformed
+                        # rendezvous leaves no way to address the child at
+                        # all -- which _release_unreturnable_held_child
+                        # records rather than guesses at.
+                        ack_path = rendezvous.get("hold_ack_path")
+                        self._release_unreturnable_held_child(
+                            process,
+                            hold_ack_path=(
+                                Path(ack_path)
+                                if isinstance(ack_path, str) and ack_path
+                                else None
+                            ),
+                            hold_session_id=rendezvous.get("hold_session_id"),
+                            error=error,
+                        )
+                        raise
                     resume = session_journal["hold_resume"]
                     # A held-after-batch session's "preview attempt" is
                     # synthetic: nothing here is a preview, but
@@ -2508,9 +2542,16 @@ class CaptureProcessAdapter:
                 # release belongs here, before the raise leaves this method.
                 self._release_unreturnable_held_child(
                     process,
-                    paths=paths,
                     hold_ack_path=hold_ack_path,
-                    hold_session_id=hold_session_id,
+                    # The validated id when the wait got that far, and the
+                    # journal's own already-rejected value when the wait is
+                    # what refused -- either way something the worker can
+                    # act on, which is what unblocks the child.
+                    hold_session_id=(
+                        self._rejected_hold_session_id(paths)
+                        if hold_session_id is None
+                        else hold_session_id
+                    ),
                     error=error,
                 )
                 raise
@@ -2725,53 +2766,83 @@ class CaptureProcessAdapter:
         self,
         process: RunningBatchProcess,
         *,
-        paths: AttemptPaths,
-        hold_ack_path: Path,
-        hold_session_id: str | None,
+        hold_ack_path: Path | None,
+        hold_session_id: Any,
         error: BaseException,
     ) -> None:
-        """Best-effort release and reap of a child parked at the hold
-        boundary that ``begin_held_preview`` can no longer hand back.
+        """Best-effort release and reap of a child parked at a hold boundary
+        that this adapter can no longer hand back.
+
+        Shared by both refusal paths that leave a live child holding the
+        reservation with nothing returned to release it with:
+        ``begin_held_preview`` refusing the original preview/hold journal,
+        and ``_resolve_held_after_batch`` refusing a CONTINUE_HOLD round's
+        own held-after-batch journal.  Both raise instead of returning a
+        session, so neither caller has a handle afterwards.
 
         Mirrors ``_release_held_session_locked`` -- publish a release
         decision, then wait the child out rather than signalling or
         abandoning it -- but deliberately never raises and never validates
         the release receipt.  ``error`` is the refusal already on its way
-        out of ``begin_held_preview`` and must stay the exception the
-        caller sees; what happened here is recorded on it as a note instead
-        of replacing it.  A best-effort release that quietly fails is still
-        strictly better than the previous behavior, which left the child
-        alive and holding the scanner with no handle anywhere to release it.
+        out and must stay the exception the caller sees; what happened here
+        is recorded on it as a note instead of replacing it.  A best-effort
+        release that quietly fails is still strictly better than leaving the
+        child alive and holding the scanner with no handle anywhere.
 
-        ``hold_session_id`` is the validated id when the wait got that far,
-        and ``None`` when the wait is what refused; in that second case the
-        journal's own (already-rejected) value is echoed back.  A mismatched
-        decision is not accepted by the worker -- it fails the wait closed
-        as a ``SynchronizedProtocolError``, whose synchronized-cleanup path
-        does still release the unit -- so publishing it unblocks a child
-        that would otherwise sit on the reservation until
+        ``hold_session_id`` is the validated id when the caller got that
+        far, and whatever the child itself published (possibly ``None``)
+        when validating that id is what refused.  A mismatched decision is
+        not accepted by the worker -- it fails the wait closed as a
+        ``SynchronizedProtocolError``, whose synchronized-cleanup path does
+        still release the unit -- so publishing it unblocks a child that
+        would otherwise sit on the reservation until
         ``wait_for_hold_decision``'s own half-hour timeout expired.
+        ``hold_ack_path`` is ``None`` only when the refused journal did not
+        name a usable rendezvous at all, which is the one case where there
+        is no way to address the child; that is recorded rather than
+        guessed at.
+
+        The child is waited out only once it has actually been unblocked --
+        either it was already gone, or a decision it will act on is now
+        published. ``_wait_for_batch_exit`` deliberately never gives up, so
+        waiting on a child still parked in ``wait_for_hold_decision`` with
+        no decision to read would block this thread for that wait's full
+        half-hour timeout rather than letting the refusal out.
         """
 
         told = "reached the hold boundary"
+        unblocked = False
         try:
             if process.poll() is None:
-                decision_id: Any = (
-                    self._rejected_hold_session_id(paths)
-                    if hold_session_id is None
-                    else hold_session_id
-                )
-                try:
-                    self._publish_hold_ack_at(
-                        hold_ack_path, hold_session_id=decision_id, action="release"
+                if hold_ack_path is None:
+                    told = (
+                        "could not be told to release (its journal named no "
+                        "usable hold rendezvous)"
                     )
-                    told = "was told to release"
-                except FileExistsError:
-                    told = "already had a hold decision published"
-                except BaseException as publish_error:
-                    told = f"could not be told to release ({publish_error})"
+                else:
+                    try:
+                        self._publish_hold_ack_at(
+                            hold_ack_path,
+                            hold_session_id=hold_session_id,
+                            action="release",
+                        )
+                        told = "was told to release"
+                        unblocked = True
+                    except FileExistsError:
+                        told = "already had a hold decision published"
+                        unblocked = True
+                    except BaseException as publish_error:
+                        told = f"could not be told to release ({publish_error})"
             else:
                 told = "was already gone"
+                unblocked = True
+            if not unblocked:
+                error.add_note(
+                    f"held preview child {told}; it was left running rather "
+                    "than waited on, and the scanner reservation must be "
+                    "assumed still held until it times out"
+                )
+                return
             returncode, wait_error = self._wait_for_batch_exit(process)
         except BaseException as cleanup_error:
             error.add_note(

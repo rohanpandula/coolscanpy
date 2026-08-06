@@ -2801,6 +2801,13 @@ class FakeHeldBatchProcess:
     )
     events: list[str] = field(default_factory=list)
     journal_overrides: dict[str, Any] | None = None
+    # journal_overrides' sibling for the *other* hold boundary: corrupts one
+    # field of the held-after-batch session journal a continue_hold ack
+    # publishes, while the child itself keeps behaving normally (it minted a
+    # real next-round hold_session_id and is parked on that round's hold-ack
+    # file). The reservation is live while the parent refuses -- the shape
+    # every _resolve_held_after_batch refusal has.
+    held_after_batch_journal_overrides: dict[str, Any] | None = None
     _job: dict[str, Any] | None = field(default=None, init=False)
     _frame_index: int = field(default=0, init=False)
     _returncode: int | None = field(default=None, init=False)
@@ -3118,6 +3125,8 @@ class FakeHeldBatchProcess:
                 "unit_released": False,
                 "hold_resume": resume,
             }
+            if self.held_after_batch_journal_overrides is not None:
+                session_journal.update(self.held_after_batch_journal_overrides)
             session_journal_path.write_text(
                 json.dumps(session_journal), encoding="utf-8"
             )
@@ -3168,6 +3177,7 @@ def _held_spawner(
     *,
     children: list[FakeHeldBatchProcess] | None = None,
     journal_overrides: dict[str, Any] | None = None,
+    held_after_batch_journal_overrides: dict[str, Any] | None = None,
 ):
     def spawn(
         argv: Sequence[str],
@@ -3186,6 +3196,7 @@ def _held_spawner(
             hold_ack_path=hold_job_path.with_name("hold-ack.json"),
             worker_sha256=worker_sha256,
             journal_overrides=journal_overrides,
+            held_after_batch_journal_overrides=held_after_batch_journal_overrides,
         )
         if children is not None:
             children.append(child)
@@ -3201,6 +3212,7 @@ def _held_adapter(
     *,
     children: list[FakeHeldBatchProcess] | None = None,
     journal_overrides: dict[str, Any] | None = None,
+    held_after_batch_journal_overrides: dict[str, Any] | None = None,
 ) -> capture.CaptureProcessAdapter:
     return capture.CaptureProcessAdapter(
         worker_path=binding.worker,
@@ -3212,6 +3224,9 @@ def _held_adapter(
             binding.worker_sha256,
             children=children,
             journal_overrides=journal_overrides,
+            held_after_batch_journal_overrides=(
+                held_after_batch_journal_overrides
+            ),
         ),
         batch_poll_seconds=0,
     )
@@ -3556,6 +3571,83 @@ def test_resume_held_session_with_continue_hold_returns_held_again(
     assert result.held_again.hold_job_path != held.hold_job_path
     assert result.held_again.hold_ack_path != held.hold_ack_path
     assert result.held_again.directory == held.directory
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"completed_slots": [99]}, "completed_slots"),
+        ({"session_id": "another-round"}, "session_id"),
+        ({"unit_released": True}, "still held"),
+        ({"hold_resume": {"hold_session_id": "short"}}, "hold_resume"),
+    ],
+    ids=["completed-slots", "session-id", "already-released", "bad-rendezvous"],
+)
+def test_refused_held_after_batch_journal_releases_the_child_instead_of_orphaning_it(
+    tmp_path: Path,
+    binding: Binding,
+    overrides: dict[str, Any],
+    match: str,
+) -> None:
+    """``_resolve_held_after_batch``'s refusals happen at exactly the moment
+    ``begin_held_preview``'s do -- the child is alive, parked at a fresh
+    hold-wait, holding the reservation -- and raise instead of returning the
+    only handle that could release it. Without the release path this test
+    pins, a refused CONTINUE_HOLD round left a live child sitting on the
+    scanner until wait_for_hold_decision's own half-hour timeout, from a
+    parent that had already given up on it.
+
+    The last case is the one with no usable rendezvous to address the child
+    with: the refusal must still propagate, and must say so rather than
+    guess at a path.
+    """
+
+    spawn_calls: list[tuple[str, ...]] = []
+    children: list[FakeHeldBatchProcess] = []
+    adapter = _held_adapter(
+        tmp_path,
+        binding,
+        spawn_calls,
+        children=children,
+        held_after_batch_journal_overrides=overrides,
+    )
+    held = adapter.begin_held_preview(
+        capture.CaptureRequest(mode=capture.CaptureMode.PREVIEW)
+    )
+    request = capture.CaptureBatchRequest(
+        (capture.CaptureRequest(capture.CaptureMode.FULL, 1, 0),),
+        reviewed_fingerprint=_reviewed_fingerprint(),
+        expected_usb_bus=1,
+        expected_usb_address=2,
+    )
+
+    with pytest.raises(capture.CaptureProcessError, match=match) as excinfo:
+        adapter.resume_held_session(
+            held,
+            request,
+            frame_handler=lambda _frame: capture.BatchAckAction.CONTINUE_HOLD,
+        )
+
+    assert len(children) == 1
+    child = children[0]
+    assert len(spawn_calls) == 1, "a refusal must never trigger a fresh spawn"
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("held preview child" in note for note in notes), (
+        "the propagating refusal must record what happened to the child"
+    )
+    if overrides.get("hold_resume") is None:
+        assert child.poll() is not None, (
+            "the refused child must be reaped, not left holding the scanner"
+        )
+        assert child.events[-1] == "hold-ack-release", child.events
+        assert any("exited 0" in note for note in notes), notes
+    else:
+        # No rendezvous to publish a decision at, so the child cannot be
+        # unblocked -- and must therefore not be waited on either, or the
+        # refusal would sit here for wait_for_hold_decision's own half-hour
+        # timeout instead of reaching the caller.
+        assert any("no usable hold rendezvous" in note for note in notes), notes
+        assert any("left running rather than waited on" in note for note in notes), notes
 
 
 def test_resume_held_session_can_be_called_again_after_continue_hold(
