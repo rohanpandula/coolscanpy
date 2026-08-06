@@ -4994,21 +4994,9 @@ class TestRollBatchRefusal:
             roll.close()
             dev.close()
 
-    def test_command_64_end_stop_status_raises_refeed_required(
+    def test_command_64_nonzero_status_is_not_misreported_as_refeed_required(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
-        # This is the sense-failure signature a short-strip preview leaves
-        # behind: the fine-scan fresh index read's command 64 comes back
-        # with a non-zero status because the transport is parked at its
-        # end-stop. See reverse_engineering/.analysis/
-        # refeed-elimination-trace-hunt-20260724.md for the hardware-trace
-        # confirmation that this exact translation (_roll.py's
-        # "command 64 status" ... "!= 0000000000000000" check) is correct
-        # and load-bearing, not an arbitrary refusal message: it is the
-        # same RefeedRequired diagnosis reverse_engineering/
-        # HANDOFF-20260724-NIGHT.md calls "a correct and useful diagnosis"
-        # in its own right, independent of the held-reservation work that
-        # makes the common preview-then-scan case stop hitting it at all.
         message = (
             "SynchronizedProtocolError: command 64 status 022b4b0000000000 "
             "!= 0000000000000000"
@@ -5021,10 +5009,10 @@ class TestRollBatchRefusal:
             roll.preview()
             if roll.needs_approval(1):
                 roll.approve(1)
-            with pytest.raises(coolscanpy.RefeedRequired) as excinfo:
+            with pytest.raises(coolscanpy.RollMismatch) as excinfo:
                 next(iter(roll.scan_many([1])))
-            assert "refeed" in str(excinfo.value) or "reinsert" in str(excinfo.value)
-            assert isinstance(excinfo.value, coolscanpy.RollMismatch)
+            assert not isinstance(excinfo.value, coolscanpy.RefeedRequired)
+            assert str(excinfo.value) == message
         finally:
             roll.close()
             dev.close()
