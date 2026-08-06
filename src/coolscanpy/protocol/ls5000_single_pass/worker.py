@@ -5802,9 +5802,39 @@ def run_live_capture(
                                 ),
                                 "session_reservation_retained": True,
                                 "unit_released": False,
-                                "scanner_identity": "Nikon LS-5000 ED 1.03",
+                                # `scanner_identity` is deliberately NOT
+                                # restated here: this same attempt's first
+                                # INQUIRY (sequence 1) already stamped the
+                                # revision the scanner actually reported,
+                                # and Lane A accepts any LS-5000 ED
+                                # revision. Overwriting it with the literal
+                                # "Nikon LS-5000 ED 1.03", as this block
+                                # used to, published a firmware revision
+                                # nobody read off the wire onto the resumed
+                                # frame's public Receipt.device_model --
+                                # diverging from both a cold batch's frame 1
+                                # (which keeps the real value) and every
+                                # continuation frame (which is handed it
+                                # explicitly, precisely so it stays real).
                                 "preview_geometry_validated_before_reads": True,
                                 "resumed_from_held_preview": True,
+                                # The preview and transport-table artifacts
+                                # stay where the preview phase persisted
+                                # them -- this attempt's own directory --
+                                # and only the frame map moves, because
+                                # `artifact_paths` was just rebound to this
+                                # frame's directory and the frame-selection
+                                # receipt written below goes there.
+                                # Restated so the journal names the files
+                                # that exist rather than the pre-resume
+                                # snapshot's now-superseded mapping path.
+                                "live_index_artifacts": {
+                                    key: str(path.resolve())
+                                    for key, path in {
+                                        **_live_index_artifact_paths(output_path),
+                                        "mapping": artifact_paths["mapping"],
+                                    }.items()
+                                },
                             }
                         )
                         journal_path = first_spec.journal
@@ -5846,6 +5876,24 @@ def run_live_capture(
                                 "unit_released": False,
                                 "recovery_required": None,
                                 "started_unix": time.time(),
+                                # A cold batch records this the moment its
+                                # preview completes (the `session_journal is
+                                # not None` branch beside the density
+                                # evidence above). A held preview has no
+                                # session journal at that moment -- one only
+                                # exists once a resume names it -- so
+                                # without restating it here the resumed
+                                # shape is the only one whose session
+                                # journal has no reservation-preview
+                                # identity block at all.
+                                "nikon_density_preview_identity": {
+                                    "reservation_id": calibration_session_id,
+                                    "batch_session_id": calibration_session_id,
+                                    "preview_sha256": preview_sha256,
+                                    "preview_identity_sha256": (
+                                        density_evidence.preview_identity_sha256
+                                    ),
+                                },
                             }
                         )
                         _write_journal(session_journal_path, session_journal)

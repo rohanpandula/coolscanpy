@@ -6358,7 +6358,15 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
-    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    # A revision deliberately unlike the "Nikon LS-5000 ED 1.03" literal
+    # the resumed-batch journal block used to hard-code over it: Lane A
+    # accepts any LS-5000 ED revision, and what the resumed frame
+    # publishes must be the one read off this attempt's own INQUIRY.
+    monkeypatch.setattr(
+        worker_module,
+        "_validate_scanner_identity",
+        lambda _payload: "Nikon LS-5000 ED 2.07",
+    )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
     )
@@ -6497,11 +6505,34 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     assert frame_7.output.parent.name == "frame-007"
     assert (root / "preview-placeholder.bin").parent.name != "frame-007"
 
+    # --- the resumed frame's journal says what actually happened ---
+    # The revision this attempt's own INQUIRY reported, not the literal the
+    # resumed-batch journal block used to overwrite it with -- that value
+    # reaches the public Receipt.device_model.
+    assert frame_7_journal["scanner_identity"] == "Nikon LS-5000 ED 2.07"
+    # The preview raster and transport table stay in the held attempt's own
+    # directory (the resume never re-captures them); only the frame map
+    # follows the rebound artifact paths into this frame's directory.
+    artifacts = frame_7_journal["live_index_artifacts"]
+    assert artifacts["preview"] == str((root / "preview-placeholder-preview.bin").resolve())
+    assert artifacts["table"] == str((root / "preview-placeholder-008e.bin").resolve())
+    assert artifacts["mapping"] == str(
+        (frame_7.output.parent / "capture-frame-map.json").resolve()
+    )
+    assert Path(artifacts["mapping"]).is_file()
+
     session_journal_path = root / "session-journal.json"
     session_journal = json.loads(session_journal_path.read_text(encoding="utf-8"))
     assert session_journal["status"] == "ejected"
     assert session_journal["completed_slots"] == [7]
     assert session_journal["density_calibration_session_id"] is not None
+    # A cold batch's session journal gets this block the moment its preview
+    # completes; a held preview has no session journal at that moment, so
+    # the resumed shape has to restate it or be the only one without it.
+    preview_identity = session_journal["nikon_density_preview_identity"]
+    assert preview_identity["reservation_id"] == captured["calibration_session_id"]
+    assert preview_identity["batch_session_id"] == captured["calibration_session_id"]
+    assert preview_identity["preview_identity_sha256"] == "d" * 64
     assert (
         ownership["batch_session_id"]
         == session_journal["density_calibration_session_id"]
