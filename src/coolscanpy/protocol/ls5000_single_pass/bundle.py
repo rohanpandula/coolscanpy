@@ -29,7 +29,7 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "capture_process.py": "03ac9737697ce1e07cfdc4c826c3dbb662b2aac72fe599893f23ffe5932f408d",
-    "worker.py": "34b9c84bbda58d872cb960ee3b9a70b6bb5b53cf3d73d6474fa8342faf4e0a49",
+    "worker.py": "29f74e99649d16da38a82163caf5a4d71502843f0afbb2187a20e66d4ecfa193",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "be7e1e11635edcc70e150fd7454625a478effbb2446017b2cb56676dcb5ebed9",
     "packed.py": "7380c8685c77be1234ad17bfd265cb6efc16efd05204ff56f55faf811f14cb9d",

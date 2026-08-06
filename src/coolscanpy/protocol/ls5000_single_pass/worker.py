@@ -5695,107 +5695,140 @@ def run_live_capture(
                         meter_output = meter_sidecar_path.open("xb")
                         artifact_paths = _live_index_artifact_paths(fine_output_path)
 
-                        journal = {
-                            "status": "starting",
-                            "plan": str(plan_path.resolve()),
-                            "plan_sha256": plan_sha256,
-                            "continuation_plan_sha256": continuation_plan_sha256,
-                            "capture_engine_sha256": CAPTURE_WORKER_SHA256,
-                            "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
-                            "meter_controller_sha256": _meter_controller_sha256(),
-                            "output": str(fine_output_path.resolve()),
-                            "capture_mode": "full",
-                            "requested_frame": frame,
-                            "expected_frame_count": None,
-                            "requested_boundary_offset_rows": boundary_offset_rows,
-                            "applied_boundary_offset_rows": None,
-                            "resolved_lookup_row": None,
-                            "resolved_native_origin": None,
-                            "expected_reads": read_count,
-                            "expected_bytes": expected_bytes,
-                            "completed_reads": 0,
-                            "completed_bytes": 0,
-                            "stall_recoveries": 0,
-                            "started_unix": time.time(),
-                            # Same field, same identity, a cold batch's own
-                            # per-frame journal carries from the shared
-                            # "starting" journal init above -- this branch
-                            # replaces `journal` wholesale rather than
-                            # updating it, so it has to be restated here too
-                            # (see the sibling note on session_journal just
-                            # below).
-                            "density_calibration_session_id": calibration_session_id,
-                            "meter_evidence_path": str(meter_sidecar_path.resolve()),
-                            "ack_nonce": None,
-                            "batch_session": {
-                                "frame_index": 1,
-                                "frame_total": len(batch_job.frames),
-                                "selected_slots": list(batch_job.selected_slots),
-                                "session_id": batch_job.session_id,
-                            },
-                            "frame_complete": False,
-                            "manual_review_approval": (
-                                None
-                                if first_spec.manual_review_approval is None
-                                else first_spec.manual_review_approval.to_payload()
-                            ),
-                            "reviewed_roll_fingerprint_sha256": (
-                                batch_job.reviewed_fingerprint.binding_sha256
-                            ),
-                            "session_reservation_retained": True,
-                            "unit_released": False,
-                            "scanner_identity": "Nikon LS-5000 ED 1.03",
-                            "preview_geometry_validated_before_reads": True,
-                            "resumed_from_held_preview": True,
-                            # The later shared selection_receipt code below
-                            # (identical for a cold batch's own frame 1 and
-                            # this resumed one) reads this back from the
-                            # per-frame journal; a cold batch's journal
-                            # carries it forward from the same startup-table
-                            # validation because it never reassigns journal
-                            # the way this branch just did.
-                            "live_startup_0x8f_status": journal["live_startup_0x8f_status"],
-                        }
-                        journal_path = first_spec.journal
-                        session_journal = {
-                            "status": "capturing",
-                            "session_id": batch_job.session_id,
-                            # Same reservation-wide identity a cold batch's
-                            # own session_journal carries from launch (see
-                            # the batch_mode branch above) -- this resumed
-                            # batch's session_journal replaces that dict
-                            # wholesale rather than updating it, so it has
-                            # to be restated here too, or a reader (the
-                            # parent's CaptureProcessAdapter included) sees
-                            # it silently go missing on every resumed
-                            # batch's first frame.
-                            "density_calibration_session_id": calibration_session_id,
-                            "selected_slots": list(batch_job.selected_slots),
-                            "completed_slots": [],
-                            "active_frame_index": 1,
-                            "active_slot": first_spec.slot,
-                            "batch_job_sha256": batch_job.job_sha256,
-                            "capture_engine_sha256": CAPTURE_WORKER_SHA256,
-                            "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
-                            "plan_sha256": plan_sha256,
-                            "continuation_plan_sha256": continuation_plan_sha256,
-                            "manual_review_approval_sha256_by_slot": {
-                                str(spec.slot): (
+                        # Regression (2026-08-06, second live failure of this
+                        # class): this used to be `journal = {new dict}`, a
+                        # wholesale replacement that silently dropped every
+                        # field the shared "starting" init above (and the
+                        # preview phase's own updates to it -- calibration,
+                        # scanner identity, startup-table validation, ...)
+                        # had already stamped, unless each was hand-copied
+                        # here one at a time. density_calibration_session_id
+                        # was the first field that bit; expected_usb_bus/
+                        # expected_usb_address/actual_usb_bus/
+                        # actual_usb_address were the next, on live hardware
+                        # (attempt 10). `.update()` on the *same* dict this
+                        # attempt has been accumulating since it started
+                        # fixes the whole class by construction: every
+                        # already-stamped field -- known or not yet
+                        # invented -- survives unless this block explicitly
+                        # overwrites it, the same way every later
+                        # session_journal.update() call in this function
+                        # already behaves.
+                        journal.update(
+                            {
+                                "status": "starting",
+                                # Unlike plan_sha256/capture_engine_sha256/
+                                # capture_bundle_sha256/meter_controller_sha256
+                                # (all set once, unconditionally, in this
+                                # attempt's shared "starting" init and never
+                                # touched again), continuation_plan_sha256 is
+                                # NOT part of that shared init -- a plain
+                                # preview needs no continuation plan. It is
+                                # only ever stamped inside `if batch_mode:`
+                                # above (a cold batch) or here (a resumed
+                                # one); the same field this exact test caught
+                                # missing before this comment existed.
+                                "continuation_plan_sha256": continuation_plan_sha256,
+                                # Also not inherited: a preview-and-hold
+                                # attempt can be launched with no specific
+                                # USB device requirement at all (expected_
+                                # usb_bus/expected_usb_address None
+                                # throughout the shared init above), while
+                                # the resumed batch's own job always names
+                                # one -- the exact field the second live
+                                # failure of this class caught (attempt 10,
+                                # 2026-08-06). _run_live_continuation_frame
+                                # already sources these from batch_job, not
+                                # from inheritance, for the same reason.
+                                "expected_usb_bus": batch_job.expected_usb_bus,
+                                "expected_usb_address": batch_job.expected_usb_address,
+                                "output": str(fine_output_path.resolve()),
+                                "capture_mode": "full",
+                                "requested_frame": frame,
+                                "expected_frame_count": None,
+                                "requested_boundary_offset_rows": (
+                                    boundary_offset_rows
+                                ),
+                                "applied_boundary_offset_rows": None,
+                                "resolved_lookup_row": None,
+                                "resolved_native_origin": None,
+                                "expected_reads": read_count,
+                                "expected_bytes": expected_bytes,
+                                "completed_reads": 0,
+                                "completed_bytes": 0,
+                                "stall_recoveries": 0,
+                                "started_unix": time.time(),
+                                "meter_evidence_path": str(
+                                    meter_sidecar_path.resolve()
+                                ),
+                                "ack_nonce": None,
+                                "batch_session": {
+                                    "frame_index": 1,
+                                    "frame_total": len(batch_job.frames),
+                                    "selected_slots": list(
+                                        batch_job.selected_slots
+                                    ),
+                                    "session_id": batch_job.session_id,
+                                },
+                                "frame_complete": False,
+                                "manual_review_approval": (
                                     None
-                                    if spec.manual_review_approval is None
-                                    else spec.manual_review_approval.binding_sha256
-                                )
-                                for spec in batch_job.frames
-                            },
-                            "reviewed_roll_fingerprint_sha256": (
-                                batch_job.reviewed_fingerprint.binding_sha256
-                            ),
-                            "reservation_acquired": True,
-                            "unit_release_attempts": 0,
-                            "unit_released": False,
-                            "recovery_required": None,
-                            "started_unix": time.time(),
-                        }
+                                    if first_spec.manual_review_approval is None
+                                    else (
+                                        first_spec.manual_review_approval.to_payload()
+                                    )
+                                ),
+                                "reviewed_roll_fingerprint_sha256": (
+                                    batch_job.reviewed_fingerprint.binding_sha256
+                                ),
+                                "session_reservation_retained": True,
+                                "unit_released": False,
+                                "scanner_identity": "Nikon LS-5000 ED 1.03",
+                                "preview_geometry_validated_before_reads": True,
+                                "resumed_from_held_preview": True,
+                            }
+                        )
+                        journal_path = first_spec.journal
+                        # Same fix, same reason, for the session-level
+                        # journal: instead of hand-curating a second fresh
+                        # dict (session_journal = {...}) that has to
+                        # independently duplicate every field the per-frame
+                        # journal above already carries (and drifts the
+                        # same way when a new one is added), start from
+                        # that journal's own already-accumulated state --
+                        # capture_engine_sha256, capture_bundle_sha256,
+                        # plan_sha256, continuation_plan_sha256,
+                        # density_calibration_session_id, expected/actual
+                        # USB topology, nikon_density_calibration -- and
+                        # layer only the fields that are genuinely
+                        # session-scoped (not per-frame) on top.
+                        session_journal = dict(journal)
+                        session_journal.update(
+                            {
+                                "status": "capturing",
+                                "session_id": batch_job.session_id,
+                                "selected_slots": list(batch_job.selected_slots),
+                                "completed_slots": [],
+                                "active_frame_index": 1,
+                                "active_slot": first_spec.slot,
+                                "batch_job_sha256": batch_job.job_sha256,
+                                "manual_review_approval_sha256_by_slot": {
+                                    str(spec.slot): (
+                                        None
+                                        if spec.manual_review_approval is None
+                                        else (
+                                            spec.manual_review_approval.binding_sha256
+                                        )
+                                    )
+                                    for spec in batch_job.frames
+                                },
+                                "reservation_acquired": True,
+                                "unit_release_attempts": 0,
+                                "unit_released": False,
+                                "recovery_required": None,
+                                "started_unix": time.time(),
+                            }
+                        )
                         _write_journal(session_journal_path, session_journal)
                         _write_journal(journal_path, journal)
                     try:

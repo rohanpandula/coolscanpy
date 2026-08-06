@@ -6281,6 +6281,14 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             poll_seconds=0,
         )
 
+    # Stashed here, at the same moment the real CaptureProcessAdapter would
+    # learn each value (the hold_session_id it must echo back to resume;
+    # the calibration_session_id it would read from the held preview's own
+    # attempt journal) -- so the parent-validator drive at the bottom of
+    # this test builds its PreparedCaptureBatch from independently-known
+    # values, not from reading back the very journal it is about to check.
+    captured: dict[str, str] = {}
+
     def fake_wait_for_hold_decision(
         path: Path,
         *,
@@ -6290,6 +6298,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     ) -> str:
         del timeout_seconds, poll_seconds
         hold_decisions.append(str(path))
+        captured["hold_session_id"] = hold_session_id
         # The one and only hold-wait: the fixed hold_job_path this attempt
         # was launched with. Publish slot 7's one-frame job, echoing back
         # the hold_session_id this held preview minted -- exactly what a
@@ -6351,10 +6360,13 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     monkeypatch.setattr(
         worker_module, "_validate_preview_density_source_contract", lambda *_args: None
     )
-    monkeypatch.setattr(
-        worker_module,
-        "build_nikon_density_evidence",
-        lambda *_args, **kwargs: SimpleNamespace(
+    def fake_build_nikon_density_evidence(*_args: object, **kwargs: object) -> object:
+        # Stashed for the same reason fake_wait_for_hold_decision stashes
+        # hold_session_id above: the parent-validator drive at the bottom
+        # of this test needs calibration_session_id from an independent
+        # source, not from reading back the journal it is about to check.
+        captured["calibration_session_id"] = kwargs["session_id"]
+        return SimpleNamespace(
             # NikonDensityFrameOwnershipReceipt.validate_evidence (real,
             # unmocked -- see below) requires calibration_binding/
             # source_binding/exposure_binding/result to each carry the same
@@ -6371,7 +6383,12 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
             result=SimpleNamespace(session_id=kwargs["session_id"]),
             preview_identity_sha256="d" * 64,
             to_dict=lambda: {"scope": "reservation-preview", "test_fixture": True},
-        ),
+        )
+
+    monkeypatch.setattr(
+        worker_module,
+        "build_nikon_density_evidence",
+        fake_build_nikon_density_evidence,
     )
     # build_nikon_density_frame_ownership (real, unmocked -- see below)
     # requires `isinstance(evidence, NikonDensityEvidence)`; the fixture
@@ -6472,3 +6489,66 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
         session_journal["session_id"]
         != session_journal["density_calibration_session_id"]
     )
+
+    # --- regression for the second live failure of this class (2026-08-06,
+    # attempt 10): worker.py's resumed-batch session_journal used to be
+    # `session_journal = {new dict}`, wholesale replacement that dropped
+    # every field the shared journal already carried unless hand-copied one
+    # at a time -- expected_usb_bus/expected_usb_address next, after
+    # density_calibration_session_id the round before. Rather than asserting
+    # a second hand-written field list here (the same failure mode, one
+    # remove), drive the real parent-side validator -- the actual
+    # authority on what a batch session journal must contain -- against
+    # this real, on-disk session_journal, exactly as CaptureProcessAdapter.
+    # resume_held_session would at the end of a live batch.
+    from coolscanpy.protocol.ls5000_single_pass import capture_process
+
+    fake_adapter_self = SimpleNamespace(
+        _expected_worker_sha256=worker_module.CAPTURE_WORKER_SHA256,
+        _expected_bundle_sha256=None,
+    )
+    prepared = capture_process.PreparedCaptureBatch(
+        request=capture_process.CaptureBatchRequest(
+            (
+                capture_process.CaptureRequest(
+                    capture_process.CaptureMode.FULL, 7, 9
+                ),
+            ),
+            reviewed_fingerprint=reviewed_fingerprint,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        ),
+        paths=capture_process.BatchSessionPaths(
+            directory=root,
+            job=hold_job_path,
+            first_plan=root / "plan-placeholder.jsonl",
+            continuation_plan=root / "continuation-placeholder.json",
+            manifest=root / "manifest-placeholder.json",
+            bootstrap_status=root / "bootstrap-placeholder.json",
+            session_journal=session_journal_path,
+            stdout=root / "stdout-placeholder.txt",
+            stderr=root / "stderr-placeholder.txt",
+        ),
+        argv=(),
+        # Read back from the exact bytes this test's own fake parent wrote
+        # to hold_job_path -- the same computation the real
+        # CaptureProcessAdapter.resume_held_session does over the payload
+        # it itself writes, not a value borrowed from the journal under
+        # test.
+        job_sha256=hashlib.sha256(hold_job_path.read_bytes()).hexdigest(),
+        session_id=captured["hold_session_id"],
+        calibration_session_id=captured["calibration_session_id"],
+    )
+    handled = (SimpleNamespace(request=SimpleNamespace(selected_slot=7)),)
+
+    validated = capture_process.CaptureProcessAdapter._load_and_validate_batch_session_journal(
+        fake_adapter_self,
+        prepared,
+        returncode=0,
+        handled=handled,
+        stopped=False,
+        ejected=True,
+    )
+
+    assert validated["status"] == "ejected"
+    assert validated["completed_slots"] == [7]
