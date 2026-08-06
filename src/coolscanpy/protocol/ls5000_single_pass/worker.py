@@ -7218,6 +7218,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not args.live:
             print("dry run only; scanner was not accessed")
             return
+        # Every other live branch revalidates the parent-pinned bundle, the
+        # supplied plan, and the supplied manifest immediately before the
+        # first USB action; this one did not, so a preview-and-hold -- the
+        # launch that goes on to own the reservation for the entire feed --
+        # was the only live shape reaching the scanner without it.
+        _verify_live_capture_bundle(
+            plan_path=args.plan,
+            manifest_path=args.manifest,
+            plan_sha256=plan_sha256,
+            expected_bundle_sha256=args.expected_capture_bundle_sha256,
+        )
         run_live_capture(
             plan,
             args.plan,

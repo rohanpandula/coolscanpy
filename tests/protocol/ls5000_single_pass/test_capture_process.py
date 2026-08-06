@@ -2324,6 +2324,161 @@ def test_verified_batch_bootstrap_failure_is_not_recovery_required(
     assert "CAPTURE_WORKER_BOOTSTRAP_FAILED" in str(excinfo.value)
 
 
+def test_held_preview_spawn_uses_the_same_bootstrap_prefix_as_every_other_launch(
+    tmp_path: Path,
+    binding: Binding,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source/wheel install launches the worker through the stdlib
+    bootstrap under an isolated interpreter -- ``_launcher`` alone is just
+    ``(sys.executable,)`` and cannot run anything. ``_build_held_preview_argv``
+    used to prepend ``_launcher`` directly, so the packaged adapter's held
+    preview came out as ``python --plan ...``, which no interpreter accepts:
+    preview-and-hold, and therefore every multi-batch-per-feed session, was
+    unlaunchable outside a frozen build. Pin the prefix and the bundle
+    assertion against the cold batch's own, which is the contract.
+    """
+
+    spawned: list[tuple[str, ...]] = []
+
+    class NeverReady:
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def spawn(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+    ) -> NeverReady:
+        del cwd, stdout, stderr
+        spawned.append(tuple(argv))
+        return NeverReady()
+
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        expected_bundle_sha256=CAPTURE_BUNDLE_SHA256,
+        verify_worker_source=False,
+        batch_spawner=spawn,
+        batch_poll_seconds=0,
+    )
+
+    held = adapter.begin_held_preview(
+        capture.CaptureRequest(
+            capture.CaptureMode.PREVIEW,
+            expected_usb_bus=1,
+            expected_usb_address=2,
+        )
+    )
+    # The child exited without ever publishing an awaiting-hold-job journal,
+    # so this is an unusable session -- which is fine here: the argv is what
+    # is under test, and it was already built before the spawn.
+    assert held.usable is False
+    assert len(spawned) == 1
+    argv = spawned[0]
+
+    assert argv[0] == sys.executable
+    assert argv[1:4] == ("-I", "-B", "-c")
+    assert argv[4] == capture._PACKAGED_WORKER_BOOTSTRAP
+    assert argv[6] == capture.PACKAGED_WORKER_MODULE
+    # The launcher receipt binds this exact bootstrap status file/nonce to
+    # this exact worker argv -- the binding _verified_bootstrap_failure
+    # re-derives before it will believe any bootstrap marker at all.
+    assert argv[5] == str(held.preview_attempt.paths.bootstrap_status)
+    assert argv[7] == held.preview_attempt.paths.bootstrap_nonce
+    assert argv[8] == capture._worker_argv_sha256(argv[9:])
+    assert "--preview-and-hold" in argv[9:]
+    # Asserted on the child's own command line by every other live launch
+    # shape (_build_argv, _build_batch_argv), and now by this one.
+    assert "--expected-capture-bundle-sha256" in argv[9:]
+    assert _argument(argv, "--expected-capture-bundle-sha256") == CAPTURE_BUNDLE_SHA256
+
+    # And the resume that follows reuses this same argv/status/nonce, so a
+    # bootstrap receipt stays verifiable across the whole reservation.
+    monkeypatch.setattr(adapter, "_batch_poll_seconds", 0)
+    assert held.preview_attempt.argv == argv
+
+
+def test_held_preview_bootstrap_failure_is_not_reported_as_a_parked_feeder(
+    tmp_path: Path,
+    binding: Binding,
+) -> None:
+    """``_interpret_held_preview_launch_failure`` conservatively requires
+    recovery for any untrustworthy journal. A verified pre-dispatch
+    bootstrap receipt is not that case -- the scanner was never touched --
+    and every other launch shape already distinguishes it
+    (``_interpret_result``). Reporting RECOVERY_REQUIRED here tells the
+    operator to power-cycle a scanner over a missing Python module.
+    """
+
+    class FailedBeforeDispatch:
+        def poll(self) -> int:
+            return 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 1
+
+    def spawn(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        stdout: object,
+        stderr: object,
+    ) -> FailedBeforeDispatch:
+        del cwd, stdout, stderr
+        command = tuple(argv)
+        marker = command.index(capture._PACKAGED_WORKER_BOOTSTRAP)
+        Path(command[marker + 1]).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "failed-before-ready",
+                    "nonce": command[marker + 3],
+                    "worker_argv_sha256": command[marker + 4],
+                    "error_type": "ModuleNotFoundError",
+                    "error_message": "No module named 'coolscanpy'",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FailedBeforeDispatch()
+
+    adapter = capture.CaptureProcessAdapter(
+        worker_path=binding.worker,
+        expected_worker_sha256=binding.worker_sha256,
+        manifest_path=binding.manifest,
+        attempts_root=tmp_path / "attempts",
+        launcher=(sys.executable,),
+        bootstrap_module=capture.PACKAGED_WORKER_MODULE,
+        batch_spawner=spawn,
+        batch_poll_seconds=0,
+    )
+
+    held = adapter.begin_held_preview(
+        capture.CaptureRequest(capture.CaptureMode.PREVIEW)
+    )
+
+    assert held.usable is False
+    attempt = held.preview_attempt
+    assert attempt.outcome is capture.CaptureOutcome.BOOTSTRAP_FAILED
+    assert attempt.recovery_required is False
+    assert attempt.journal is None
+    assert attempt.journal_error is not None
+    assert "CAPTURE_WORKER_BOOTSTRAP_FAILED" in attempt.journal_error
+    assert "before scanner dispatch" in attempt.journal_error
+
+
 def test_packaged_factory_uses_frozen_app_helper_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

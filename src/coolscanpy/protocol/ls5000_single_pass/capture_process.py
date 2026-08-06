@@ -2524,8 +2524,25 @@ class CaptureProcessAdapter:
         expected_usb_bus: int | None = None,
         expected_usb_address: int | None = None,
     ) -> tuple[str, ...]:
-        argv = (
-            *self._launcher,
+        """Build a held-preview launch the same way every other launch is
+        built: through ``_worker_launcher``, with the packaged bundle
+        identity asserted on the child's own command line.
+
+        This method used to prepend ``self._launcher`` directly and omit
+        ``--expected-capture-bundle-sha256``, unlike ``_build_argv`` and
+        ``_build_batch_argv``. For the packaged adapter -- where
+        ``_launcher`` is ``(sys.executable,)`` and the stdlib bootstrap is
+        what turns that into a real worker invocation -- the result was
+        ``python --plan ...``, which no interpreter accepts, so a
+        source/wheel install could not start a held preview at all; and
+        because the argv then failed ``_verified_bootstrap_failure``'s own
+        prefix check, the failure could not even be reported as a bootstrap
+        failure. A frozen build (``_bootstrap_module is None``) was
+        unaffected either way, and every test adapter builds without a
+        bootstrap module, which is why the suite never saw it.
+        """
+
+        worker_argv = [
             "--plan",
             str(paths.plan),
             "--manifest",
@@ -2540,16 +2557,31 @@ class CaptureProcessAdapter:
             str(paths.journal),
             "--live",
             "--preview-and-hold",
-        )
+        ]
         if expected_usb_bus is not None:
             assert expected_usb_address is not None
-            argv = argv + (
-                "--expected-usb-bus",
-                str(expected_usb_bus),
-                "--expected-usb-address",
-                str(expected_usb_address),
+            worker_argv.extend(
+                (
+                    "--expected-usb-bus",
+                    str(expected_usb_bus),
+                    "--expected-usb-address",
+                    str(expected_usb_address),
+                )
             )
-        return argv
+        if self._expected_bundle_sha256 is not None:
+            worker_argv.extend(
+                ("--expected-capture-bundle-sha256", self._expected_bundle_sha256)
+            )
+        return tuple(
+            (
+                *self._worker_launcher(
+                    bootstrap_status=paths.bootstrap_status,
+                    bootstrap_nonce=paths.bootstrap_nonce,
+                    worker_argv=worker_argv,
+                ),
+                *worker_argv,
+            )
+        )
 
     def _wait_for_held_preview_ready(
         self,
@@ -2628,8 +2660,33 @@ class CaptureProcessAdapter:
         does not know about ``"preview-and-hold"``; duplicating its handful
         of field checks here keeps that shared, heavily-tested validator's
         contract for every other caller completely unchanged.
+
+        A verified pre-dispatch bootstrap receipt is checked first, exactly
+        as ``_interpret_result`` does for every other launch shape --
+        otherwise a held preview whose child failed before importing the
+        worker is reported as RECOVERY_REQUIRED, telling the operator to
+        power-cycle a scanner that was never touched, instead of the
+        BOOTSTRAP_FAILED ``Roll.preview()`` already knows how to translate.
         """
 
+        bootstrap_error = self._verified_bootstrap_failure(
+            paths=paths,
+            argv=argv,
+            journal_path=paths.journal,
+            returncode=returncode,
+        )
+        if bootstrap_error is not None:
+            return CaptureAttemptResult(
+                outcome=CaptureOutcome.BOOTSTRAP_FAILED,
+                request=request,
+                paths=paths,
+                argv=argv,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                journal=None,
+                journal_error=bootstrap_error,
+            )
         try:
             payload = json.loads(paths.journal.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
