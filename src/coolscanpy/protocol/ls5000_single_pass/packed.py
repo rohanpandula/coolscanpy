@@ -112,11 +112,11 @@ def _counter_train_ok(
 def _padding_counter_dialect(block: np.ndarray) -> str | None:
     """Identify any complete padding counter dialect observed live.
 
-    The original captures begin with the canonical ``AA55,D893`` pair.  Two
+    The original captures begin with the canonical ``AA55,D893`` pair.  Four
     further stable LS-5000 states, each observed identically in both long
     padding blocks across every record of its captured stream, replace only
-    the first three words with a repeated sentinel — ``E9EA``, ``E004``, or
-    ``DC4C``.
+    the first three words with a repeated sentinel — ``E9EA``, ``E004``,
+    ``DC4C``, or ``F6B1``.
     The fourth word remains ``D894`` and the canonical ``AA55,D895...`` train
     resumes immediately afterward.  Accept only those exact whole-block forms.
     """
@@ -129,6 +129,7 @@ def _padding_counter_dialect(block: np.ndarray) -> str | None:
         (0xE9EA, "e9ea-prefixed"),
         (0xE004, "e004-prefixed"),
         (0xDC4C, "dc4c-prefixed"),
+        (0xF6B1, "f6b1-prefixed"),
     ):
         sentinel_prefix = np.array(
             [sentinel, sentinel, sentinel, 0xD894],
