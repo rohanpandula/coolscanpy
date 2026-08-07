@@ -283,6 +283,17 @@ class TestStreamingFrameDecoder:
         with pytest.raises(ValueError, match="padding 3 counter train mismatch"):
             _feed(decoder, full.astype(">u2").tobytes(), 65_535)
 
+    def test_cross_record_dialect_change_fails_closed(self) -> None:
+        _base, full = _synthetic_full_records(height=3)
+        record = full[1]
+        _e9ea_prefixed_counter_train(record[110_840 // 2 : 111_616 // 2])
+        _e9ea_prefixed_counter_train(record[207_096 // 2 : 207_872 // 2])
+        decoder = StreamingFrameDecoder(height=3)
+        with pytest.raises(
+            ValueError, match="dialect changed at record 1: canonical -> e9ea-prefixed"
+        ):
+            _feed(decoder, full.astype(">u2").tobytes(), 65_535)
+
     def test_empty_pushes_are_no_ops(self, tmp_path: Path) -> None:
         _base, stream = _stream_bytes(height=3)
         path = tmp_path / "capture.bin"

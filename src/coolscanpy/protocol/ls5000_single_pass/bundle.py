@@ -32,7 +32,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "worker.py": "0a76c57cb7c4a77dc4c5a89bbc952890d963473d54e708454cd472f7d59211f5",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "be7e1e11635edcc70e150fd7454625a478effbb2446017b2cb56676dcb5ebed9",
-    "packed.py": "623c5f3329c141e53cce4791ebdb5f19e55a50634e0d4b6ebc626d6270d31b40",
+    "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",

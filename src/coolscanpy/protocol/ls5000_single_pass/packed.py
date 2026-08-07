@@ -279,8 +279,11 @@ class StreamingFrameDecoder:
     time or whole records -- then call `finish`.  It routes every completed
     207,872-byte record through the same `_decode_record_block` kernel and the
     same fail-closed `validate_full_record_layout` padding check as the batch
-    `decode_full_records`, so its output is byte-identical to an offline decode
-    of the same stream.
+    `decode_full_records`, and additionally holds every record to the first
+    record's padding counter dialect -- the stream-wide uniformity the batch
+    decoder's whole-stream vectorized check enforces implicitly -- so its
+    output is byte-identical to an offline decode of the same stream and it
+    refuses exactly the streams the offline decode refuses.
 
     It retains at most one record of raw staging, enforces an exact stream
     length, and reveals its private output buffer only after a complete,
@@ -313,6 +316,7 @@ class StreamingFrameDecoder:
         self._received = 0
         self._record_index = 0
         self._max_staged = 0
+        self._padding_dialect: str | None = None
         if out is not None:
             out_array = np.asarray(out)
             if (
@@ -380,7 +384,15 @@ class StreamingFrameDecoder:
             self._rgbi = np.empty((self._height, self._width, CHANNELS), dtype=np.uint16)
         record_words = np.frombuffer(self._staging, dtype=">u2").reshape(1, FULL_RECORD_WORDS)
         if self._validate_padding:
-            validate_full_record_layout(record_words)
+            layout = validate_full_record_layout(record_words)
+            dialect = str(layout["padding_1_3_counter_dialect"])
+            if self._record_index == 0:
+                self._padding_dialect = dialect
+            elif dialect != self._padding_dialect:
+                raise ValueError(
+                    "full-record padding counter dialect changed at record "
+                    f"{self._record_index}: {self._padding_dialect} -> {dialect}"
+                )
         flat_rows = _decode_record_block(record_words, width=self._width)
         output_first = self._record_index * ROWS_PER_RECORD
         output_last = min(self._height, output_first + flat_rows.shape[0])
