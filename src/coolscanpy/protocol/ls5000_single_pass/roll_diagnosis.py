@@ -108,6 +108,19 @@ _CONTRAST_FLOOR_SYMMETRY_FLOOR = 0.90
 # required before the check may speak at all.
 _OBSTRUCTION_CLEAR_LEVEL_FRACTION = 0.75
 _OBSTRUCTION_MIN_BRIGHT_ROWS = 6
+# ...and the p99 reference itself must stand clearly apart from the typical
+# row before those candidates are believed to be clear film at all: on a
+# roll with NO clear rows (dense/gapless refusals -- exactly when diagnosis
+# runs), p99 lands on bright FRAME rows whose one-sided scene content then
+# resurrects the phantom-obstruction sentence (re-review 2026-08-08, F-C).
+# Real clear film reads several times brighter than frame content; a p99
+# within this ratio of the median row means there is no clear-film
+# population to judge from, and the check stays silent. 1.8 sits between
+# frame texture's own p99/median spread (~1.5-1.6 measured on the synthetic
+# fixtures) and real clear film's ~3x separation; dense film whose clear
+# rows barely clear its frames loses obstruction diagnosis rather than
+# risking a wrong sentence.
+_OBSTRUCTION_CLEAR_SEPARATION_RATIO = 1.8
 # Below this aperture width, edge/middle columns cannot be split usefully.
 _APERTURE_MIN_WIDTH_FOR_OBSTRUCTION_CHECK = 10
 
@@ -385,6 +398,11 @@ def _diagnose_aperture_obstruction(
     row_middle = np.median(levels[:, edge:-edge], axis=1)
     clear_reference = float(np.percentile(row_middle, 99.0))
     if clear_reference <= 0:
+        return None
+    typical_row = float(np.median(row_middle))
+    if typical_row > 0 and clear_reference < (
+        _OBSTRUCTION_CLEAR_SEPARATION_RATIO * typical_row
+    ):
         return None
     bright_rows = row_middle >= _OBSTRUCTION_CLEAR_LEVEL_FRACTION * clear_reference
     if int(bright_rows.sum()) < _OBSTRUCTION_MIN_BRIGHT_ROWS:

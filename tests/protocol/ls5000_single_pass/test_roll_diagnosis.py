@@ -492,3 +492,22 @@ def test_true_obstruction_on_clear_rows_still_reads_as_blocked() -> None:
     )
 
     assert sentence is not None and "partly blocked" in sentence
+
+
+def test_gapless_roll_never_reads_as_obstruction() -> None:
+    """Re-review 2026-08-08, F-C: on a roll with NO clear rows at all, the
+    p99 'clear' reference lands on bright frame rows, and one-sided scene
+    content resurrected the phantom blocked-window sentence. With the
+    separation floor, a raster whose brightest rows are not clearly apart
+    from typical rows stays silent on obstruction."""
+
+    gapless_rgb = _synthetic_roll_with_gap_rows([], height=6 * 145)
+    gapless = gapless_rgb.astype(np.float64)
+    gapless[:, 2:20] *= 0.55  # one-sided dark composition
+    gapless = gapless.astype(gapless_rgb.dtype)
+
+    sentence = diagnosis.diagnose_roll_refusal(
+        gapless, np.ones_like(gapless, dtype=bool), nominal_frame_rows=145
+    )
+
+    assert sentence is None or "partly blocked" not in sentence

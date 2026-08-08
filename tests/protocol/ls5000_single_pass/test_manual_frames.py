@@ -27,6 +27,7 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     IndexDecodeError,
+    TRANSPORT_ORIGIN_CLAMP_REASON,
     TransportRecord,
     transport_native_origin,
 )
@@ -827,3 +828,74 @@ def test_refuses_an_incomplete_preview() -> None:
         manual_frames.build_manual_detection(
             rgb, known, boundaries, nominal_frame_rows=143, records=records
         )
+
+
+def test_far_substitute_extrapolates_at_the_anchor_instead_of_drifting() -> None:
+    """Re-review 2026-08-08, F-A: symmetric corruption around a narrow run's
+    trailing edge left the local fit's median seed standing while pushing the
+    nearest trusted row far from the anchor. The uncapped nearest-inlier
+    substitute then silently displaced the origin by up to 22 rows through
+    gates that all read zero residual. Beyond the 3-row cap the origin must
+    now extrapolate AT the anchor from the surviving fit -- landing within
+    one step of the true line -- and carry the clamp reason truthfully."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    records = list(_clean_records(len(rgb)))
+    target = boundaries[3]
+    run_end = target + 3
+    for offset in range(-12, 13):
+        row = run_end + offset
+        if not 0 <= row < len(records):
+            continue
+        if abs(offset) <= 8:
+            spoiled = records[row]
+            records[row] = TransportRecord(
+                row=spoiled.row,
+                code=spoiled.code,
+                selector=spoiled.selector,
+                native_origin=spoiled.native_origin
+                + (30_000 if offset % 2 else -30_000),
+            )
+
+    result = manual_frames.build_manual_detection(
+        rgb,
+        np.ones_like(rgb, dtype=bool),
+        list(boundaries),
+        nominal_frame_rows=145,
+        records=records,
+    )
+
+    frame4 = result.mapping.origins[3]
+    assert abs(frame4.native_origin - 42 * run_end) <= 84
+    assert TRANSPORT_ORIGIN_CLAMP_REASON in frame4.review_reasons or (
+        manual_frames.INFERRED_ORIGIN_REVIEW_REASON in frame4.review_reasons
+    )
+
+
+def test_lookup_far_from_pick_earns_its_own_review_reason() -> None:
+    """Re-review 2026-08-08, F-B: an 18-row clear band inside a frame pulls
+    the trailing-edge anchor well away from the operator's line with no
+    other signal; the divergence now carries an explicit review reason."""
+
+    rgb, boundaries = _synthetic_roll(6)
+    clear_row = rgb[boundaries[2]].copy()
+    # Extend boundary 2's natural clear run (rows b-3..b+3) to a 20-row
+    # band b-3..b+17 -- still narrow (<= 20), so the trailing-edge anchor
+    # lands at b+17 while the operator's line stays at b: a 17-row
+    # divergence with no snap and no other signal.
+    rgb[boundaries[2] + 3 : boundaries[2] + 17] = clear_row
+    records = _clean_records(len(rgb))
+
+    result = manual_frames.build_manual_detection(
+        rgb,
+        np.ones_like(rgb, dtype=bool),
+        list(boundaries),
+        nominal_frame_rows=145,
+        records=records,
+    )
+
+    frame3 = result.mapping.origins[2]
+    assert abs(frame3.lookup_row - result.detection.boundaries[2].output_row) > 4
+    assert (
+        manual_frames.LOOKUP_FAR_FROM_PICK_REVIEW_REASON in frame3.review_reasons
+    )

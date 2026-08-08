@@ -203,6 +203,21 @@ NARROW_EVIDENCE_RUN_MAX_WIDTH_ROWS = 20
 # Nikon detector selects roughly 2..5 rows after a physical gap centre").
 CANDIDATE_SEARCH_LOOKAHEAD_ROWS = 8
 
+# A narrow-run anchor whose own table read is untrusted may substitute a
+# neighboring trusted row only within this distance -- the lattice's own
+# selector-rollover displacement is one row, capped at three for margin.
+# Anything farther extrapolates AT the anchor from the local fit instead
+# (re-review 2026-08-08, F-A: the uncapped substitute silently displaced
+# origins by up to 22 rows through gates that all read zero residual).
+SUBSTITUTE_ANCHOR_MAX_DISTANCE_ROWS = 3
+
+# A resolved lookup row farther than this from the operator's pick earns an
+# explicit review reason: the ordinary narrow-gap trailing-edge offset is
+# ~3 rows, and anything beyond it means the resolution moved meaningfully
+# away from what the operator pointed at (re-review 2026-08-08, F-B).
+LOOKUP_FAR_FROM_PICK_ROWS = 4
+LOOKUP_FAR_FROM_PICK_REVIEW_REASON = "transport-anchor-far-from-pick"
+
 # Placement-wide affine-fit residual gate (F4): identical bounds to
 # derive_transport_mapping's own maximum_anchor_mae_rows/
 # maximum_anchor_error_rows defaults. MAXIMUM_INTERIOR_ANCHOR_ERROR_ROWS is
@@ -432,9 +447,32 @@ def _resolve_boundary_transport_origin(
         substituted = False
         inferred = False
     elif narrow_run:
-        lookup_row = int(inlier_rows[np.argmin(np.abs(inlier_rows - anchor_row))])
-        substituted = True
-        inferred = False
+        nearest = int(inlier_rows[np.argmin(np.abs(inlier_rows - anchor_row))])
+        if abs(nearest - anchor_row) <= SUBSTITUTE_ANCHOR_MAX_DISTANCE_ROWS:
+            lookup_row = nearest
+            substituted = True
+            inferred = False
+        else:
+            # Re-review 2026-08-08, F-A: an uncapped nearest-inlier
+            # substitute silently displaced origins by up to 22 rows on a
+            # table whose symmetric jitter left the median seed standing --
+            # a real physical point, so every downstream residual gate saw
+            # zero error. Beyond the lattice's own ~1-row rollover
+            # displacement (capped at 3 for margin), the anchor's
+            # neighborhood is not trustworthy row-by-row; extrapolate AT
+            # the anchor from the surviving local fit instead -- the same
+            # semantics the automatic path's transport-origin clamp has
+            # always had, which also makes the clamp marker truthful here.
+            lookup_row = anchor_row
+            record = records[anchor_row]
+            return _ResolvedTransportOrigin(
+                lookup_row=anchor_row,
+                code=record.code,
+                selector=record.selector,
+                native_origin=int(round(intercept + scale * anchor_row)),
+                substituted=True,
+                inferred=True,
+            )
     else:
         start = max(0, anchor_row + 1)
         end = min(ramp_upper_bound + 1, anchor_row + CANDIDATE_SEARCH_LOOKAHEAD_ROWS)
@@ -939,6 +977,18 @@ def build_manual_detection(
             reasons.append(INFERRED_ORIGIN_REVIEW_REASON)
         elif item.substituted:
             reasons.append(TRANSPORT_ORIGIN_CLAMP_REASON)
+        if (
+            abs(item.lookup_row - start_boundary.output_row)
+            > LOOKUP_FAR_FROM_PICK_ROWS
+        ):
+            # Re-review 2026-08-08, F-B: a false clear-film run inside a
+            # frame (blown-highlight band on slide film) can pull the
+            # trailing-edge anchor well away from what the operator pointed
+            # at with no snap note and no other signal. Beyond the ordinary
+            # ~3-row narrow-gap offset, the divergence gets its own review
+            # reason so the approval UI shows the operator that the scanner
+            # will cut this frame somewhere other than exactly their line.
+            reasons.append(LOOKUP_FAR_FROM_PICK_REVIEW_REASON)
         origins.append(
             NativeFrameOrigin(
                 frame=frame_index,

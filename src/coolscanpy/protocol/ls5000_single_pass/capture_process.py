@@ -82,9 +82,12 @@ WORKER_BOOTSTRAP_STATUS_FILENAME = "worker-bootstrap.json"
 REVIEWED_ROLL_FINGERPRINT_VERSION = 2
 # Bumped 2 (S6 hardening, FEEDING-UX-LADDER-OVERNIGHT-20260807.md F1
 # rework): adds manual_boundary_rows_sha256, a required field, so this is a
-# breaking schema change on purpose -- a version-1 receipt is rejected
-# outright by __post_init__'s schema_version check rather than failing
-# from_payload's key-set check with a less specific message. Approval
+# breaking schema change on purpose. A genuine version-1 payload is refused
+# by from_payload's exact key-set check first (its key set no longer
+# matches); only a fabricated payload carrying version 1 WITH version-2
+# keys reaches __post_init__'s schema_version check. Both paths refuse --
+# the ordering is recorded here so nobody expects the version check to be
+# the gate that ordinary stale receipts hit (re-review 2026-08-08). Approval
 # receipts are ephemeral (created and consumed within one reviewed-session
 # -> scan-time flow, never persisted the way RollPreviewSession.to_json()
 # is), so there is no backward-compatibility case to preserve here the way
