@@ -28,7 +28,7 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
-    "capture_process.py": "31485687011afad5dcf3470d72da26bc090ec43398518c7c9b85c42841fc97ef",
+    "capture_process.py": "6208a95b23bba84ee0903a07a0d583a9840c5332cbdc60f38a4b574a050d24e2",
     "worker.py": "f5f12eebea1cb20c599e9adbd919599eb7143c649dc972cbf6e2bf7d243556d3",
     "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
