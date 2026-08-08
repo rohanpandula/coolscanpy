@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-08
+
+The power-on housekeeping-collapse acceptance is one-sided only: exactly
+one parity may transition onto the other parity's record, and the other
+parity must be stable across the whole capture. The two-sided swap -- the
+signature of a one-row slip in the scanner's row generator, which would
+silently displace every later frame by one index row -- refuses exactly as
+it did before 0.2.0. Found by post-release adversarial review; the live
+power-on shape is unaffected. The preview-failure teardown also uses the
+already-resolved adapter rather than re-resolving inside the handler.
+
 ## 0.2.0 - 2026-08-08
 
 A failed roll preview can no longer strand its capture worker holding the

@@ -37,7 +37,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",
-    "roll_index.py": "79fd793b1c7ded878aa2a594c04c705c9af7ad6c2d5b208682b899b8aae6559d",
+    "roll_index.py": "ab84fc59ad08ab411f266d56960eabb066b62a3a1082dee3491e58ea77d5a4c5",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (
