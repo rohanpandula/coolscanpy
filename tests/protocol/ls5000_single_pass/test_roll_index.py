@@ -1570,9 +1570,16 @@ def test_manual_placement_accepts_every_archived_automatic_boundary_set() -> Non
         rgb, known, _report = roll.decode_full_index_bytes(
             preview_bytes, geometry, usable_rows=usable_rows
         )
-        detection = roll.detect_roll_frames(
-            rgb, known, nominal_frame_rows=5_959 // geometry.pitch
-        )
+        try:
+            detection = roll.detect_roll_frames(
+                rgb, known, nominal_frame_rows=5_959 // geometry.pitch
+            )
+        except roll.IndexDecodeError:
+            # Automatic detection itself refused this capture (e.g. the
+            # vendored tree's leading-frame-clip gate on a strip whose
+            # first frame starts before the raster) -- out of this gate's
+            # scope exactly like a below-high confidence result.
+            continue
         if detection.confidence != "high":
             continue  # automatic did not succeed; out of this gate's scope
         records = roll.parse_live_transport_records_bytes(
