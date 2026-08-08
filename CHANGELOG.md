@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-08-08
+
 A failed roll preview can no longer strand its capture worker holding the
 scanner's USB claim. `Roll.preview()` spawns the `--preview-and-hold` child,
 and when the completed traversal's evidence was then refused parent-side
