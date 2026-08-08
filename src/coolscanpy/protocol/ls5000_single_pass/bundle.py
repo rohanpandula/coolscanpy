@@ -28,16 +28,16 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
-    "capture_process.py": "8df668809b15493ff4b0ac4da23133c848120daf6f3266198a91a30a225a5d44",
-    "worker.py": "c9d46b53a42f7ee7b1cc120ae79ca657c8c1a59327cc40c465cb3960a645bb9c",
-    "manual_frames.py": "729fee63adcd597bf0e4d6594b9a31a723ca80755d6d8b3c333854497c0b45af",
+    "capture_process.py": "53f83ae0e81d7e1febd87154d126f1b74d4a16dc76d275781ca0d64bd2e2db3c",
+    "worker.py": "f5f12eebea1cb20c599e9adbd919599eb7143c649dc972cbf6e2bf7d243556d3",
+    "manual_frames.py": "d2c56ea9b6a99e5456a104ddedf8ec06df348da156c2f63e03a157c0e06b5a90",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "be7e1e11635edcc70e150fd7454625a478effbb2446017b2cb56676dcb5ebed9",
     "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",
-    "roll_index.py": "2ad87317e651fcc8280401af424ca18478db925e92dea57891aebb2564368517",
+    "roll_index.py": "7165da3bf2793a9c9a269d5c797ae0de13d81fc822ca3facffe236fc00e619f5",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (
