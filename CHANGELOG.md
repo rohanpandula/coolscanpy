@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-08
+
+Raw negative export writers: a 16-bit LinearRaw DNG (DNG 1.4, uncompressed,
+untouched negative) with the infrared plane embedded as a marked grayscale
+SubIFD, plus linear TIFF variants -- IR as a fourth channel, IR as a
+separate sidecar file, or RGB-only. Atomic, fail-closed writes; containers
+are parsed back tag-by-tag in tests and verified sample-for-sample. Written
+for ScanStudio's raw export feature; the encoder API is scanning-agnostic
+(ScanResult in, file out).
+
 ## 0.2.1 - 2026-08-08
 
 The power-on housekeeping-collapse acceptance is one-sided only: exactly
