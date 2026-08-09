@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- macOS SCSI transport for FireWire Coolscans (`coolscanpy.transport.macos_scsi`):
+  pure-ctypes SCSITaskLib client targeting the ASFireWire DriverKit stack, with
+  device discovery, identity, a motion-free probe CLI, and the 1 MB per-task
+  chunking policy. Scanning on the FireWire models stays deliberately refused
+  until real-hardware captures confirm the command set (FIREWIRE.md, issue #28).
+
 ## 0.3.0 - 2026-08-08
 
 Raw negative export writers: a 16-bit LinearRaw DNG (DNG 1.4, uncompressed,
