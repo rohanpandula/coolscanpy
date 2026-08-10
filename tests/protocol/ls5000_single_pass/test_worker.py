@@ -17,16 +17,10 @@ import pytest
 from coolscanpy.protocol.ls5000_single_pass import worker as worker_module
 from coolscanpy.protocol.ls5000_single_pass import manual_frames
 from coolscanpy.protocol.ls5000_single_pass.capture_process import (
-    AttemptPaths,
-    CaptureAttemptResult,
-    CaptureMode,
-    CaptureOutcome,
-    CaptureRequest,
     ManualFrameApproval,
     ReviewedRollFingerprint,
     build_reviewed_roll_fingerprint,
 )
-from coolscanpy.roll.preview_session import _validate_preview_result
 from coolscanpy.protocol.ls5000_single_pass.roll_index import (
     NativeFrameOrigin,
     TransportMapping,
