@@ -41,6 +41,38 @@ def test_repository_workflows_pass_pin_policy() -> None:
     assert "7 external uses entries" in output.getvalue()
 
 
+def test_uv_and_publish_inputs_are_immutable() -> None:
+    workflows = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((REPOSITORY_ROOT / ".github" / "workflows").glob("*.yml"))
+    )
+    assert (
+        workflows.count(
+            "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
+        )
+        == 3
+    )
+    assert workflows.count('version: "0.11.30"') == 3
+    assert workflows.count("enable-cache: false") == 3
+
+    publish = (REPOSITORY_ROOT / ".github" / "workflows" / "publish.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "git merge-base --is-ancestor" in publish
+    assert "refs/remotes/origin/port/cross-platform" in publish
+    assert publish.count("fetch-depth: 0") == 1
+    assert "uv sync --frozen --dev" in publish
+    assert "--no-build-isolation" in publish
+    assert "--out-dir \"$RUNNER_TEMP/dist\"" in publish
+    assert "packages-dir: ${{ runner.temp }}/dist/" in publish
+
+
+def test_build_backend_is_exactly_locked() -> None:
+    pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'requires = ["setuptools==84.0.0"]' in pyproject
+    assert 'required-version = "==0.11.30"' in pyproject
+
+
 def test_full_sha_and_checkout_credential_fence_pass(tmp_path: Path) -> None:
     result, output = _run_policy(
         tmp_path,
