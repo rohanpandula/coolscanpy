@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=80"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv]
+required-version = "==0.11.30"
 
 [project]
 name = "coolscanpy"
-version = "0.7.0"
+version = "0.7.1"
 description = "Direct-USB acquisition library for Nikon Coolscan film scanners with a python-sane-style API — roll scanning, RGBI capture, IR plane, scan receipts"
 readme = "README.md"
 license = "GPL-3.0-only"

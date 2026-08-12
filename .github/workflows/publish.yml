@@ -16,12 +16,27 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.30"
           python-version: "3.13"
-      - run: uv sync --dev
-      - run: uv run pytest -q
+          enable-cache: false
+      - name: Tag target must be merged into the release branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            +refs/heads/port/cross-platform:refs/remotes/origin/port/cross-platform
+          if ! git merge-base --is-ancestor \
+            "$GITHUB_SHA" refs/remotes/origin/port/cross-platform; then
+            echo "tag target is not merged into port/cross-platform" >&2
+            exit 1
+          fi
+      - run: uv sync --frozen --dev
+      - run: uv run --frozen pytest -q
 
   publish:
     needs: test
@@ -29,17 +44,39 @@ jobs:
     permissions:
       id-token: write   # required for PyPI trusted publishing
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.30"
+          python-version: "3.13"
+          enable-cache: false
+      - name: Install the locked build backend
+        run: uv sync --frozen --dev
       - name: Tag must equal pyproject version
         run: |
-          version="$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')"
+          version="$(uv run --frozen python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
+          PY
+          )"
           tag="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$tag" ]; then
             echo "tag $GITHUB_REF_NAME does not match pyproject version $version" >&2
             exit 1
           fi
       - name: Build sdist + wheel
-        run: uv build
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/dist"
+          uv build \
+            --no-sources \
+            --no-build-isolation \
+            --out-dir "$RUNNER_TEMP/dist"
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: ${{ runner.temp }}/dist/
