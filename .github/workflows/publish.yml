@@ -16,12 +16,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           python-version: "3.13"
-      - run: uv sync --dev
-      - run: uv run pytest -q
+      - run: uv sync --frozen --dev
+      - run: uv run --frozen pytest -q
 
   publish:
     needs: test
@@ -29,8 +31,12 @@ jobs:
     permissions:
       id-token: write   # required for PyPI trusted publishing
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.13"
       - name: Tag must equal pyproject version
         run: |
           version="$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')"
@@ -40,6 +46,6 @@ jobs:
             exit 1
           fi
       - name: Build sdist + wheel
-        run: uv build
+        run: uv build --no-sources --clear
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

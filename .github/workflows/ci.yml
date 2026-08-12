@@ -13,10 +13,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python-version: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -26,10 +28,10 @@ jobs:
         # headers, which these runners don't have. The suite is
         # hardware-free and never imports it for real (SANE-touching tests
         # fake sys.modules["sane"]), so it isn't needed here.
-        run: uv sync --dev
+        run: uv sync --frozen --dev
 
       - name: Run tests
-        run: uv run pytest -q
+        run: uv run --frozen pytest -q
 
       - name: Run ruff
-        run: uv run ruff check .
+        run: uv run --frozen ruff check .
