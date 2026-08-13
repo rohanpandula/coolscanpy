@@ -133,14 +133,14 @@ than an index release, install it in editable mode:
 python -m pip install -e .
 ```
 
-The base install covers `get_devices()`, `open()`, and everything under
-`Device.roll()`. None of that needs SANE. `get_devices()`/`open()` fall back
-to direct USB enumeration when python-sane is not installed, and the
-roll-feeder extension talks to the scanner over raw USB in a separate
-process regardless.
+The base install covers `get_devices()`, `open()`, `Device.eject()`, and
+everything under `Device.roll()`. None of that needs SANE.
+`get_devices()`/`open()` fall back to direct USB enumeration when
+python-sane is not installed, the roll-feeder extension talks to the scanner
+over raw USB in a separate process regardless, and `Device.eject()` replays
+the scanner's own traced unload sequence over that same raw-USB transport.
 
-SANE is needed only for the plain `Device.scan()` path and the vendor
-`Device.eject()` action:
+SANE is needed only for the plain `Device.scan()` path:
 
 ```
 pip install "coolscanpy[scanner]"
