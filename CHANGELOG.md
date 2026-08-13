@@ -41,6 +41,31 @@
   budget rather than a short one: observed good clears range from about
   14 s to 57 s, so a short window would report a physically successful
   roll eject as a failure.
+- Attended scan binding (feed-detector round; ScanStudio #24, #16, #42 --
+  "previews fine but will not scan"). A roll the detector places at `medium`
+  confidence can now be fine-scanned when an operator explicitly approves
+  every requested frame, closing the gap where preview accepted a roll that
+  scanning then refused with `roll boundary lattice confidence is 'medium';
+  unattended frame binding requires 'high'`.
+  - `RollPreviewSession.attended_binding_available` / `Roll
+    .attended_binding_available` report whether a roll is rescuable this way
+    (automatic detection at `medium` only).
+  - `Roll.approve(slot, attended=True)` mints a `ManualFrameApproval` that
+    carries `ATTENDED_ROLL_BINDING_REASON` inside its signed binding payload,
+    and may approve a slot the detector did not itself flag.
+  - The capture worker's roll-confidence gate binds `medium` only when EVERY
+    requested frame in the batch carries such a receipt; the verdict is
+    derived from the receipts the batch already authenticates against this
+    preview's reviewed fingerprint, never asserted by a caller.
+  - No detector threshold, accept window, or lattice bound changed. `low`
+    always refuses, and UNATTENDED `medium` refuses with the identical
+    message as before.
+  - Every attended acceptance is journaled under
+    `live_frame_selection.attended_roll_binding`, so an evidence audit can
+    tell which mode bound a frame without re-running the detector.
+  - `Roll.scan_many()` refuses a partially approved medium roll before any
+    film moves, naming the unapproved frames, and now validates every
+    approval it forwards rather than only those on flagged slots.
 
 ## 0.7.1 - 2026-08-11
 
