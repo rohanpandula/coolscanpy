@@ -28,6 +28,12 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-08-23 (ScanStudio #16): manual_frames.py gained an
+    # honest direct_fraction on its RollDetection construction;
+    # roll_index.py gained the degraded-gap-evidence confidence tier, the
+    # DEGRADED_GAP_EVIDENCE_WARNING marker, and the additive
+    # RollDetection.direct_fraction field. No wire resource, plan,
+    # or continuation template changed, so their pins are untouched.
     # Resealed 2026-08-13 (attended scan binding, feed-detector round;
     # ScanStudio #24/#16/#42): capture_process.py gained the
     # ATTENDED_ROLL_BINDING_* pair and ManualFrameApproval.
@@ -36,14 +42,14 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # or continuation template changed, so their pins are untouched.
     "capture_process.py": "c4d234c02bcabf5d10c83b9ef9f071c591546c2447ca004610cc0e0c804a3944",
     "worker.py": "1c8c99bc12ca3664ba7f344d8a053b764568e0311ba709a63e7cff1187b2f048",
-    "manual_frames.py": "f30f0003e081c3a98610d5700d7e6b6ee4d182b9d5228932f3304f1307d4815f",
+    "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
     "packed.py": "856315714e4f7e81f42e1ca93917e4cc0feb03b24915c2ad604302bfdca46f87",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "6b17a06fd1baf1be872a19e819d4e642d42e542601c82b506891bb943969a25c",
-    "roll_index.py": "ab84fc59ad08ab411f266d56960eabb066b62a3a1082dee3491e58ea77d5a4c5",
+    "roll_index.py": "7b2217ef91cfde98744e0c5db6d08ac8c517124015aa1df03649f9ab55449450",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,
     f"data/{CANONICAL_CONTINUATION_PLAN_FILENAME}": (
