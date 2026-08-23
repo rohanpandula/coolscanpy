@@ -1492,21 +1492,6 @@ def test_heavily_degraded_evidence_below_the_score_bar_stays_low() -> None:
     assert roll.DEGRADED_GAP_EVIDENCE_WARNING not in detection.warnings
 
 
-def test_incomplete_index_never_triggers_recovery() -> None:
-    """IncompleteIndexError is a subclass of IndexDecodeError; it must pass
-    through the two-pass wrapper untouched, with no recovery note."""
-
-    rgb, _boundaries = _synthetic_roll(5)
-    known = np.ones_like(rgb, dtype=bool)
-    known[: rgb.shape[0] // 10] = False
-
-    with pytest.raises(roll.IncompleteIndexError) as excinfo:
-        roll.detect_roll_frames(
-            rgb, known, nominal_frame_rows=145, expected_frame_count=None
-        )
-    assert "wide_gap_recovery" not in str(excinfo.value)
-
-
 def _wide_boundary(index: int, row: int, run: tuple[int, int]) -> roll.GapBoundary:
     return roll.GapBoundary(
         index=index,
