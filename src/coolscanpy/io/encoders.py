@@ -259,8 +259,7 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
 
 _DNG_VERSION = (1, 4, 0, 0)
 _DNG_BACKWARD_VERSION = (1, 1, 0, 0)
-_INFRARED_TAG = 65001
-_INFRARED_MARKER = "scanstudio.infrared.linear.uint16.v1"
+_DNG_INFRARED_DESCRIPTION = "Untouched Nikon Coolscan infrared plane"
 
 
 class _NamedBinaryFile:
@@ -317,8 +316,11 @@ def _dng_ir_extratags() -> list[tuple]:
     return [
         (254, 4, 1, 0, True),
         (274, 3, 1, 1, True),
-        (270, 2, 0, "Untouched scanner infrared plane", True),
-        (_INFRARED_TAG, 2, 0, _INFRARED_MARKER, True),
+        # DNG has no standard scanner-infrared role. The standard
+        # ImageDescription field, together with the grayscale SubIFD
+        # relationship, identifies this plane without using private tag
+        # 65001, which ExifTool assigns to SerialNumber in DNG files.
+        (270, 2, 0, _DNG_INFRARED_DESCRIPTION, True),
     ]
 
 
@@ -326,10 +328,10 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
     """Encode one uncompressed LinearRaw DNG into a readable, seekable file.
 
     The converter-facing main IFD is always three plain RGB samples. Infrared,
-    when present, is a same-size grayscale SubIFD carrying a versioned private
-    marker. Keeping IR out of the main image avoids the ambiguous four-sample
-    LinearRaw layout that raw processors commonly interpret as one color
-    sample plus three auxiliaries.
+    when present, is a same-size grayscale SubIFD identified through its
+    standard ImageDescription. Keeping IR out of the main image avoids the
+    ambiguous four-sample LinearRaw layout that raw processors commonly
+    interpret as one color sample plus three auxiliaries.
 
     ``file`` is not closed. The caller owns publication and durability.
     """
@@ -376,6 +378,14 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
     # page with RGB first is what produces three color samples and no
     # ExtraSamples; patching only the already-emitted SHORT tag then gives
     # DNG its required LinearRaw value without changing any strip bytes.
+    #
+    # Issue #105: tifffile also emits the classic-TIFF SubIFDs pointer with
+    # field type 13 (TIFF "IFD"), but TIFF/EP and the DNG profile require
+    # type 4 (LONG) — strict readers such as ExifTool warn about the non-
+    # standard encoding. Both types store four-byte elements, so a count-1
+    # pointer occupies exactly the same four inline bytes either way:
+    # rewriting only the two-byte type code cannot move any other byte, and
+    # RawPy/NegPy decode the same pixels from both encodings.
     file.flush()
     file.seek(0)
     with tifffile.TiffFile(named_file) as tiff:
@@ -383,11 +393,18 @@ def write_dng_linear_to_file(file: BinaryIO, result: ScanResult) -> None:
         if page.samplesperpixel != 3 or page.extrasamples:
             raise RuntimeError("Linear DNG main IFD did not encode as three plain RGB samples")
         photometric_offset = page.tags["PhotometricInterpretation"].valueoffset
+        subifds_tag = page.tags.get(330)
+        subifds_entry_offset = None if subifds_tag is None else subifds_tag.offset
         byteorder = tiff.byteorder
     file.seek(photometric_offset)
     written = file.write(struct.pack(byteorder + "H", 34892))
     if written != 2:
         raise OSError("short write while setting LinearRaw photometric tag")
+    if subifds_entry_offset is not None:
+        file.seek(subifds_entry_offset + 2)
+        written = file.write(struct.pack(byteorder + "H", 4))
+        if written != 2:
+            raise OSError("short write while setting SubIFDs pointer type to LONG")
     file.flush()
 
 
