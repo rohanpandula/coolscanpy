@@ -4,6 +4,16 @@
 
 ## 0.7.4 - 2026-08-23
 
+- Linear DNG and raw-export infrared markers moved from private tag
+  65001 -- which ExifTool reports as `SerialNumber` for Nikon files --
+  to collision-free private code 65010, shared through one contract
+  constant; readers accept both codes so earlier exports stay
+  discoverable (ScanStudio #105).
+- The linear-DNG encoder now patches tifffile's classic-TIFF SubIFDs
+  pointer from field type 13 to the TIFF/EP-required LONG (type 4);
+  strict readers such as ExifTool no longer warn, with zero pixel-byte
+  movement (ScanStudio #105).
+
 - An unrecognized SANE `coolscan3:` identity no longer classifies as
   supported (ScanStudio #103). Discovery now marks a device supported only
   when its model string is the exact canonical LS-5000 identity after
