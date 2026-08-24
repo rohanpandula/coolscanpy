@@ -5591,15 +5591,6 @@ class TestRollBatchRefusal:
             roll.close()
             dev.close()
 
-    @pytest.mark.xfail(
-        reason=(
-            "resumed-batch spawner wiring for the facade-level witness replay "
-            "is not yet threaded through this fixture; the behavior itself is "
-            "proven end-to-end by the worker journal-replay unit tests and "
-            "the bridge evidence mint/export suite"
-        ),
-        strict=False,
-    )
     def test_transport_failure_record_raises_typed_refeed_with_witness(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
