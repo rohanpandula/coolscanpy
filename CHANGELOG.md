@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.7.6 - 2026-09-06
+
+- Release the held scanner child when a reserved batch is stopped, closed, or abandoned before its first iteration. A failed batch reservation leaves the original held session available for cleanup.
+- Retain the batch and device locks when held-child shutdown cannot be confirmed, and preserve attempt evidence after uncertain or forced teardown.
+- Port only the reviewed stop-session changes and regressions from ScanStudio; preserve the canonical capture implementation and receipt schema.
+
 ## 0.7.5 - 2026-09-06
 
 - Accept the observed EBDE-prefixed LS-5000 padding counter dialect only when the entire padding block matches its exact counter train. Offline and streaming decoding retain strict corruption rejection and identical sample output.
