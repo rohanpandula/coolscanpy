@@ -28,6 +28,10 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-06 (samples_per_scan): capture_process.py and
+    # worker.py gained the 1|4 samples-per-scan batch parameter that patches
+    # the fine SET_WINDOW multi-read byte and its GET_WINDOW echo before
+    # preflight; 4 remains a verified byte-for-byte no-op.
     # Resealed 2026-08-23 (ScanStudio #98/#101/#106 round): meter.py gained
     # the typed controller-refusal payload; worker.py gained the durable
     # meter-refusal and replayable transport-failure-witness journal records;
@@ -45,8 +49,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # is_attended_roll_binding; worker.py gained the attended branch of the
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
-    "capture_process.py": "c4d234c02bcabf5d10c83b9ef9f071c591546c2447ca004610cc0e0c804a3944",
-    "worker.py": "22ba191b7f9d313d80aeec195db648bc686f631849145b620851d0961dcbc5cf",
+    "capture_process.py": "1d81b94ed76e3a1e3704f60915d21b3bad2d510fe124cd0033de81fde4101b26",
+    "worker.py": "7a204abf4b97231a44f55ebb04c2eff784e2aa737480c5acd946022339c29ff0",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

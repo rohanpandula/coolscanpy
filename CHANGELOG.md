@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add ``samples_per_scan`` (1 or 4, default 4) to ``Roll.scan``/``Roll.scan_many`` and the batch job. Single-sample mode patches the fine SET_WINDOW multi-read byte (payload[48]) and its GET_WINDOW echo expectation before preflight, mirroring the metering windows' own single-sample value; the frame journal records ``fine_samples_per_scan``. The traced 4-sample capture is byte-for-byte unchanged. Single-sample output has not yet been validated on hardware.
+
 ## 0.7.6 - 2026-09-06
 
 - Release the held scanner child when a reserved batch is stopped, closed, or abandoned before its first iteration. A failed batch reservation leaves the original held session available for cleanup.
