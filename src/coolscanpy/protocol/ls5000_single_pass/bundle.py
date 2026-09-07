@@ -28,6 +28,12 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-07 (HW-08): meter.py's IR pass-linearity correlation
+    # check gained its own, looser floor (LINEARITY_CORRELATION_MIN_IR =
+    # 0.95) instead of sharing R/G/B's 0.98 gate, plus a recorded
+    # correlation_min per channel in the linearity diagnostic. R/G/B and the
+    # nonlinear_gain/linearity_insufficient refusals are unchanged. No wire
+    # resource, plan, or continuation template changed.
     # Resealed 2026-09-06 (samples_per_scan): capture_process.py and
     # worker.py gained the 1|4 samples-per-scan batch parameter that patches
     # the fine SET_WINDOW multi-read byte and its GET_WINDOW echo before
@@ -57,7 +63,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     "packed.py": "abff893d6ec5ff36aa33be86ef401a28ffbd6054e2279129e8fb88d7f650b435",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
-    "meter.py": "b03b3212d1ff1f8e3ad8ca7b512765ad6a115d4766e3f3eb5a86de3573076d4e",
+    "meter.py": "35adb86c43ccae29584768d929c253d595d0547b33dd0d0b784d2601b1ded9d6",
     "roll_index.py": "38013a1e942c3d1d1798ca0e718fb7ccdc3bc605277ca729e9891fa53bcde311",
     "window.py": "5edd64a2f55cb3c968bb380d548d0d9002b41b26f5f4713e5d9b889910d5ed4f",
     "data/replay-first-rgbi4-plan.jsonl": CANONICAL_PLAN_SHA256,

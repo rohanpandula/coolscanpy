@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Give the IR channel its own pass-linearity correlation floor (``LINEARITY_CORRELATION_MIN_IR = 0.95``) instead of sharing R/G/B's 0.98 gate (HW-08). A real LS-5000 ED batch scan (2026-09-07, firmware 1.03, SA-30 roll adapter) aborted at frame 10 -- a dark, low-contrast exposure -- when IR pass correlation 0.9727 fell under the shared floor while R/G/B held 0.9995/0.9999/0.9999; frame 9 had passed with IR 0.992, and the refusal reproduced deterministically on retry. IR does not drive C-41 negative exposure decisions (only R/G/B do; IR is dust/scratch detection), so the relaxed floor does not weaken exposure safety -- R/G/B keep the 0.98 gate unchanged, IR still refuses below its own 0.95 floor, and the ``nonlinear_gain``/``linearity_insufficient`` refusals are unchanged for every channel. The applied per-channel floor is now recorded as ``correlation_min`` alongside each channel's ``linearity`` diagnostic in the meter-controller journal, so evidence of which gate decided a pass stays complete.
+
 ## 0.7.7 - 2026-09-06
 
 - Add ``samples_per_scan`` (1 or 4, default 4) to ``Roll.scan``/``Roll.scan_many`` and the batch job. Single-sample mode patches the fine SET_WINDOW multi-read byte (payload[48]) and its GET_WINDOW echo expectation before preflight, mirroring the metering windows' own single-sample value; the frame journal records ``fine_samples_per_scan``. The traced 4-sample capture is byte-for-byte unchanged. Single-sample mode is lab-only: on a live LS-5000 (2026-09-06) the scanner accepted the one-sample window and metered normally, but the first fine READ failed with libusb OVERFLOW and the transport needed a power-cycle, so the 4-sample transaction framing does not carry over; a verified single-sample trace is required before it can be offered to users.
