@@ -379,6 +379,7 @@ def _install_fake_hardware(
 
     # One 1-byte fine READ per frame, on the worker side.
     monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", 1)
+    monkeypatch.setattr(worker_module, "EXPECTED_FINE_REQUEST", 1)
     monkeypatch.setattr(
         worker_module, "validate_plan", lambda _plan, *_manifest: tiny_target
     )
