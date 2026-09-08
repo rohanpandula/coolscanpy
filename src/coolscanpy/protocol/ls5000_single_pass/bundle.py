@@ -28,6 +28,8 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-08: held-session meter-only authority and 1x validation
+    # ordering; wire plans and continuation resources are unchanged.
     # Resealed 2026-09-07 (HW-07): worker.py derives the 1-sample fine READ
     # length and binds the selected USB identity; capture_process.py validates
     # the derived byte total and carries that identity; packed.py admits the
@@ -60,8 +62,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # is_attended_roll_binding; worker.py gained the attended branch of the
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
-    "capture_process.py": "5861212d175a4869699a0385e11237582f1eb1fd34556e2f6f165b1c28db4539",
-    "worker.py": "710be2217b11112e1f0f9c1af7c2b144feed8c7be0bb222553507fea51c12cfc",
+    "capture_process.py": "d82379f517d1eb7ce447c45a587e8a9a5d51ed53dda33d81a1b856d6d13812b1",
+    "worker.py": "8d96a80b096afae1c0fe5ad98305d22fd3f1e45942e554f5af2877591d22cca4",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",

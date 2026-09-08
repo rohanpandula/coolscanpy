@@ -81,6 +81,7 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CaptureRequest,
     CaptureStopped,
     HeldPreviewSession,
+    HeldMeterRequest,
     HeldSessionExpired,
     ManualFrameApproval,
     POWER_CYCLE_RECOVERY,
@@ -112,6 +113,7 @@ from coolscanpy.types import (
     ArtifactEvidence,
     ClippingTelemetry,
     ExposureVector,
+    ExposureSolution,
     Frame,
     FingerprintComparison,
     FocusDetailTelemetry,
@@ -1021,6 +1023,132 @@ class Roll:
             return session.slots[slot - 1].manual_review
 
     # -- scanning --------------------------------------------------------
+
+    def solve_exposure(self, slot: int) -> ExposureSolution:
+        """Meter one reviewed slot without ending the held reservation.
+
+        The returned RGB values are raw 10ns tick counts suitable for
+        ``exposure_override_10ns``. Infrared remains meter-controlled.
+        """
+
+        with self._state_condition:
+            self._require_mutable_review_locked()
+            session = self._require_session_locked()
+            self._check_slot(session, slot)
+            held = self._held_session
+            if held is None or not held.usable:
+                raise RefeedRequired(
+                    "exposure solving requires the reservation retained by preview(); "
+                    "refeed the strip and preview it again"
+                )
+            if self._stop_event.is_set():
+                raise SafeStopRequested("safe stop requested before exposure solving")
+            approval = self._approvals.get(slot)
+            offset = session.slots[slot - 1].boundary_offset_rows
+            if session.slots[slot - 1].manual_review and (
+                approval is None
+                or not session.validate_manual_approval(
+                    approval,
+                    slot_id=slot,
+                    boundary_offset_rows=offset,
+                )
+            ):
+                raise ManualReviewRequired(
+                    f"slot {slot} requires visual review; call approve({slot}) first",
+                    slot=slot,
+                )
+            if (
+                not session.slots[slot - 1].manual_review
+                and approval is not None
+                and not session.validate_manual_approval(
+                    approval,
+                    slot_id=slot,
+                    boundary_offset_rows=offset,
+                )
+            ):
+                raise ManualReviewRequired(
+                    f"slot {slot} approval no longer matches this preview",
+                    slot=slot,
+                )
+            if session.attended_binding_available and (
+                approval is None or not approval.is_attended_roll_binding
+            ):
+                raise ManualReviewRequired(
+                    f"slot {slot} requires attended roll approval before metering",
+                    slot=slot,
+                )
+            topology = self._session_usb_topology
+            if topology is None:
+                raise BatchIntegrityError(
+                    "exposure solving has no exact USB topology from its preview"
+                )
+            vendor_id, product_id, model, allow_unverified = (
+                self._device._capture_identity()
+            )
+            frame = CaptureRequest(
+                mode=CaptureMode.METER_ONLY,
+                selected_slot=slot,
+                boundary_offset_rows=offset,
+                manual_review_approval=approval,
+                expected_usb_bus=topology[0],
+                expected_usb_address=topology[1],
+                expected_usb_vendor_id=vendor_id,
+                expected_usb_product_id=product_id,
+                expected_scanner_model=model,
+                allow_unverified=allow_unverified,
+            )
+            request = HeldMeterRequest(
+                frame=frame,
+                reviewed_fingerprint=session.reviewed_fingerprint(),
+                expected_usb_bus=topology[0],
+                expected_usb_address=topology[1],
+                manual_boundary_rows=(
+                    tuple(
+                        boundary.output_row
+                        for boundary in session.detection.boundaries
+                    )
+                    if MANUAL_PLACEMENT_WARNING in session.detection.warnings
+                    else None
+                ),
+            )
+            self._held_session = None
+            self._preview_active = True
+            self._preview_thread_id = threading.get_ident()
+
+        io_acquired = False
+        try:
+            self._device._acquire_io_lock("roll exposure solve")
+            io_acquired = True
+            adapter = self._ensure_adapter()
+            result = adapter.meter_held_session(held, request)
+            if self._stop_event.is_set():
+                adapter.release_held_session(result.held_again)
+                raise SafeStopRequested(
+                    "safe stop requested; metering finished and the reservation was released"
+                )
+            with self._state_condition:
+                self._held_session = result.held_again
+            return result.solution
+        except HeldSessionExpired as error:
+            self._preserve_evidence(str(error))
+            raise RefeedRequired(
+                "the held preview reservation expired; refeed and preview again"
+            ) from error
+        except CaptureStopped as error:
+            raise SafeStopRequested(str(error)) from error
+        except BaseException as error:
+            if not io_acquired:
+                with self._state_condition:
+                    self._held_session = held
+            self._preserve_evidence(f"held exposure solve failed: {error}")
+            raise
+        finally:
+            if io_acquired:
+                self._device._release_io_lock()
+            with self._state_condition:
+                self._preview_active = False
+                self._preview_thread_id = None
+                self._state_condition.notify_all()
 
     def scan(
         self,

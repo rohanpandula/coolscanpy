@@ -99,6 +99,7 @@ from .window import WindowBlock, decode_window_block
 from .streaming_sidecar import FineStreamSession
 
 from coolscanpy._logging import get_logger
+from coolscanpy.exceptions import MeterUnusableError
 
 HERE = Path(__file__).resolve().parent
 LOGGER = get_logger(__name__)
@@ -2064,6 +2065,7 @@ def load_validated_batch_job(
     expected_job_sha256: str,
     expected_plan_sha256: str,
     expected_continuation_sha256: str,
+    frame_directory_prefix: str = "frame",
 ) -> LiveBatchJob:
     """Load an exact path-confined parent/child batch handshake contract."""
 
@@ -2288,7 +2290,16 @@ def load_validated_batch_job(
                     f"batch frame {index} manual review approval belongs to a "
                     "different set of placed boundaries"
                 )
-        expected_directory = f"frame-{slot:03d}"
+        if frame_directory_prefix != "frame" and (
+            not frame_directory_prefix.startswith("meter-")
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                for character in frame_directory_prefix
+            )
+        ):
+            raise ProtocolError("batch frame directory prefix is invalid")
+        expected_directory = f"{frame_directory_prefix}-{slot:03d}"
         expected_paths = {
             "output": f"{expected_directory}/capture.bin",
             "journal": f"{expected_directory}/journal.json",
@@ -2420,6 +2431,8 @@ def wait_for_hold_decision(
     reservation; no job is coming), or ``"eject"`` (the operator decided,
     having seen the preview and without ever scanning, to end the session
     by replaying the traced vendor eject sequence before releasing).
+    ``"meter"`` publishes the same strictly validated one-slot job shape,
+    but stops at the meter boundary and returns to a fresh hold wait.
     """
 
     if timeout_seconds < 0 or poll_seconds < 0:
@@ -2451,7 +2464,7 @@ def wait_for_hold_decision(
                         f"expected {required!r}"
                     )
             action = payload.get("action")
-            if action not in ("scan", "release", "eject"):
+            if action not in ("scan", "meter", "release", "eject"):
                 raise SynchronizedProtocolError(
                     f"hold decision has invalid action {action!r}"
                 )
@@ -3233,9 +3246,7 @@ def _patch_samples_contract(
         entry["expected_data_in"] = payload
 
 
-def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
-    """Size the fine READ from the sample count commanded in SET_WINDOW."""
-
+def _fine_request_bytes(samples_per_scan: int) -> int:
     if (
         isinstance(samples_per_scan, bool)
         or not isinstance(samples_per_scan, int)
@@ -3245,13 +3256,23 @@ def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
             f"samples_per_scan {samples_per_scan!r} is not one of "
             f"{SUPPORTED_SAMPLES_PER_SCAN}"
         )
+    return (
+        EXPECTED_FINE_REQUEST
+        if samples_per_scan == TRACED_SAMPLES_PER_SCAN
+        else SINGLE_SAMPLE_RECORD_BYTES
+    )
+
+
+def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
+    """Size the fine READ from the sample count commanded in SET_WINDOW."""
+
+    request_len = _fine_request_bytes(samples_per_scan)
     matches = [entry for entry in plan if entry.get("role") == "fine-rgbi4-template"]
     if len(matches) != 1:
         raise ProtocolError("plan must contain exactly one fine-rgbi4-template")
     target = matches[0]
-    if samples_per_scan == TRACED_SAMPLES_PER_SCAN:
+    if request_len == EXPECTED_FINE_REQUEST:
         return
-    request_len = SINGLE_SAMPLE_RECORD_BYTES
     cdb = bytearray.fromhex(target.get("cdb", ""))
     if len(cdb) != 10 or cdb[0] != 0x28:
         raise ProtocolError("fine READ template has an invalid CDB")
@@ -4922,6 +4943,7 @@ def _run_live_continuation_frame(
     # was already an unsound accepted-argument type, not a runtime
     # contract -- no observed call has ever actually passed None.
     scanner_identity: str | None = "Nikon LS-5000 ED 1.03",
+    meter_only: bool = False,
 ) -> dict[str, Any]:
     """Capture one later frame without reconnecting, reserving, or releasing.
 
@@ -4960,14 +4982,22 @@ def _run_live_continuation_frame(
         entry for entry in active_plan if entry.get("role") == "fine-rgbi4-template"
     )
     active_target.update(target)
-    _patch_fine_read_contract(active_plan, _batch_samples_per_scan(batch_job))
-    target = active_target
-    expected_bytes = EXPECTED_FINE_READS * target["request_len"]
+    samples_per_scan = _batch_samples_per_scan(batch_job)
+    expected_bytes = (
+        METER_CAPTURE_BYTES
+        if meter_only
+        else EXPECTED_FINE_READS * _fine_request_bytes(samples_per_scan)
+    )
     output_path = frame_spec.output
     journal_path = frame_spec.journal
     meter_path = _full_capture_meter_path(output_path)
     output_path.parent.mkdir(parents=False, exist_ok=False)
-    for candidate in (output_path, journal_path, frame_spec.ack, meter_path):
+    candidates = (
+        (output_path, journal_path, meter_path)
+        if meter_only
+        else (output_path, journal_path, frame_spec.ack, meter_path)
+    )
+    for candidate in candidates:
         if candidate.exists():
             raise ProtocolError(f"refusing to overwrite {candidate}")
     free_bytes = shutil.disk_usage(output_path.parent).free
@@ -4992,20 +5022,24 @@ def _run_live_continuation_frame(
         dict(DEFAULT_EXPOSURES),
     )
     steps = compile_continuation_steps(active_plan, continuation_plan)
+    _patch_fine_read_contract(active_plan, samples_per_scan)
+    target = active_target
     batch_identity = {
         "frame_index": frame_index,
         "frame_total": len(batch_job.frames),
         "selected_slots": list(batch_job.selected_slots),
         "session_id": batch_job.session_id,
     }
-    density_ownership = _density_frame_ownership_receipt(
-        density_evidence,
-        selection,
-        batch_job=batch_job,
-        frame_index=frame_index,
-        frame_capture_attempt_id=output_path.parent.name,
-        expected_calibration_session_id=expected_calibration_session_id,
-    )
+    density_ownership = None
+    if not meter_only:
+        density_ownership = _density_frame_ownership_receipt(
+            density_evidence,
+            selection,
+            batch_job=batch_job,
+            frame_index=frame_index,
+            frame_capture_attempt_id=output_path.parent.name,
+            expected_calibration_session_id=expected_calibration_session_id,
+        )
     journal: dict[str, Any] = {
         "status": "starting",
         "plan": str(plan_path.resolve()),
@@ -5015,7 +5049,7 @@ def _run_live_continuation_frame(
         "capture_bundle_sha256": CAPTURE_BUNDLE_SHA256,
         "meter_controller_sha256": _meter_controller_sha256(),
         "output": str(output_path.resolve()),
-        "capture_mode": "full",
+        "capture_mode": "held-meter" if meter_only else "full",
         "expected_usb_bus": batch_job.expected_usb_bus,
         "expected_usb_address": batch_job.expected_usb_address,
         "expected_usb_vendor_id": batch_job.expected_usb_vendor_id,
@@ -5031,7 +5065,9 @@ def _run_live_continuation_frame(
         "applied_boundary_offset_rows": selection.applied_boundary_offset_rows,
         "resolved_lookup_row": selection.selected.lookup_row,
         "resolved_native_origin": selection.selected.native_origin,
-        "expected_reads": EXPECTED_FINE_READS,
+        "expected_reads": (
+            len(METER_READ_SEQUENCES) if meter_only else EXPECTED_FINE_READS
+        ),
         "expected_bytes": expected_bytes,
         "completed_reads": 0,
         "completed_bytes": 0,
@@ -5054,7 +5090,6 @@ def _run_live_continuation_frame(
         "session_reservation_retained": True,
         "unit_released": False,
         "nikon_density_calibration": density_calibration.to_dict(),
-        "nikon_density_frame_ownership": density_ownership,
         "meter_evidence_path": str(meter_path.resolve()),
         "meter_observed_exposures_raw_10ns": [],
         "meter_layout": _meter_layout_receipt(),
@@ -5071,7 +5106,12 @@ def _run_live_continuation_frame(
             },
         },
     }
-    if frame_index == 1:
+    if meter_only:
+        journal["session_id"] = batch_job.session_id
+        journal["fine_completed_reads"] = 0
+    if density_ownership is not None:
+        journal["nikon_density_frame_ownership"] = density_ownership
+    if frame_index == 1 and not meter_only:
         # Frame 1 of every batch carries the reservation's density evidence
         # receipt: that is the rule the parent validates against
         # (capture_process._validate_batch_frame_result's own
@@ -5266,6 +5306,9 @@ def _run_live_continuation_frame(
                     meter_group_payloads[group_index].extend(result.payload)
                     journal["meter_completed_reads"] += 1
                     journal["meter_completed_bytes"] += len(result.payload)
+                    if meter_only:
+                        journal["completed_reads"] += 1
+                        journal["completed_bytes"] += len(result.payload)
                     if sequence == METER_READ_GROUPS[group_index][-1]:
                         if meter_group_bytes[group_index] != METER_GROUP_BYTES:
                             raise SynchronizedProtocolError(
@@ -5446,9 +5489,38 @@ def _run_live_continuation_frame(
                         }
                         meter_output.flush()
                         os.fsync(meter_output.fileno())
-                        journal["meter_evidence_persisted_before_fine_arm"] = True
+                        if not meter_only:
+                            journal["meter_evidence_persisted_before_fine_arm"] = True
                         meter_evidence_persisted = True
                         _write_journal(journal_path, journal)
+                        if meter_only:
+                            break
+
+            if meter_only:
+                if (
+                    not final_controller_accepted
+                    or not meter_evidence_persisted
+                    or final_wire_exposures is None
+                    or journal["completed_bytes"] != expected_bytes
+                ):
+                    raise SynchronizedProtocolError(
+                        "held meter capture lacks complete accepted evidence"
+                    )
+                journal["output_sha256"] = hashlib.sha256(b"").hexdigest()
+                journal["disk_bytes"] = output_path.stat().st_size
+                lifecycle.at_transaction_boundary = False
+                polls, stalls = _wait_post_scan_ready(ep_out, ep_in)
+                lifecycle.at_transaction_boundary = True
+                lifecycle.scan_active = False
+                lifecycle.ready_required = False
+                journal["post_scan_ready_polls"] = polls
+                journal["stall_recoveries"] += stalls
+                journal["unit_released"] = False
+                journal["recovery_required"] = None
+                journal["status"] = "meter-complete"
+                journal["finished_unix"] = time.time()
+                _write_journal(journal_path, journal)
+                return journal
 
             if (
                 not final_controller_accepted
@@ -5565,6 +5637,8 @@ def _run_live_continuation_frame(
             fine_stream,
             reason=f"capture-error:{type(error).__name__}",
         )
+        if isinstance(error, MeterUnusableError):
+            journal["meter_unusable"] = {"channel": error.channel}
         journal["status"] = (
             "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
         )
@@ -5575,6 +5649,98 @@ def _run_live_continuation_frame(
         except Exception:
             pass
         raise
+
+
+def _run_live_held_meter(
+    ep_out: Any,
+    ep_in: Any,
+    plan: list[dict],
+    plan_path: Path,
+    plan_sha256: str,
+    continuation_plan: dict[str, Any],
+    continuation_plan_sha256: str,
+    job_path: Path,
+    *,
+    hold_session_id: str,
+    preview_bytes: bytes,
+    live_sub_8e_table: bytes,
+    lifecycle: SessionLifecycle,
+    density_calibration: DensityCalibration,
+    density_evidence: NikonDensityEvidence,
+    actual_usb_bus: int,
+    actual_usb_address: int,
+    expected_calibration_session_id: str,
+    expected_usb_vendor_id: int,
+    expected_usb_product_id: int,
+    expected_scanner_model: str,
+    scanner_identity: str | None,
+    allow_unverified: bool,
+) -> tuple[Path, Path, str]:
+    """Run a meter-only continuation and return a fresh hold rendezvous."""
+
+    prefix = f"meter-{hold_session_id}"
+    job = load_validated_batch_job(
+        job_path,
+        expected_job_sha256=hashlib.sha256(job_path.read_bytes()).hexdigest(),
+        expected_plan_sha256=plan_sha256,
+        expected_continuation_sha256=continuation_plan_sha256,
+        frame_directory_prefix=prefix,
+    )
+    if job.session_id != hold_session_id or len(job.frames) != 1:
+        raise ProtocolError("held meter job does not match this hold session")
+    if job.exposure_override_10ns is not None or job.samples_per_scan != TRACED_SAMPLES_PER_SCAN:
+        raise ProtocolError("held meter job cannot override exposure or sample count")
+    if (
+        job.expected_usb_bus != actual_usb_bus
+        or job.expected_usb_address != actual_usb_address
+        or job.expected_usb_vendor_id != expected_usb_vendor_id
+        or job.expected_usb_product_id != expected_usb_product_id
+        or job.expected_scanner_model != expected_scanner_model
+        or job.allow_unverified != allow_unverified
+    ):
+        raise ProtocolError("held meter USB binding does not match the reservation")
+    derive_equivalent_continuation_blocks(continuation_plan)
+    selections = _derive_live_batch_selections(
+        plan,
+        preview_bytes,
+        live_sub_8e_table,
+        job.frames,
+        reviewed_fingerprint=job.reviewed_fingerprint,
+        manual_boundary_rows=job.manual_boundary_rows,
+    )
+    journal = _run_live_continuation_frame(
+        ep_out,
+        ep_in,
+        plan,
+        plan_path,
+        plan_sha256,
+        continuation_plan,
+        continuation_plan_sha256,
+        job.frames[0],
+        selections[0],
+        batch_job=job,
+        frame_index=1,
+        lifecycle=lifecycle,
+        density_calibration=density_calibration,
+        density_evidence=density_evidence,
+        actual_usb_bus=actual_usb_bus,
+        actual_usb_address=actual_usb_address,
+        expected_calibration_session_id=expected_calibration_session_id,
+        scanner_identity=scanner_identity,
+        allow_unverified=allow_unverified,
+        meter_only=True,
+    )
+    next_session_id = secrets.token_hex(16)
+    next_job_path = job_path.parent / f"hold-job-{next_session_id}.json"
+    next_ack_path = job_path.parent / f"hold-ack-{next_session_id}.json"
+    journal["hold_resume"] = {
+        "hold_session_id": next_session_id,
+        "hold_job_path": str(next_job_path),
+        "hold_ack_path": str(next_ack_path),
+    }
+    journal["status"] = "meter-complete-held"
+    _write_journal(job.frames[0].journal, journal)
+    return next_job_path, next_ack_path, next_session_id
 
 
 def run_live_capture(
@@ -5809,12 +5975,15 @@ def run_live_capture(
     )
     active_target.update(target)
     active_samples_per_scan = samples_per_scan
-    _patch_fine_read_contract(active_plan, active_samples_per_scan)
     target = active_target
     expected_bytes = (
         0
         if preview_only or preview_and_hold
-        else (METER_CAPTURE_BYTES if meter_only else read_count * target["request_len"])
+        else (
+            METER_CAPTURE_BYTES
+            if meter_only
+            else read_count * _fine_request_bytes(active_samples_per_scan)
+        )
     )
     calibration_session_id = (
         batch_job.session_id
@@ -6497,6 +6666,42 @@ def run_live_capture(
                         action = wait_for_hold_decision(
                             hold_ack_path, hold_session_id=hold_session_id
                         )
+                        while action == "meter":
+                            if density_calibration is None or density_evidence is None:
+                                raise SynchronizedProtocolError(
+                                    "held meter reached without density reservation evidence"
+                                )
+                            (
+                                hold_job_path,
+                                hold_ack_path,
+                                hold_session_id,
+                            ) = _run_live_held_meter(
+                                ep_out,
+                                ep_in,
+                                plan,
+                                plan_path,
+                                plan_sha256,
+                                continuation_plan,
+                                continuation_plan_sha256,
+                                hold_job_path,
+                                hold_session_id=hold_session_id,
+                                preview_bytes=preview_bytes,
+                                live_sub_8e_table=live_sub_8e_table,
+                                lifecycle=batch_lifecycle,
+                                density_calibration=density_calibration,
+                                density_evidence=density_evidence,
+                                actual_usb_bus=actual_usb_bus,
+                                actual_usb_address=actual_usb_address,
+                                expected_calibration_session_id=calibration_session_id,
+                                expected_usb_vendor_id=expected_usb_vendor_id,
+                                expected_usb_product_id=expected_usb_product_id,
+                                expected_scanner_model=expected_scanner_model,
+                                scanner_identity=scanner_identity,
+                                allow_unverified=allow_unverified,
+                            )
+                            action = wait_for_hold_decision(
+                                hold_ack_path, hold_session_id=hold_session_id
+                            )
                         if action == "release":
                             journal["hold_outcome"] = "released"
                             _write_journal(journal_path, journal)
@@ -6575,11 +6780,10 @@ def run_live_capture(
                         journal["hold_outcome"] = "resumed-as-batch"
                         _write_journal(journal_path, journal)
 
-                        _patch_fine_read_contract(
-                            active_plan, active_samples_per_scan
-                        )
                         target = active_plan[-1]
-                        expected_bytes = read_count * target["request_len"]
+                        expected_bytes = read_count * _fine_request_bytes(
+                            active_samples_per_scan
+                        )
                         meter_sidecar_path = _full_capture_meter_path(
                             first_spec.output
                         )
@@ -6868,6 +7072,9 @@ def run_live_capture(
                         DYNAMIC_WINDOW_GROUPS[0],
                         METER_GET_WINDOW_GROUPS[0],
                         dict(DEFAULT_EXPOSURES),
+                    )
+                    _patch_fine_read_contract(
+                        bound_plan, active_samples_per_scan
                     )
                     # `preamble` holds these dictionaries by reference.  Update
                     # them in place so the very next command (SEND 0x8f) is the
@@ -7513,6 +7720,43 @@ def run_live_capture(
                 action = wait_for_hold_decision(
                     round_hold_ack_path, hold_session_id=round_hold_session_id
                 )
+                while action == "meter":
+                    if density_calibration is None or density_evidence is None:
+                        raise SynchronizedProtocolError(
+                            "held meter reached without density reservation evidence"
+                        )
+                    (
+                        round_hold_job_path,
+                        round_hold_ack_path,
+                        round_hold_session_id,
+                    ) = _run_live_held_meter(
+                        ep_out,
+                        ep_in,
+                        plan,
+                        plan_path,
+                        plan_sha256,
+                        continuation_plan,
+                        continuation_plan_sha256,
+                        round_hold_job_path,
+                        hold_session_id=round_hold_session_id,
+                        preview_bytes=preview_bytes,
+                        live_sub_8e_table=live_sub_8e_table,
+                        lifecycle=batch_lifecycle,
+                        density_calibration=density_calibration,
+                        density_evidence=density_evidence,
+                        actual_usb_bus=actual_usb_bus,
+                        actual_usb_address=actual_usb_address,
+                        expected_calibration_session_id=calibration_session_id,
+                        expected_usb_vendor_id=expected_usb_vendor_id,
+                        expected_usb_product_id=expected_usb_product_id,
+                        expected_scanner_model=expected_scanner_model,
+                        scanner_identity=scanner_identity,
+                        allow_unverified=allow_unverified,
+                    )
+                    action = wait_for_hold_decision(
+                        round_hold_ack_path,
+                        hold_session_id=round_hold_session_id,
+                    )
                 if action == "release":
                     hold_wait_release_receipt_path = round_hold_release_journal_path
                     break

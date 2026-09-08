@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -40,6 +41,9 @@ from statistics import median
 from typing import Any, Protocol, Sequence
 
 import numpy as np
+
+from coolscanpy.exceptions import MeterControllerRefused, MeterUnusableError
+from coolscanpy.types import ExposureSolution
 
 from .bundle import (
     CANONICAL_MANIFEST_FILENAME,
@@ -1358,6 +1362,44 @@ class CaptureBatchRequest:
 
 
 @dataclass(frozen=True)
+class HeldMeterRequest:
+    """One meter-only slot bound to an already-held reviewed preview."""
+
+    frame: CaptureRequest
+    reviewed_fingerprint: ReviewedRollFingerprint
+    expected_usb_bus: int
+    expected_usb_address: int
+    manual_boundary_rows: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.frame, CaptureRequest):
+            raise TypeError("held meter frame must be a CaptureRequest")
+        if self.frame.mode is not CaptureMode.METER_ONLY:
+            raise ValueError("held meter request requires meter-only mode")
+        if (
+            self.frame.expected_usb_bus != self.expected_usb_bus
+            or self.frame.expected_usb_address != self.expected_usb_address
+        ):
+            raise ValueError("held meter frame and preview USB topology differ")
+        # Reuse the full batch contract's binding validation without exposing
+        # meter-only as a batch capture mode.
+        self.as_batch_request()
+
+    def as_batch_request(self) -> CaptureBatchRequest:
+        return CaptureBatchRequest(
+            frames=(replace(self.frame, mode=CaptureMode.FULL),),
+            reviewed_fingerprint=self.reviewed_fingerprint,
+            expected_usb_bus=self.expected_usb_bus,
+            expected_usb_address=self.expected_usb_address,
+            manual_boundary_rows=self.manual_boundary_rows,
+            expected_usb_vendor_id=self.frame.expected_usb_vendor_id,
+            expected_usb_product_id=self.frame.expected_usb_product_id,
+            expected_scanner_model=self.frame.expected_scanner_model,
+            allow_unverified=self.frame.allow_unverified,
+        )
+
+
+@dataclass(frozen=True)
 class AttemptPaths:
     """All durable paths owned by one never-overwritten worker attempt."""
 
@@ -1645,6 +1687,14 @@ class HeldPreviewSession:
         """
 
         return self.preview_attempt.outcome is CaptureOutcome.COMPLETE
+
+
+@dataclass(frozen=True)
+class HeldMeterResult:
+    """Validated meter authority while the same child remains held."""
+
+    solution: ExposureSolution
+    held_again: HeldPreviewSession
 
 
 class _HeldPreviewLaunchFailed(Exception):
@@ -3287,6 +3337,279 @@ class CaptureProcessAdapter:
                 ) from error
             return self._drive_prepared_batch(prepared, held.process, frame_handler)
 
+    def meter_held_session(
+        self,
+        held: HeldPreviewSession,
+        request: HeldMeterRequest,
+    ) -> HeldMeterResult:
+        """Meter one slot inside an existing held reservation."""
+
+        if not isinstance(request, HeldMeterRequest):
+            raise TypeError("request must be a HeldMeterRequest")
+        if not held.usable:
+            raise HeldSessionExpired("this held preview was never resumable")
+        with self._attempt_lock:
+            if held.process.poll() is not None:
+                raise HeldSessionExpired(
+                    "the held preview's child is no longer running"
+                )
+            if self._stop_requested.is_set():
+                self._release_held_session_locked(held)
+                raise CaptureStopped(
+                    "capture stopped before held metering; the reservation was released"
+                )
+            batch_request = request.as_batch_request()
+            prefix = f"meter-{held.hold_session_id}"
+            payload = self._batch_job_bytes(
+                batch_request,
+                session_id=held.hold_session_id,
+                frame_directory_prefix=prefix,
+            )
+            try:
+                _write_exclusive(held.hold_job_path, payload)
+                self._publish_hold_ack(held, action="meter")
+            except OSError as error:
+                self._release_held_session_locked(held)
+                raise CaptureProcessError(
+                    f"could not publish held meter request: {error}"
+                ) from error
+
+            meter_dir = held.directory / f"{prefix}-{request.frame.selected_slot:03d}"
+            journal_path = meter_dir / "journal.json"
+            while True:
+                if journal_path.is_file():
+                    try:
+                        journal_bytes = journal_path.read_bytes()
+                        journal = json.loads(journal_bytes.decode("utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        journal = None
+                    if isinstance(journal, dict) and journal.get("status") == "meter-complete-held":
+                        try:
+                            solution, resume = self._validate_held_meter_result(
+                                held,
+                                request,
+                                journal,
+                                journal_path=journal_path,
+                                journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
+                            )
+                        except BaseException as error:
+                            try:
+                                cleanup_resume = self._validated_held_meter_resume(
+                                    held, journal.get("hold_resume")
+                                )
+                            except CaptureIntegrityError:
+                                cleanup_resume = None
+                            self._release_unreturnable_held_child(
+                                held.process,
+                                hold_ack_path=(
+                                    Path(cleanup_resume["hold_ack_path"])
+                                    if cleanup_resume is not None
+                                    else None
+                                ),
+                                hold_session_id=(
+                                    cleanup_resume["hold_session_id"]
+                                    if cleanup_resume is not None
+                                    else None
+                                ),
+                                error=error,
+                            )
+                            raise
+                        held_again = replace(
+                            held,
+                            hold_job_path=Path(resume["hold_job_path"]),
+                            hold_ack_path=Path(resume["hold_ack_path"]),
+                            hold_session_id=resume["hold_session_id"],
+                        )
+                        return HeldMeterResult(solution=solution, held_again=held_again)
+                returncode = held.process.poll()
+                if returncode is not None:
+                    try:
+                        failure_journal = json.loads(
+                            journal_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        failure_journal = None
+                    if isinstance(failure_journal, dict):
+                        failure = self._held_meter_failure(
+                            held, request, failure_journal
+                        )
+                        if failure is not None:
+                            raise failure
+                    raise CaptureProcessError(
+                        f"held meter child exited {returncode} before returning to hold"
+                    )
+                if self._batch_poll_seconds:
+                    time.sleep(self._batch_poll_seconds)
+
+    def _validate_held_meter_result(
+        self,
+        held: HeldPreviewSession,
+        request: HeldMeterRequest,
+        journal: dict[str, Any],
+        *,
+        journal_path: Path,
+        journal_sha256: str,
+    ) -> tuple[ExposureSolution, dict[str, Any]]:
+        frame = request.frame
+        self._validate_held_meter_invariants(held, request, journal)
+        for forbidden in ("frame_complete", "fine_windows", "nikon_density_frame_ownership"):
+            if forbidden in journal:
+                raise CaptureIntegrityError(
+                    f"held meter journal unexpectedly contains {forbidden}"
+                )
+        authority = journal.get("active_exposure_authority")
+        controller = journal.get("meter_controller_final_result")
+        active = authority.get("active_controller_channels_raw_10ns") if isinstance(authority, dict) else None
+        commanded = authority.get("commanded_channels_raw_10ns") if isinstance(authority, dict) else None
+        if (
+            not isinstance(authority, dict)
+            or authority.get("rgb_source") != "nikon-parity-guarded-v2"
+            or authority.get("ir_source") != "active-controller"
+            or not isinstance(active, dict)
+            or not isinstance(commanded, dict)
+            or not isinstance(controller, dict)
+            or controller.get("accepted") is not True
+            or controller.get("final_exposures_raw_10ns") != active
+            or commanded.get("IR") != active.get("IR")
+        ):
+            raise CaptureIntegrityError("held meter authority is not bound to the accepted solve")
+        ticks = tuple(commanded.get(channel) for channel in ("R", "G", "B"))
+        ir_tick = active.get("IR")
+        if any(type(value) is not int or not EXPOSURE_MIN <= value <= EXPOSURE_MAX for value in (*ticks, ir_tick)):
+            raise CaptureIntegrityError("held meter authority is outside the fixed protocol bounds")
+        evidence = journal.get("meter_evidence")
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("complete") is not True
+            or not isinstance(evidence.get("sha256"), str)
+            or len(evidence["sha256"]) != 64
+        ):
+            raise CaptureIntegrityError("held meter evidence is incomplete")
+        evidence_path = (
+            held.directory
+            / f"meter-{held.hold_session_id}-{frame.selected_slot:03d}"
+            / "capture-meter.bin"
+        ).resolve()
+        if evidence.get("path") != str(evidence_path):
+            raise CaptureIntegrityError("held meter evidence path changed")
+        try:
+            metadata = evidence_path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise CaptureIntegrityError("held meter evidence is not a regular file")
+            meter_bytes = evidence_path.read_bytes()
+        except OSError as error:
+            raise CaptureIntegrityError(
+                f"held meter evidence could not be read: {error}"
+            ) from error
+        if (
+            evidence.get("bytes") != len(meter_bytes)
+            or len(meter_bytes) != METER_CAPTURE_BYTES
+            or not hmac.compare_digest(
+                evidence["sha256"], hashlib.sha256(meter_bytes).hexdigest()
+            )
+        ):
+            raise CaptureIntegrityError("held meter evidence bytes changed")
+        resume = self._validated_held_meter_resume(held, journal.get("hold_resume"))
+        return (
+            ExposureSolution(
+                slot=int(frame.selected_slot),
+                rgb_exposures_raw_10ns=(int(ticks[0]), int(ticks[1]), int(ticks[2])),
+                ir_metered_exposure_raw_10ns=int(ir_tick),
+                meter_evidence_path=evidence_path,
+                meter_evidence_sha256=evidence["sha256"],
+                journal_path=journal_path.resolve(),
+                journal_sha256=journal_sha256,
+            ),
+            resume,
+        )
+
+    @staticmethod
+    def _validate_held_meter_invariants(
+        held: HeldPreviewSession,
+        request: HeldMeterRequest,
+        journal: dict[str, Any],
+    ) -> None:
+        frame = request.frame
+        invariants = {
+            "capture_mode": "held-meter",
+            "session_id": held.hold_session_id,
+            "requested_frame": frame.selected_slot,
+            "requested_boundary_offset_rows": frame.boundary_offset_rows,
+            "reviewed_roll_fingerprint_sha256": request.reviewed_fingerprint.binding_sha256,
+            "expected_usb_bus": request.expected_usb_bus,
+            "expected_usb_address": request.expected_usb_address,
+            "expected_usb_vendor_id": frame.expected_usb_vendor_id,
+            "expected_usb_product_id": frame.expected_usb_product_id,
+            "expected_scanner_model": frame.expected_scanner_model,
+            "allow_unverified": frame.allow_unverified,
+            "unit_released": False,
+            "fine_completed_reads": 0,
+        }
+        for key, expected in invariants.items():
+            if journal.get(key) != expected:
+                raise CaptureIntegrityError(
+                    f"held meter journal {key}={journal.get(key)!r}, expected {expected!r}"
+                )
+
+    def _held_meter_failure(
+        self,
+        held: HeldPreviewSession,
+        request: HeldMeterRequest,
+        journal: dict[str, Any],
+    ) -> BaseException | None:
+        self._validate_held_meter_invariants(held, request, journal)
+        refusal = journal.get("meter_controller_refusal")
+        if refusal is not None:
+            try:
+                return MeterControllerRefused.from_dict(refusal)
+            except ValueError as error:
+                raise CaptureIntegrityError(
+                    "held meter controller-refusal evidence is malformed"
+                ) from error
+        unusable = journal.get("meter_unusable")
+        if unusable is not None:
+            if (
+                not isinstance(unusable, dict)
+                or set(unusable) != {"channel"}
+                or unusable.get("channel") not in {"R", "G", "B", "IR"}
+            ):
+                raise CaptureIntegrityError(
+                    "held meter unusable-channel evidence is malformed"
+                )
+            return MeterUnusableError(unusable["channel"])
+        return None
+
+    @staticmethod
+    def _validated_held_meter_resume(
+        held: HeldPreviewSession,
+        resume: Any,
+    ) -> dict[str, str]:
+        if (
+            not isinstance(resume, dict)
+            or set(resume) != {"hold_session_id", "hold_job_path", "hold_ack_path"}
+            or not isinstance(resume.get("hold_session_id"), str)
+            or not isinstance(resume.get("hold_job_path"), str)
+            or not isinstance(resume.get("hold_ack_path"), str)
+        ):
+            raise CaptureIntegrityError("held meter result has no fresh hold rendezvous")
+        next_session_id = resume["hold_session_id"]
+        directory = held.directory.resolve()
+        job_path = Path(resume["hold_job_path"])
+        ack_path = Path(resume["hold_ack_path"])
+        if (
+            len(next_session_id) != 32
+            or any(character not in "0123456789abcdef" for character in next_session_id)
+            or next_session_id == held.hold_session_id
+            or not job_path.is_absolute()
+            or job_path.parent != directory
+            or job_path.name != f"hold-job-{next_session_id}.json"
+            or not ack_path.is_absolute()
+            or ack_path.parent != directory
+            or ack_path.name != f"hold-ack-{next_session_id}.json"
+        ):
+            raise CaptureIntegrityError("held meter rendezvous is not path-confined")
+        return resume
+
     def release_held_session(self, held: HeldPreviewSession) -> dict[str, Any]:
         """Tell a still-held preview's child to release and exit, then wait
         for it and validate the release actually happened.
@@ -3793,18 +4116,26 @@ class CaptureProcessAdapter:
         request: CaptureBatchRequest,
         *,
         session_id: str,
+        frame_directory_prefix: str = "frame",
     ) -> bytes:
         frames = [
             {
-                "ack": f"frame-{frame.selected_slot:03d}/parent-ack.json",
+                "ack": (
+                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/"
+                    "parent-ack.json"
+                ),
                 "boundary_offset_rows": frame.boundary_offset_rows,
-                "journal": f"frame-{frame.selected_slot:03d}/journal.json",
+                "journal": (
+                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/journal.json"
+                ),
                 "manual_review_approval": (
                     None
                     if frame.manual_review_approval is None
                     else frame.manual_review_approval.to_payload()
                 ),
-                "output": f"frame-{frame.selected_slot:03d}/capture.bin",
+                "output": (
+                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/capture.bin"
+                ),
                 "slot": frame.selected_slot,
             }
             for frame in request.frames
@@ -4702,6 +5033,8 @@ __all__ = [
     "CaptureRequest",
     "CaptureStopped",
     "HeldPreviewSession",
+    "HeldMeterRequest",
+    "HeldMeterResult",
     "HeldSessionExpired",
     "PreparedCaptureBatch",
 ]

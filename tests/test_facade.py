@@ -49,11 +49,13 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CANONICAL_FINE_READ_BYTES,
     CANONICAL_FINE_READ_COUNT,
     CaptureAttemptResult,
+    CaptureIntegrityError,
     CaptureOutcome,
     CaptureProcessAdapter,
     CaptureRequest,
     HeldPreviewSession,
     ManualFrameApproval,
+    METER_CAPTURE_BYTES,
 )
 from coolscanpy.protocol.ls5000_single_pass.continuation_plan import (
     CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -1341,6 +1343,8 @@ class _FakeHeldWorkerProcess:
     expected_usb_address: int | None = None
     preview_started: threading.Event | None = None
     preview_release: threading.Event | None = None
+    meter_resume_override: dict[str, str] | None = None
+    meter_failure_journal: dict[str, Any] | None = None
     # Odd preview row whose housekeeping record gets corrupted at encode
     # time (see _corrupt_index_framing): every downstream hash and density
     # artifact stays self-consistent, so the refusal surfaces exactly where
@@ -1584,6 +1588,76 @@ class _FakeHeldWorkerProcess:
             )
             self._returncode = 0
             return 0
+        if ack["action"] == "meter":
+            job = json.loads(self.hold_job_path.read_text(encoding="utf-8"))
+            frame = job["frames"][0]
+            meter_dir = self.hold_job_path.parent / Path(frame["journal"]).parent
+            meter_dir.mkdir()
+            (self.hold_job_path.parent / frame["output"]).write_bytes(b"")
+            meter_payload = b"m" * METER_CAPTURE_BYTES
+            meter_path = meter_dir / "capture-meter.bin"
+            meter_path.write_bytes(meter_payload)
+            next_session_id = secrets.token_hex(16)
+            next_job_path = self.hold_job_path.parent / f"hold-job-{next_session_id}.json"
+            next_ack_path = self.hold_job_path.parent / f"hold-ack-{next_session_id}.json"
+            ticks = {"R": 111_000, "G": 222_000, "B": 333_000, "IR": 144_000}
+            hold_resume = {
+                "hold_session_id": next_session_id,
+                "hold_job_path": str(next_job_path),
+                "hold_ack_path": str(next_ack_path),
+            }
+            if self.meter_resume_override is not None:
+                hold_resume.update(self.meter_resume_override)
+            meter_journal = {
+                "status": "meter-complete-held",
+                "capture_mode": "held-meter",
+                "session_id": self.hold_session_id,
+                "requested_frame": frame["slot"],
+                "requested_boundary_offset_rows": frame["boundary_offset_rows"],
+                "reviewed_roll_fingerprint_sha256": job["reviewed_roll_fingerprint"]["binding_sha256"],
+                "expected_usb_bus": job["expected_usb_bus"],
+                "expected_usb_address": job["expected_usb_address"],
+                "expected_usb_vendor_id": job["expected_usb_vendor_id"],
+                "expected_usb_product_id": job["expected_usb_product_id"],
+                "expected_scanner_model": job["expected_scanner_model"],
+                "allow_unverified": job["allow_unverified"],
+                "unit_released": False,
+                "fine_completed_reads": 0,
+                "meter_controller_final_result": {
+                    "accepted": True,
+                    "final_exposures_raw_10ns": ticks,
+                },
+                "active_exposure_authority": {
+                    "rgb_source": "nikon-parity-guarded-v2",
+                    "ir_source": "active-controller",
+                    "commanded_channels_raw_10ns": ticks,
+                    "active_controller_channels_raw_10ns": ticks,
+                },
+                "meter_evidence": {
+                    "path": str(meter_path.resolve()),
+                    "bytes": len(meter_payload),
+                    "sha256": _sha256(meter_payload),
+                    "complete": True,
+                },
+                "hold_resume": hold_resume,
+            }
+            if self.meter_failure_journal is not None:
+                meter_journal.update(
+                    status="failed",
+                    error="held meter refused",
+                    **self.meter_failure_journal,
+                )
+            (self.hold_job_path.parent / frame["journal"]).write_text(
+                json.dumps(meter_journal), encoding="utf-8"
+            )
+            if self.meter_failure_journal is not None:
+                self._returncode = 1
+                return 1
+            self.hold_job_path = next_job_path
+            self.hold_ack_path = next_ack_path
+            self.hold_session_id = next_session_id
+            self.events.append(f"meter-{frame['slot']}")
+            return None
         # action == "scan": hold_job_path now holds a real batch-job.json,
         # published by resume_held_session before this ack -- exactly the
         # ordering the real worker's wait_for_hold_decision/hold-ack.json
@@ -1622,6 +1696,8 @@ def _held_worker_process(
     preview_started: threading.Event | None = None,
     preview_release: threading.Event | None = None,
     corrupt_framing_at_row: int | None = None,
+    meter_resume_override: dict[str, str] | None = None,
+    meter_failure_journal: dict[str, Any] | None = None,
 ) -> _FakeHeldWorkerProcess:
     hold_job_path = Path(_arg(argv, "--hold-job"))
     return _FakeHeldWorkerProcess(
@@ -1633,6 +1709,8 @@ def _held_worker_process(
         events=events,
         delegate_factory=delegate_factory,
         corrupt_framing_at_row=corrupt_framing_at_row,
+        meter_resume_override=meter_resume_override,
+        meter_failure_journal=meter_failure_journal,
         expected_usb_bus=(
             int(_arg(argv, "--expected-usb-bus"))
             if "--expected-usb-bus" in argv
@@ -1710,6 +1788,8 @@ def _success_spawner(
     stop_after_index: int | None = None,
     preview_started: threading.Event | None = None,
     preview_release: threading.Event | None = None,
+    meter_resume_override: dict[str, str] | None = None,
+    meter_failure_journal: dict[str, Any] | None = None,
 ):
     def make_batch_process(job_path: Path, session_journal_path: Path) -> _FakeBatchProcess:
         return _FakeBatchProcess(
@@ -1727,6 +1807,8 @@ def _success_spawner(
                 delegate_factory=make_batch_process,
                 preview_started=preview_started,
                 preview_release=preview_release,
+                meter_resume_override=meter_resume_override,
+                meter_failure_journal=meter_failure_journal,
             )
         job_path = Path(_arg(argv, "--batch-job"))
         session_journal_path = Path(_arg(argv, "--session-journal"))
@@ -5239,6 +5321,144 @@ class TestRollMultiBatchHold:
     facade layer's own faithful proxy for the same claim, matching
     test_capture_process.py's identical idiom for the original
     preview-then-first-batch resume."""
+
+    def test_solve_exposure_keeps_one_child_for_the_following_scan(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(
+                events,
+                processes,
+                _success_spawner(events),
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            solution = roll.solve_exposure(1)
+            frame = roll.scan(
+                1,
+                exposure_override_10ns=solution.rgb_exposures_raw_10ns,
+            )
+
+            assert solution.slot == 1
+            assert solution.rgb_exposures_raw_10ns == (111_000, 222_000, 333_000)
+            assert solution.ir_metered_exposure_raw_10ns == 144_000
+            assert solution.meter_evidence_path.is_file()
+            assert solution.meter_evidence_sha256 == _sha256(
+                solution.meter_evidence_path.read_bytes()
+            )
+            assert solution.journal_path.is_file()
+            assert solution.journal_sha256 == _sha256(
+                solution.journal_path.read_bytes()
+            )
+            assert len(solution.journal_sha256) == 64
+            assert frame.slot == 1
+            assert len(processes) == 1
+            assert events.count("preview-hold-ready") == 1
+            assert events.count("meter-1") == 1
+            assert events.count("hold-ack-scan") == 1
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_solve_exposure_refuses_unconfined_resume_without_writing_it(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        outside_ack = tmp_path / "outside-hold-ack.json"
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(
+                events,
+                processes,
+                _success_spawner(
+                    events,
+                    meter_resume_override={
+                        "hold_session_id": "../outside",
+                        "hold_job_path": str(tmp_path / "outside-hold-job.json"),
+                        "hold_ack_path": str(outside_ack),
+                    },
+                ),
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            with pytest.raises(
+                CaptureIntegrityError, match="rendezvous is not path-confined"
+            ):
+                roll.solve_exposure(1)
+
+            assert not outside_ack.exists()
+            assert events[-1] == "terminate"
+            assert len(processes) == 1
+            assert processes[0].poll() == -15
+        finally:
+            roll.close()
+            dev.close()
+
+    @pytest.mark.parametrize(
+        ("failure_journal", "error_type"),
+        [
+            (
+                {
+                    "meter_controller_refusal": {
+                        "pass": 2,
+                        "reasons": [
+                            {
+                                "code": "near_clipping",
+                                "message": "meter channel is too close to clipping",
+                                "channel": "R",
+                            }
+                        ],
+                    }
+                },
+                coolscanpy.MeterControllerRefused,
+            ),
+            ({"meter_unusable": {"channel": "G"}}, coolscanpy.MeterUnusableError),
+        ],
+        ids=["controller-refused", "meter-unusable"],
+    )
+    def test_solve_exposure_preserves_typed_worker_refusal(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+        failure_journal: dict[str, Any],
+        error_type: type[Exception],
+    ) -> None:
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_success_spawner(
+                events, meter_failure_journal=failure_journal
+            ),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+
+            with pytest.raises(error_type):
+                roll.solve_exposure(1)
+
+            assert roll._held_session is None
+        finally:
+            roll.close()
+            dev.close()
 
     def test_second_scan_many_resumes_the_first_without_a_new_spawn(
         self, fake_service_factory, tmp_path: Path
