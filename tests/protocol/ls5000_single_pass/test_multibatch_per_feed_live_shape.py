@@ -390,7 +390,7 @@ def _install_fake_hardware(
     monkeypatch.setattr(
         worker_module,
         "_validate_scanner_identity",
-        lambda _payload: "Nikon LS-5000 ED 2.07",
+        lambda _payload, **_kwargs: "Nikon LS-5000 ED 2.07",
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows

@@ -108,6 +108,16 @@ _NIKON_COOLSCAN_USB_MODELS: dict[int, dict[int, str]] = {
         _LS5000_USB_PRODUCT_ID: "LS-5000 ED",
     },
 }
+_UNVERIFIED_DIRECT_USB_MODELS = frozenset(
+    _NIKON_COOLSCAN_USB_MODELS[_LS5000_USB_VENDOR_ID].values()
+) - {_CANONICAL_LS5000_MODEL}
+
+
+def _unsupported_device_message(model: str) -> str:
+    return (
+        f"{model} is recognized but not supported; "
+        "only the LS-5000 is supported"
+    )
 
 # SANE lane counterpart of the USB lane's product-id table above (#14): SANE
 # has no product id, only the backend's free-text model string, so a
@@ -390,7 +400,7 @@ def get_devices(local_only: bool = False) -> list[DeviceInfo]:
         ) from usb_error
 
 
-def open(devname: str) -> "Device":
+def open(devname: str, *, allow_unverified: bool = False) -> "Device":
     """Open one Coolscan LS-5000. Mirrors ``sane.open(devname)``.
 
     ``devname`` is either ``"ls5000"`` (friendly alias for "the one attached
@@ -408,14 +418,22 @@ def open(devname: str) -> "Device":
         # fall through to it so the more specific "recognized but not
         # supported" message below fires instead of the generic
         # not-attached one.
-        supported_infos = [candidate for candidate in infos if candidate.supported]
-        if len(supported_infos) > 1:
+        eligible_infos = [
+            candidate
+            for candidate in infos
+            if candidate.supported
+            or (
+                allow_unverified
+                and candidate.model in _UNVERIFIED_DIRECT_USB_MODELS
+            )
+        ]
+        if len(eligible_infos) > 1:
             raise DeviceNotFound(
                 "more than one Coolscan LS-5000 unit is attached; "
                 "disambiguate via get_devices()"
             )
-        if supported_infos:
-            info = supported_infos[0]
+        if eligible_infos:
+            info = eligible_infos[0]
         elif infos:
             info = infos[0]
         else:
@@ -428,13 +446,12 @@ def open(devname: str) -> "Device":
             )
         info = matches[0]
 
-    if not info.supported:
+    if not info.supported and not (
+        allow_unverified and info.model in _UNVERIFIED_DIRECT_USB_MODELS
+    ):
         # Recognize-and-refuse (Lane D): a Nikon Coolscan that is not the
         # LS-5000 is listed in discovery but must never be opened. Fail-closed.
-        raise DeviceNotFound(
-            f"{info.model} is recognized but not supported; "
-            "only the LS-5000 is supported"
-        )
+        raise DeviceNotFound(_unsupported_device_message(info.model))
 
     _register_open_device(info.id)
     try:

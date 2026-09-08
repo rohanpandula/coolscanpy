@@ -107,6 +107,13 @@ DATA_PACKAGE = "coolscanpy.protocol.ls5000_single_pass.data"
 EXPECTED_FINE_CDB = "280000000001032c0080"
 EXPECTED_FINE_REQUEST = 207_872
 EXPECTED_FINE_READS = 2_980
+NIKON_USB_VENDOR_ID = 0x04B0
+NIKON_COOLSCAN_USB_PRODUCTS = {
+    0x4000: "LS-40 ED",
+    0x4001: "LS-50 ED",
+    0x4002: "LS-5000 ED",
+}
+CANONICAL_SCANNER_PRODUCT = "LS-5000 ED"
 READY_POLL_SECONDS = 0.1
 READY_POLL_DEADLINE_SECONDS = 120.0
 RETRYABLE_BUSY_SENSES = {"020401"}
@@ -3418,7 +3425,11 @@ def _validate_live_meter_windows(
     return decoded
 
 
-def _validate_scanner_identity(payload: bytes) -> str:
+def _validate_scanner_identity(
+    payload: bytes,
+    *,
+    expected_product: str = CANONICAL_SCANNER_PRODUCT,
+) -> str:
     """Validate the standard INQUIRY identity and return its label.
 
     Accepts a genuine Nikon ``LS-5000 ED`` at any firmware revision (1.02 and
@@ -3435,12 +3446,14 @@ def _validate_scanner_identity(payload: bytes) -> str:
     vendor = payload[8:16].decode("ascii", errors="replace").strip()
     product = payload[16:32].decode("ascii", errors="replace").strip()
     revision = payload[32:36].decode("ascii", errors="replace").strip()
-    if (vendor, product) != ("Nikon", "LS-5000 ED"):
+    if expected_product not in NIKON_COOLSCAN_USB_PRODUCTS.values():
+        raise ProtocolError(f"unrecognized expected scanner product {expected_product!r}")
+    if (vendor, product) != ("Nikon", expected_product):
         raise SynchronizedProtocolError(
             "unexpected scanner identity "
             f"vendor={vendor!r} product={product!r} revision={revision!r}"
         )
-    return f"Nikon LS-5000 ED {revision}"
+    return f"Nikon {expected_product} {revision}"
 
 
 def _validate_live_fine_windows(
@@ -3517,30 +3530,49 @@ def _validate_live_fine_windows(
 def _find_ls5000_usb_device(
     usb_core: Any,
     *,
+    expected_product: str | None = CANONICAL_SCANNER_PRODUCT,
     expected_bus: int | None = None,
     expected_address: int | None = None,
     backend: Any | None = None,
 ) -> Any:
     if (expected_bus is None) != (expected_address is None):
         raise ProtocolError("expected USB bus and address are inseparable")
+    product_ids = tuple(
+        product_id
+        for product_id, product in NIKON_COOLSCAN_USB_PRODUCTS.items()
+        if expected_product is None or product == expected_product
+    )
+    if not product_ids:
+        raise ProtocolError(f"unrecognized expected scanner product {expected_product!r}")
+    if expected_product is None and expected_bus is None:
+        raise ProtocolError("a model-agnostic Coolscan search requires exact USB topology")
     if expected_bus is None:
+        assert expected_product is not None and len(product_ids) == 1
+        product_id = product_ids[0]
         device = usb_core.find(
-            idVendor=0x04B0,
-            idProduct=0x4002,
+            idVendor=NIKON_USB_VENDOR_ID,
+            idProduct=product_id,
             backend=backend,
         )
         if device is None:
-            raise ProtocolError("Nikon LS-5000 (04b0:4002) is not on the USB bus")
+            raise ProtocolError(
+                f"Nikon {expected_product} (04b0:{product_id:04x}) is not on the USB bus"
+            )
         return device
 
     devices = tuple(
-        usb_core.find(
-            idVendor=0x04B0,
-            idProduct=0x4002,
-            find_all=True,
-            backend=backend,
+        device
+        for product_id in product_ids
+        for device in (
+            usb_core.find(
+                idVendor=NIKON_USB_VENDOR_ID,
+                idProduct=product_id,
+                find_all=True,
+                backend=backend,
+            )
+            or ()
         )
-        or ()
+        if getattr(device, "idProduct", 0x4002) == product_id
     )
     matches = tuple(
         device
@@ -3552,7 +3584,7 @@ def _find_ls5000_usb_device(
         raise ProtocolError(
             "exact USB topology "
             f"{expected_bus:03d}:{expected_address:03d} resolved to "
-            f"{len(matches)} Nikon LS-5000 devices; refusing fallback selection"
+            f"{len(matches)} recognized Nikon Coolscan devices; refusing fallback selection"
         )
     return matches[0]
 
@@ -3569,6 +3601,9 @@ def _connect_device(
 
     device = _find_ls5000_usb_device(
         usb.core,
+        expected_product=(
+            None if expected_usb_bus is not None else CANONICAL_SCANNER_PRODUCT
+        ),
         expected_bus=expected_usb_bus,
         expected_address=expected_usb_address,
         backend=get_libusb_backend(),
@@ -4808,6 +4843,7 @@ def _run_live_continuation_frame(
     actual_usb_bus: int,
     actual_usb_address: int,
     expected_calibration_session_id: str,
+    allow_unverified: bool = False,
     # Type-only: the caller's own local is `str | None` (set once the
     # batch's first INQUIRY validates it), so a `str`-only annotation here
     # was already an unsound accepted-argument type, not a runtime
@@ -4918,6 +4954,7 @@ def _run_live_continuation_frame(
         "stall_recoveries": 0,
         "started_unix": time.time(),
         "scanner_identity": scanner_identity,
+        "allow_unverified": allow_unverified,
         "preview_geometry_validated_before_reads": True,
         "live_frame_selection": selection.diagnostics(),
         "manual_review_approval": (
@@ -5820,6 +5857,13 @@ def run_live_capture(
             )
         actual_usb_bus = getattr(device, "bus", None)
         actual_usb_address = getattr(device, "address", None)
+        actual_usb_product = getattr(device, "idProduct", 0x4002)
+        expected_scanner_product = NIKON_COOLSCAN_USB_PRODUCTS.get(actual_usb_product)
+        if expected_scanner_product is None:
+            raise ProtocolError(
+                f"connected USB product 04b0:{actual_usb_product:04x} is not a recognized Coolscan"
+            )
+        allow_unverified = expected_scanner_product != CANONICAL_SCANNER_PRODUCT
         if expected_usb_bus is not None and (
             isinstance(actual_usb_bus, bool)
             or not isinstance(actual_usb_bus, int)
@@ -5834,10 +5878,12 @@ def run_live_capture(
             )
         journal["actual_usb_bus"] = actual_usb_bus
         journal["actual_usb_address"] = actual_usb_address
+        journal["allow_unverified"] = allow_unverified
         if session_journal is not None:
             assert session_journal_path is not None
             session_journal["actual_usb_bus"] = actual_usb_bus
             session_journal["actual_usb_address"] = actual_usb_address
+            session_journal["allow_unverified"] = allow_unverified
             _write_journal(session_journal_path, session_journal)
         journal["status"] = "preamble"
         journal["endpoint_out"] = f"0x{ep_out.bEndpointAddress:02x}"
@@ -6035,7 +6081,10 @@ def run_live_capture(
                     ready_required=ready_required,
                 )
                 if entry["seq"] == 1:
-                    scanner_identity = _validate_scanner_identity(result.payload)
+                    scanner_identity = _validate_scanner_identity(
+                        result.payload,
+                        expected_product=expected_scanner_product,
+                    )
                     journal["scanner_identity"] = scanner_identity
                     if session_journal is not None and session_journal_path is not None:
                         session_journal["scanner_identity"] = scanner_identity
@@ -7232,6 +7281,7 @@ def run_live_capture(
                         actual_usb_address=actual_usb_address,
                         expected_calibration_session_id=calibration_session_id,
                         scanner_identity=scanner_identity,
+                        allow_unverified=allow_unverified,
                     )
                     completed_slots.append(frame_spec.slot)
                     session_journal.update(
@@ -7419,6 +7469,7 @@ def run_live_capture(
                         actual_usb_address=actual_usb_address,
                         expected_calibration_session_id=calibration_session_id,
                         scanner_identity=scanner_identity,
+                        allow_unverified=allow_unverified,
                     )
                     completed_slots.append(frame_spec.slot)
                     session_journal.update(

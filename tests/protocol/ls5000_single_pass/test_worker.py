@@ -1287,6 +1287,20 @@ def test_usb_device_selection_requires_exact_reviewed_sane_topology() -> None:
     ]
 
 
+def test_usb_device_selection_can_target_a_recognized_ls50() -> None:
+    expected = SimpleNamespace(bus=1, address=2, idProduct=0x4001)
+    calls: list[dict[str, object]] = []
+
+    def find(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return expected
+
+    assert worker_module._find_ls5000_usb_device(
+        SimpleNamespace(find=find), expected_product="LS-50 ED"
+    ) is expected
+    assert calls[0]["idProduct"] == 0x4001
+
+
 def test_usb_device_selection_refuses_missing_or_ambiguous_exact_topology() -> None:
     for devices in (
         (SimpleNamespace(bus=1, address=9),),
@@ -2375,7 +2389,7 @@ def _preview_and_hold_fakes() -> dict[str, object]:
 def _apply_preview_and_hold_fakes(
     monkeypatch: pytest.MonkeyPatch, fakes: dict[str, object]
 ) -> None:
-    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: None)
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: fakes["preview_windows"]
     )
@@ -6256,7 +6270,7 @@ def test_live_two_frame_batch_uses_one_combined_table_and_one_release(
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
     monkeypatch.setattr(
-        worker_module, "_validate_scanner_identity", lambda _payload: "Nikon LS-5000 ED 1.03"
+        worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: "Nikon LS-5000 ED 1.03"
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
@@ -7015,7 +7029,7 @@ def test_preview_and_hold_two_rounds_share_one_reservation_then_eject_after(
     monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
     monkeypatch.setattr(worker_module, "validate_plan", lambda _plan: tiny_target)
     monkeypatch.setattr(worker_module, "_derive_index_geometry", lambda _plan: geometry)
-    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload: None)
+    monkeypatch.setattr(worker_module, "_validate_scanner_identity", lambda _payload, **_kwargs: None)
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows
     )
@@ -7542,7 +7556,7 @@ def test_preview_and_hold_resume_binds_density_ownership_to_calibration_identity
     monkeypatch.setattr(
         worker_module,
         "_validate_scanner_identity",
-        lambda _payload: "Nikon LS-5000 ED 2.07",
+        lambda _payload, **_kwargs: "Nikon LS-5000 ED 2.07",
     )
     monkeypatch.setattr(
         worker_module, "_validate_live_preview_windows", lambda *_args: preview_windows

@@ -6034,6 +6034,12 @@ class TestSaneLaneDiscoveryGate:
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("ls5000")
 
+        dev = coolscanpy.open("ls5000", allow_unverified=True)
+        try:
+            assert dev._info.model == "LS-50 ED"
+        finally:
+            dev.close()
+
     def test_sane_listed_ls5000_stays_supported(
         self,
         fake_sane_module: Callable[[list[tuple[str, str, str, str]]], None],
@@ -6073,6 +6079,8 @@ class TestSaneLaneDiscoveryGate:
 
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("ls5000")
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open("ls5000", allow_unverified=True)
 
     def test_sane_model_marker_order_matches_the_longer_digit_model_first(
         self,
@@ -6136,6 +6144,10 @@ class TestSaneLaneDiscoveryGate:
             coolscanpy.open("ls5000")
         with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
             coolscanpy.open("coolscan3:usb:001:009")
+        with pytest.raises(coolscanpy.DeviceNotFound, match="not supported"):
+            coolscanpy.open(
+                "coolscan3:usb:001:009", allow_unverified=True
+            )
 
     @pytest.mark.parametrize(
         ("model", "expected_name", "expected_supported"),
