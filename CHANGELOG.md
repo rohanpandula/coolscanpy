@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.10 - 2026-09-08
+
+- Route `Roll.film_present()` through the child that owns a preview-held USB
+  reservation. The query uses TEST UNIT READY, preserves the held session, and
+  returns the driver's existing `True`/`False`/`None` result without opening a
+  second device or retrying an unknown result. This path was exercised on one
+  LS-5000 ED / firmware 1.03 / SA-30 session after a retained preview.
+- Give every resumed held scan round its own immutable
+  `frame-NNN-<held-session-id>` artifact directory. The parent and worker bind
+  the directory suffix to the exact held session, so repeating a slot cannot
+  overwrite or misread an earlier round's journal or ACK. The fix is covered by
+  synthetic multi-round, worker-parser, cleanup, and transport regressions; the
+  repeated same-slot workflow was not rerun on hardware after this change.
+- Record `explicit-rgb-override` as the RGB exposure source when a validated
+  override is applied. No new scanner models, platforms, or batch shapes are
+  qualified by this release.
+
 ## 0.7.9 - 2026-09-08
 
 - Add `Roll.solve_exposure(slot=...)` within the existing preview-held scanner
