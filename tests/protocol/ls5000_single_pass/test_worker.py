@@ -2203,7 +2203,7 @@ def test_wait_for_hold_decision_accepts_all_supported_actions(
     minted. "eject" ends the session by replaying the traced vendor eject
     sequence before releasing -- the operator-changed-their-mind case."""
 
-    for action in ("scan", "meter", "release", "eject"):
+    for action in ("scan", "meter", "status", "release", "eject"):
         ack_path = tmp_path / f"hold-ack-{action}.json"
         ack_path.write_text(
             json.dumps(
