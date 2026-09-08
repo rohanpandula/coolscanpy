@@ -962,6 +962,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert "--frame" not in prepared.argv
     assert job["session_id"] == prepared.session_id
     assert job == {
+        "allowed_meter_refusal_slots": [],
         "apply_all_boundary_offsets_before_first_frame": True,
         "capture_plan_sha256": CANONICAL_PLAN_SHA256,
         "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
@@ -995,7 +996,7 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
         "reviewed_roll_fingerprint": fingerprint.to_payload(),
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": prepared.session_id,
         "session_contract": "one-process-one-reservation",
     }
@@ -1009,6 +1010,40 @@ def test_prepare_batch_frames_every_selected_slot_as_one_future_child_session(
     assert hashlib.sha256(prepared.paths.job.read_bytes()).hexdigest() == (
         prepared.job_sha256
     )
+
+
+def test_batch_meter_refusal_allowlist_is_exact_and_job_hash_bound(
+    tmp_path: Path, binding: Binding
+) -> None:
+    frames = (
+        capture.CaptureRequest(capture.CaptureMode.FULL, 2, 0),
+        capture.CaptureRequest(capture.CaptureMode.FULL, 36, 0),
+    )
+    common = {
+        "frames": frames,
+        "reviewed_fingerprint": _reviewed_fingerprint(),
+        "expected_usb_bus": 1,
+        "expected_usb_address": 2,
+    }
+    with pytest.raises(ValueError, match="unique sorted subset"):
+        capture.CaptureBatchRequest(
+            **common, allowed_meter_refusal_slots=(36, 2)
+        )
+    with pytest.raises(TypeError, match="integer tuple"):
+        capture.CaptureBatchRequest(
+            **common, allowed_meter_refusal_slots=(True,)
+        )
+
+    adapter = _adapter(tmp_path, binding, FakeRunner(binding.worker_sha256))
+    prepared = adapter.prepare_batch_session(
+        capture.CaptureBatchRequest(
+            **common, allowed_meter_refusal_slots=(2, 36)
+        )
+    )
+    payload = prepared.paths.job.read_bytes()
+    job = json.loads(payload)
+    assert job["allowed_meter_refusal_slots"] == [2, 36]
+    assert hashlib.sha256(payload).hexdigest() == prepared.job_sha256
 
 
 def test_prepare_batch_session_threads_exposure_override_into_the_batch_job(

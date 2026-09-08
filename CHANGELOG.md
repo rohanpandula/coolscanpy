@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.9 - 2026-09-08
+
+- Add `Roll.solve_exposure(slot=...)` within the existing preview-held scanner
+  session. Meter jobs bind the original USB topology, device identity and
+  opt-in before admission; results retain RGB ticks, metered IR and immutable
+  meter/journal evidence. No substitute full-frame capture or second device
+  reservation is used.
+- Add exact, default-empty `scan_many(allowed_meter_refusal_slots=...)` and
+  `on_meter_refusal_skipped(slot, refusal)`. Only a structured controller
+  refusal after the drained meter transaction reaches READY can continue.
+  Skips retain a journal and unused output reservation, not a capture receipt.
+  Unlisted refusals, transport failures and callback failures stop the batch.
+- Validate and bind the canonical four-sample wire plan before applying the
+  one-sample execution patch. The matching ScanStudio driver fix completed one
+  LS-5000 ED / firmware 1.03 / SA-30 RGBI 4000 dpi 16-bit single-sample frame
+  with exactly 189,194,240 fine bytes on 2026-09-08. This does not qualify other
+  models or the new held-meter/skip workflow, which remains hardware-unvalidated.
+
 ## 0.7.8 - 2026-09-07
 
 - Give the IR channel its own pass-linearity correlation floor (``LINEARITY_CORRELATION_MIN_IR = 0.95``) instead of sharing R/G/B's 0.98 gate (HW-08). A real LS-5000 ED batch scan (2026-09-07, firmware 1.03, SA-30 roll adapter) aborted at frame 10 -- a dark, low-contrast exposure -- when IR pass correlation 0.9727 fell under the shared floor while R/G/B held 0.9995/0.9999/0.9999; frame 9 had passed with IR 0.992, and the refusal reproduced deterministically on retry. IR does not drive C-41 negative exposure decisions (only R/G/B do; IR is dust/scratch detection), so the relaxed floor does not weaken exposure safety -- R/G/B keep the 0.98 gate unchanged, IR still refuses below its own 0.95 floor, and the ``nonlinear_gain``/``linearity_insufficient`` refusals are unchanged for every channel. The applied per-channel floor is now recorded as ``correlation_min`` alongside each channel's ``linearity`` diagnostic in the meter-controller journal, so evidence of which gate decided a pass stays complete.

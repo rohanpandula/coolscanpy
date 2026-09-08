@@ -206,6 +206,7 @@ def _patch_continuation_common(
         "request_parts": [1],
     }
     monkeypatch.setattr(worker_module, "EXPECTED_FINE_READS", fine_reads)
+    monkeypatch.setattr(worker_module, "_fine_request_bytes", lambda _samples: 1)
     if not full_meter_payload:
         monkeypatch.setattr(worker_module, "METER_GROUP_BYTES", 5)
         monkeypatch.setattr(worker_module, "METER_CAPTURE_BYTES", 15)
@@ -279,7 +280,7 @@ def _drive_continuation(
         diagnostics=lambda: {"frame": 18, "prevalidated": True},
     )
     root = tmp_path / "continuation"
-    root.mkdir()
+    root.mkdir(parents=True)
     second = worker_module.BatchFrameSpec(
         18,
         -11,
@@ -563,6 +564,9 @@ def _drive_two_frame_batch(
     open_session,
     fine_reads: int = 1,
     fail_first_fine_read_index: int | None = None,
+    allowed_meter_refusal_slots: tuple[int, ...] = (),
+    refuse_first_meter: bool = False,
+    fail_first_meter_transport: bool = False,
 ) -> dict:
     records, base_mapping = _records_and_mapping()
     combined, resolved = apply_batch_boundary_offsets(
@@ -596,7 +600,7 @@ def _drive_two_frame_batch(
 
     selections = (selection_for(7, 9, resolved[0]), selection_for(18, -11, resolved[1]))
     root = tmp_path / "both-loops-batch"
-    root.mkdir()
+    root.mkdir(parents=True)
     first = worker_module.BatchFrameSpec(
         7,
         9,
@@ -622,6 +626,7 @@ def _drive_two_frame_batch(
         CANONICAL_PLAN_SHA256,
         worker_module.CANONICAL_CONTINUATION_PLAN_SHA256,
         "c" * 64,
+        allowed_meter_refusal_slots=allowed_meter_refusal_slots,
     )
     nonce = "both-loops-nonce"
     first.ack.write_text(
@@ -672,9 +677,10 @@ def _drive_two_frame_batch(
         return selections
 
     fine_read_index = 0
+    meter_read_index = 0
 
     def perform(_ep_out, _ep_in, entry, **_kwargs):
-        nonlocal fine_read_index
+        nonlocal fine_read_index, meter_read_index
         sequence = entry["seq"]
         if sequence in (115, 116, 117):
             payload = b"window"
@@ -690,6 +696,9 @@ def _drive_two_frame_batch(
         ):
             payload = bytes.fromhex(entry["expected_data_in"])
         elif sequence in worker_module.METER_READ_SEQUENCES:
+            if fail_first_meter_transport and meter_read_index == 0:
+                raise RuntimeError("forced first-frame meter transport failure")
+            meter_read_index += 1
             payload = b"m"
         elif sequence == 607:
             if fine_read_index == fail_first_fine_read_index:
@@ -767,6 +776,34 @@ def _drive_two_frame_batch(
         for color in (1, 2, 3)
     ]
     _patch_continuation_common(monkeypatch, plan, fine_reads=fine_reads)
+    if refuse_first_meter:
+        refusal = worker_module.SafetyRefusal(
+            code="linearity_insufficient",
+            message="known blank has insufficient linear samples",
+            channel="R",
+            valid_raw_samples=0,
+            required_raw_samples=256,
+            valid_aggregate_samples=0,
+            required_aggregate_samples=24,
+        )
+        refused = SimpleNamespace(
+            accepted=False,
+            proposed_exposures=dict(worker_module.DEFAULT_EXPOSURES),
+            refusals=(refusal,),
+            to_dict=lambda: {
+                "accepted": False,
+                "refusals": [refusal.to_dict()],
+            },
+        )
+        accepted = worker_module.propose_next_exposures(None)
+        proposal_calls = 0
+
+        def proposal(*_args, **_kwargs):
+            nonlocal proposal_calls
+            proposal_calls += 1
+            return refused if proposal_calls == 1 else accepted
+
+        monkeypatch.setattr(worker_module, "propose_next_exposures", proposal)
     monkeypatch.setattr(
         worker_module,
         "EXPECTED_PREVIEW_BYTES",
@@ -861,6 +898,59 @@ def test_both_fine_loops_wire_the_shared_streaming_hook(
     raw_sha = hashlib.sha256(b"f").hexdigest()
     assert log["submit_calls"] == [(0, b"f"), (1, b"f")]
     assert log["finish_calls"] == [(0, raw_sha, 1), (1, raw_sha, 1)]
+
+
+def test_two_frame_meter_refusal_skip_is_exact_and_transport_still_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(
+        worker_module.SynchronizedProtocolError,
+        match="controller refused",
+    ):
+        _drive_two_frame_batch(
+            tmp_path / "default-stop",
+            monkeypatch,
+            open_session=lambda *_args: None,
+            refuse_first_meter=True,
+        )
+    assert not (
+        tmp_path / "default-stop" / "both-loops-batch" / "frame-018"
+    ).exists()
+
+    monkeypatch.undo()
+    skipped = _drive_two_frame_batch(
+        tmp_path / "explicit-skip",
+        monkeypatch,
+        open_session=lambda *_args: None,
+        refuse_first_meter=True,
+        allowed_meter_refusal_slots=(7,),
+    )
+    first_journal = json.loads(skipped["first"].journal.read_text(encoding="utf-8"))
+    assert first_journal["status"] == "meter-controller-refusal-skipped"
+    assert first_journal["skip"] == {
+        "code": "METER_CONTROLLER_REFUSED",
+        "frame_index": 1,
+        "refusal": first_journal["meter_controller_refusal"],
+        "slot": 7,
+    }
+    assert first_journal["output_placeholder_retained"] is True
+    assert skipped["first"].output.read_bytes() == b""
+    assert skipped["second"].output.read_bytes() == b"f"
+    assert skipped["session_journal"]["completed_slots"] == [18]
+    assert skipped["session_journal"]["skipped_frames"] == [first_journal["skip"]]
+
+    monkeypatch.undo()
+    with pytest.raises(RuntimeError, match="meter transport failure"):
+        _drive_two_frame_batch(
+            tmp_path / "transport-stop",
+            monkeypatch,
+            open_session=lambda *_args: None,
+            allowed_meter_refusal_slots=(7,),
+            fail_first_meter_transport=True,
+        )
+    assert not (
+        tmp_path / "transport-stop" / "both-loops-batch" / "frame-018"
+    ).exists()
 
 
 def test_first_frame_read_failure_aborts_stream_and_preserves_original_error(
