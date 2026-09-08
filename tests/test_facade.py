@@ -1346,6 +1346,8 @@ class _FakeHeldWorkerProcess:
     preview_release: threading.Event | None = None
     meter_resume_override: dict[str, str] | None = None
     meter_failure_journal: dict[str, Any] | None = None
+    film_present_result: bool | None = True
+    film_status_overrides: dict[str, Any] | None = None
     # Odd preview row whose housekeeping record gets corrupted at encode
     # time (see _corrupt_index_framing): every downstream hash and density
     # artifact stays self-consistent, so the refusal surfaces exactly where
@@ -1593,6 +1595,43 @@ class _FakeHeldWorkerProcess:
             )
             self._returncode = 0
             return 0
+        if ack["action"] == "status":
+            old_session_id = self.hold_session_id
+            next_session_id = secrets.token_hex(16)
+            next_job_path = self.hold_job_path.parent / f"hold-job-{next_session_id}.json"
+            next_ack_path = self.hold_job_path.parent / f"hold-ack-{next_session_id}.json"
+            raw_status = {
+                True: "000000",
+                False: "023a00",
+                None: "020401",
+            }[self.film_present_result]
+            status_path = self.hold_job_path.parent / f"hold-status-{old_session_id}.json"
+            payload = {
+                        "schema_version": 1,
+                        "status": "film-status-complete-held",
+                        "hold_session_id": old_session_id,
+                        "film_present": self.film_present_result,
+                        "raw_status": raw_status,
+                        "sense_history": [],
+                        "device_id": f"usb:{self.expected_usb_bus}:{self.expected_usb_address}",
+                        "unit_released": False,
+                        "hold_resume": {
+                            "hold_session_id": next_session_id,
+                            "hold_job_path": str(next_job_path),
+                            "hold_ack_path": str(next_ack_path),
+                        },
+                    }
+            if self.film_status_overrides is not None:
+                payload.update(self.film_status_overrides)
+            status_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            self.hold_job_path = next_job_path
+            self.hold_ack_path = next_ack_path
+            self.hold_session_id = next_session_id
+            self.events.append(f"film-status-{self.film_present_result}")
+            return None
         if ack["action"] == "meter":
             job = json.loads(self.hold_job_path.read_text(encoding="utf-8"))
             frame = job["frames"][0]
@@ -1703,6 +1742,8 @@ def _held_worker_process(
     corrupt_framing_at_row: int | None = None,
     meter_resume_override: dict[str, str] | None = None,
     meter_failure_journal: dict[str, Any] | None = None,
+    film_present_result: bool | None = True,
+    film_status_overrides: dict[str, Any] | None = None,
 ) -> _FakeHeldWorkerProcess:
     hold_job_path = Path(_arg(argv, "--hold-job"))
     return _FakeHeldWorkerProcess(
@@ -1716,6 +1757,8 @@ def _held_worker_process(
         corrupt_framing_at_row=corrupt_framing_at_row,
         meter_resume_override=meter_resume_override,
         meter_failure_journal=meter_failure_journal,
+        film_present_result=film_present_result,
+        film_status_overrides=film_status_overrides,
         expected_usb_bus=(
             int(_arg(argv, "--expected-usb-bus"))
             if "--expected-usb-bus" in argv
@@ -1795,6 +1838,8 @@ def _success_spawner(
     preview_release: threading.Event | None = None,
     meter_resume_override: dict[str, str] | None = None,
     meter_failure_journal: dict[str, Any] | None = None,
+    film_present_result: bool | None = True,
+    film_status_overrides: dict[str, Any] | None = None,
 ):
     def make_batch_process(job_path: Path, session_journal_path: Path) -> _FakeBatchProcess:
         return _FakeBatchProcess(
@@ -1814,6 +1859,8 @@ def _success_spawner(
                 preview_release=preview_release,
                 meter_resume_override=meter_resume_override,
                 meter_failure_journal=meter_failure_journal,
+                film_present_result=film_present_result,
+                film_status_overrides=film_status_overrides,
             )
         job_path = Path(_arg(argv, "--batch-job"))
         session_journal_path = Path(_arg(argv, "--session-journal"))
@@ -5352,6 +5399,68 @@ class TestRollMultiBatchHold:
     facade layer's own faithful proxy for the same claim, matching
     test_capture_process.py's identical idiom for the original
     preview-then-first-batch resume."""
+
+    @pytest.mark.parametrize("verdict", (True, False, None))
+    def test_film_status_uses_the_held_child_and_keeps_one_reservation(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+        verdict: bool | None,
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(
+                events,
+                processes,
+                _success_spawner(events, film_present_result=verdict),
+            ),
+        )
+        try:
+            roll.preview()
+
+            assert roll.film_present() is verdict
+            assert roll.film_present() is verdict
+            assert len(processes) == 1
+            assert events.count(f"film-status-{verdict}") == 2
+            assert roll._held_session is not None
+        finally:
+            roll.close()
+            dev.close()
+
+    def test_film_status_refuses_a_verdict_that_disagrees_with_raw_status(
+        self,
+        fake_service_factory,
+        tmp_path: Path,
+    ) -> None:
+        events: list[str] = []
+        processes: list[Any] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_counting_spawner(
+                events,
+                processes,
+                _success_spawner(
+                    events,
+                    film_status_overrides={"film_present": False},
+                ),
+            ),
+        )
+        try:
+            roll.preview()
+
+            assert roll.film_present() is None
+            assert len(processes) == 1
+            assert processes[0].poll() == 0
+            assert roll._held_session is None
+        finally:
+            roll.close()
+            dev.close()
 
     def test_solve_exposure_keeps_one_child_for_the_following_scan(
         self, fake_service_factory, tmp_path: Path
