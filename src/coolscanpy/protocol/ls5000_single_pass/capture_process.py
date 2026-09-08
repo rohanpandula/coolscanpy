@@ -241,7 +241,13 @@ def _validated_density_calibration(
     return calibration
 
 
-def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
+def _batch_frame_output(
+    batch_directory: Path,
+    selected_slot: object,
+    *,
+    frame_directory_prefix: str = "frame",
+    frame_directory_suffix: str | None = None,
+) -> Path:
     """Return one batch frame's own capture output, as the job names it.
 
     The single source of truth for the ``frame-NNN/capture.bin`` layout the
@@ -252,7 +258,10 @@ def _batch_frame_output(batch_directory: Path, selected_slot: object) -> Path:
 
     if type(selected_slot) is not int:
         raise AssertionError("validated batch frame has no selected slot")
-    return batch_directory / f"frame-{selected_slot:03d}" / "capture.bin"
+    directory_name = f"{frame_directory_prefix}-{selected_slot:03d}"
+    if frame_directory_suffix is not None:
+        directory_name += f"-{frame_directory_suffix}"
+    return batch_directory / directory_name / "capture.bin"
 
 
 def _density_source_path(output_path: Path) -> Path:
@@ -1473,6 +1482,7 @@ class PreparedCaptureBatch:
     session_id: str
     calibration_session_id: str
     density_source_path: Path
+    frame_directory_suffix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1726,17 @@ class HeldMeterResult:
     """Validated meter authority while the same child remains held."""
 
     solution: ExposureSolution
+    held_again: HeldPreviewSession
+
+
+@dataclass(frozen=True)
+class HeldFilmStatusResult:
+    """One motion-free film verdict while the same child remains held."""
+
+    film_present: bool | None
+    raw_status: str | None
+    sense_history: tuple[str, ...]
+    device_id: str | None
     held_again: HeldPreviewSession
 
 
@@ -2064,6 +2085,7 @@ class CaptureProcessAdapter:
         batch_spawner: BatchProcessSpawner = _spawn_batch_subprocess,
         batch_poll_seconds: float = 0.1,
         held_teardown_wait_seconds: float = 5.0,
+        held_status_wait_seconds: float = 20.0,
     ) -> None:
         if not _is_sha256(expected_worker_sha256):
             raise ValueError("expected worker SHA-256 is not a lowercase digest")
@@ -2107,6 +2129,9 @@ class CaptureProcessAdapter:
         if held_teardown_wait_seconds < 0:
             raise ValueError("held_teardown_wait_seconds cannot be negative")
         self._held_teardown_wait_seconds = float(held_teardown_wait_seconds)
+        if not math.isfinite(held_status_wait_seconds) or held_status_wait_seconds <= 0:
+            raise ValueError("held_status_wait_seconds must be finite and positive")
+        self._held_status_wait_seconds = float(held_status_wait_seconds)
         self._stop_requested = threading.Event()
         self._stop_gate = threading.Lock()
         self._attempt_lock = threading.Lock()
@@ -3369,7 +3394,11 @@ class CaptureProcessAdapter:
                 )
             job_path = held.hold_job_path
             session_journal_path = held.directory / "session-journal.json"
-            payload = self._batch_job_bytes(request, session_id=held.hold_session_id)
+            payload = self._batch_job_bytes(
+                request,
+                session_id=held.hold_session_id,
+                frame_directory_suffix=held.hold_session_id,
+            )
             # held.hold_session_id is this round's own (fresh, per-round)
             # identity, not the reservation-wide one this held preview's
             # density calibration is actually bound to -- see
@@ -3427,6 +3456,7 @@ class CaptureProcessAdapter:
                 # this validator looked before (live failure 2026-08-06,
                 # attempt 11: "Nikon density source artifact is missing").
                 density_source_path=held.reservation_density_source_path,
+                frame_directory_suffix=held.hold_session_id,
             )
             try:
                 self._publish_hold_ack(held, action="scan")
@@ -3513,7 +3543,7 @@ class CaptureProcessAdapter:
                             )
                         except BaseException as error:
                             try:
-                                cleanup_resume = self._validated_held_meter_resume(
+                                cleanup_resume = self._validated_next_hold_resume(
                                     held, journal.get("hold_resume")
                                 )
                             except CaptureIntegrityError:
@@ -3559,6 +3589,214 @@ class CaptureProcessAdapter:
                     )
                 if self._batch_poll_seconds:
                     time.sleep(self._batch_poll_seconds)
+
+    def film_status_held_session(
+        self,
+        held: HeldPreviewSession,
+    ) -> HeldFilmStatusResult:
+        """Ask the retained child for motion-free TEST UNIT READY status."""
+
+        if not held.usable:
+            raise HeldSessionExpired("this held preview was never resumable")
+        with self._attempt_lock:
+            if held.process.poll() is not None:
+                raise HeldSessionExpired(
+                    "the held preview's child is no longer running"
+                )
+            result_path = held.directory / f"hold-status-{held.hold_session_id}.json"
+            if os.path.lexists(result_path):
+                raise CaptureIntegrityError(
+                    "held film-status result path already exists"
+                )
+            try:
+                self._publish_hold_ack(held, action="status")
+            except OSError as error:
+                self._release_held_session_locked(held)
+                raise CaptureProcessError(
+                    f"could not publish held film-status request: {error}"
+                ) from error
+
+            deadline = time.monotonic() + self._held_status_wait_seconds
+            while True:
+                try:
+                    payload = self._read_held_film_status_result(result_path)
+                except CaptureIntegrityError as error:
+                    self._release_unreturnable_held_child(
+                        held.process,
+                        hold_ack_path=None,
+                        hold_session_id=None,
+                        error=error,
+                    )
+                    raise
+                if payload is not None:
+                    try:
+                        result, resume = self._validate_held_film_status(held, payload)
+                    except BaseException as error:
+                        try:
+                            cleanup_resume = self._validated_next_hold_resume(
+                                held, payload.get("hold_resume")
+                            )
+                        except CaptureIntegrityError:
+                            cleanup_resume = None
+                        self._release_unreturnable_held_child(
+                            held.process,
+                            hold_ack_path=(
+                                Path(cleanup_resume["hold_ack_path"])
+                                if cleanup_resume is not None
+                                else None
+                            ),
+                            hold_session_id=(
+                                cleanup_resume["hold_session_id"]
+                                if cleanup_resume is not None
+                                else None
+                            ),
+                            error=error,
+                        )
+                        raise
+                    return replace(result, held_again=replace(
+                        held,
+                        hold_job_path=Path(resume["hold_job_path"]),
+                        hold_ack_path=Path(resume["hold_ack_path"]),
+                        hold_session_id=resume["hold_session_id"],
+                    ))
+                returncode = held.process.poll()
+                if returncode is not None:
+                    raise CaptureProcessError(
+                        f"held film-status child exited {returncode} before returning to hold"
+                    )
+                if time.monotonic() >= deadline:
+                    error = CaptureProcessError(
+                        "held film-status child did not return to hold before timeout"
+                    )
+                    self._release_unreturnable_held_child(
+                        held.process,
+                        hold_ack_path=None,
+                        hold_session_id=None,
+                        error=error,
+                    )
+                    raise error
+                if self._batch_poll_seconds:
+                    time.sleep(self._batch_poll_seconds)
+
+    @staticmethod
+    def _read_held_film_status_result(path: Path) -> dict[str, Any] | None:
+        """Read one complete, regular result without following replacements."""
+
+        if not os.path.lexists(path):
+            return None
+        descriptor: int | None = None
+        try:
+            initial = path.lstat()
+            if not stat.S_ISREG(initial.st_mode):
+                raise CaptureIntegrityError(
+                    "held film-status result is not a regular file"
+                )
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino)
+                or opened.st_size > 65_536
+            ):
+                raise CaptureIntegrityError(
+                    "held film-status result file changed or is too large"
+                )
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = None
+                raw = stream.read(65_537)
+        except FileNotFoundError:
+            return None
+        except CaptureIntegrityError:
+            raise
+        except OSError as error:
+            raise CaptureIntegrityError(
+                f"held film-status result is unreadable: {error}"
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if len(raw) > 65_536:
+            raise CaptureIntegrityError("held film-status result is too large")
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            raise CaptureIntegrityError("held film-status result is not an object")
+        return payload
+
+    def _validate_held_film_status(
+        self,
+        held: HeldPreviewSession,
+        payload: dict[str, Any],
+    ) -> tuple[HeldFilmStatusResult, dict[str, str]]:
+        expected_keys = {
+            "schema_version", "status", "hold_session_id", "film_present",
+            "raw_status", "sense_history", "device_id", "unit_released",
+            "hold_resume",
+        }
+        film_present = payload.get("film_present")
+        raw_status = payload.get("raw_status")
+        sense_history = payload.get("sense_history")
+        preview = held.preview_attempt.journal
+        expected_bus = preview.get("expected_usb_bus") if isinstance(preview, dict) else None
+        expected_address = (
+            preview.get("expected_usb_address") if isinstance(preview, dict) else None
+        )
+        expected_device_id = (
+            f"usb:{expected_bus}:{expected_address}"
+            if type(expected_bus) is int and type(expected_address) is int
+            else None
+        )
+        classified = (
+            {"000000": True, "023a00": False}.get(raw_status)
+            if isinstance(raw_status, str)
+            else None
+        )
+        if (
+            set(payload) != expected_keys
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != 1
+            or payload.get("status") != "film-status-complete-held"
+            or payload.get("hold_session_id") != held.hold_session_id
+            or payload.get("unit_released") is not False
+            or (film_present is not None and type(film_present) is not bool)
+            or (raw_status is not None and (
+                not isinstance(raw_status, str)
+                or len(raw_status) != 6
+                or any(character not in "0123456789abcdef" for character in raw_status)
+            ))
+            or not isinstance(sense_history, list)
+            or any(
+                not isinstance(sense, str)
+                or len(sense) != 6
+                or any(character not in "0123456789abcdef" for character in sense)
+                for sense in sense_history
+            )
+            or (sense_history and sense_history[-1] != raw_status)
+            or film_present is not classified
+            or expected_device_id is None
+            or payload.get("device_id") != expected_device_id
+        ):
+            raise CaptureIntegrityError("held film-status result is malformed")
+        resume = self._validated_next_hold_resume(held, payload.get("hold_resume"))
+        return (
+            HeldFilmStatusResult(
+                film_present=film_present,
+                raw_status=raw_status,
+                sense_history=tuple(sense_history),
+                device_id=expected_device_id,
+                held_again=held,
+            ),
+            resume,
+        )
 
     def _validate_held_meter_result(
         self,
@@ -3628,7 +3866,7 @@ class CaptureProcessAdapter:
             )
         ):
             raise CaptureIntegrityError("held meter evidence bytes changed")
-        resume = self._validated_held_meter_resume(held, journal.get("hold_resume"))
+        resume = self._validated_next_hold_resume(held, journal.get("hold_resume"))
         return (
             ExposureSolution(
                 slot=int(frame.selected_slot),
@@ -3699,7 +3937,7 @@ class CaptureProcessAdapter:
         return None
 
     @staticmethod
-    def _validated_held_meter_resume(
+    def _validated_next_hold_resume(
         held: HeldPreviewSession,
         resume: Any,
     ) -> dict[str, str]:
@@ -3710,7 +3948,7 @@ class CaptureProcessAdapter:
             or not isinstance(resume.get("hold_job_path"), str)
             or not isinstance(resume.get("hold_ack_path"), str)
         ):
-            raise CaptureIntegrityError("held meter result has no fresh hold rendezvous")
+            raise CaptureIntegrityError("held result has no fresh hold rendezvous")
         next_session_id = resume["hold_session_id"]
         directory = held.directory.resolve()
         job_path = Path(resume["hold_job_path"])
@@ -3726,7 +3964,7 @@ class CaptureProcessAdapter:
             or ack_path.parent != directory
             or ack_path.name != f"hold-ack-{next_session_id}.json"
         ):
-            raise CaptureIntegrityError("held meter rendezvous is not path-confined")
+            raise CaptureIntegrityError("held rendezvous is not path-confined")
         return resume
 
     def release_held_session(self, held: HeldPreviewSession) -> dict[str, Any]:
@@ -4236,29 +4474,30 @@ class CaptureProcessAdapter:
         *,
         session_id: str,
         frame_directory_prefix: str = "frame",
+        frame_directory_suffix: str | None = None,
     ) -> bytes:
-        frames = [
-            {
-                "ack": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/"
-                    "parent-ack.json"
-                ),
+        frames = []
+        for frame in request.frames:
+            directory_name = _batch_frame_output(
+                Path("."),
+                frame.selected_slot,
+                frame_directory_prefix=frame_directory_prefix,
+                frame_directory_suffix=frame_directory_suffix,
+            ).parent.as_posix()
+            frames.append({
+                "ack": f"{directory_name}/parent-ack.json",
                 "boundary_offset_rows": frame.boundary_offset_rows,
                 "journal": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/journal.json"
+                    f"{directory_name}/journal.json"
                 ),
                 "manual_review_approval": (
                     None
                     if frame.manual_review_approval is None
                     else frame.manual_review_approval.to_payload()
                 ),
-                "output": (
-                    f"{frame_directory_prefix}-{frame.selected_slot:03d}/capture.bin"
-                ),
+                "output": f"{directory_name}/capture.bin",
                 "slot": frame.selected_slot,
-            }
-            for frame in request.frames
-        ]
+            })
         job = {
             "apply_all_boundary_offsets_before_first_frame": True,
             "capture_plan_sha256": CANONICAL_PLAN_SHA256,
@@ -4340,7 +4579,9 @@ class CaptureProcessAdapter:
         request: CaptureRequest,
     ) -> AttemptPaths:
         output = _batch_frame_output(
-            prepared.paths.directory, request.selected_slot
+            prepared.paths.directory,
+            request.selected_slot,
+            frame_directory_suffix=prepared.frame_directory_suffix,
         )
         directory = output.parent
         return AttemptPaths(
