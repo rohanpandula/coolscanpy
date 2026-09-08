@@ -28,6 +28,11 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-07 (HW-07): worker.py derives the 1-sample fine READ
+    # length and binds the selected USB identity; capture_process.py validates
+    # the derived byte total and carries that identity; packed.py admits the
+    # derived record geometry and validates its observed trailing pad. No wire
+    # resource, plan, or continuation template changed.
     # Resealed 2026-09-07 (HW-08): meter.py's IR pass-linearity correlation
     # check gained its own, looser floor (LINEARITY_CORRELATION_MIN_IR =
     # 0.95) instead of sharing R/G/B's 0.98 gate, plus a recorded
@@ -55,12 +60,12 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # is_attended_roll_binding; worker.py gained the attended branch of the
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
-    "capture_process.py": "1d81b94ed76e3a1e3704f60915d21b3bad2d510fe124cd0033de81fde4101b26",
-    "worker.py": "7a204abf4b97231a44f55ebb04c2eff784e2aa737480c5acd946022339c29ff0",
+    "capture_process.py": "5861212d175a4869699a0385e11237582f1eb1fd34556e2f6f165b1c28db4539",
+    "worker.py": "710be2217b11112e1f0f9c1af7c2b144feed8c7be0bb222553507fea51c12cfc",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
-    "packed.py": "abff893d6ec5ff36aa33be86ef401a28ffbd6054e2279129e8fb88d7f650b435",
+    "packed.py": "4388e6667ccdb8a1fba9ee4325a2913eee8b3965de13f81f0975afd1eacaadba",
     "streaming_sidecar.py": "81ca79a72b37dee579d57be07bd00f59f6e7843a43710bab1811d8b9a94dffb7",
     "continuation_plan.py": "bfdebfaa28075c708f3e8ef070083edce36a28b497bba622173cbb6d1466a282",
     "meter.py": "35adb86c43ccae29584768d929c253d595d0547b33dd0d0b784d2601b1ded9d6",

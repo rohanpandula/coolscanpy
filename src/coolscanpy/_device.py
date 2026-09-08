@@ -455,7 +455,13 @@ def open(devname: str, *, allow_unverified: bool = False) -> "Device":
 
     _register_open_device(info.id)
     try:
-        return Device(info, _service_factory())
+        return Device(
+            info,
+            _service_factory(),
+            allow_unverified=(
+                allow_unverified and info.model in _UNVERIFIED_DIRECT_USB_MODELS
+            ),
+        )
     except BaseException:
         _unregister_open_device(info.id)
         raise
@@ -469,9 +475,16 @@ class Device:
     device enumeration.
     """
 
-    def __init__(self, info: DeviceInfo, service: ScannerService) -> None:
+    def __init__(
+        self,
+        info: DeviceInfo,
+        service: ScannerService,
+        *,
+        allow_unverified: bool = False,
+    ) -> None:
         self._info = info
         self._service = service
+        self._allow_unverified = allow_unverified
         self._lock = threading.Lock()
         self._roll_lock = threading.Lock()
         self._state_lock = threading.RLock()
@@ -489,6 +502,21 @@ class Device:
         self.samples = 1
         self.autofocus = True
         self.auto_exposure = False
+
+    def _capture_identity(self) -> tuple[int, int, str, bool]:
+        products = _NIKON_COOLSCAN_USB_MODELS[_LS5000_USB_VENDOR_ID]
+        product_id = next(
+            (candidate for candidate, model in products.items() if model == self._info.model),
+            None,
+        )
+        if product_id is None:
+            raise ValueError(f"{self._info.model} has no direct-USB capture identity")
+        return (
+            _LS5000_USB_VENDOR_ID,
+            product_id,
+            self._info.model,
+            self._allow_unverified,
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         if name in _OPTION_NAMES:

@@ -74,6 +74,7 @@ from .meter import (
     verify_final_convergence,
 )
 from .plan import CANONICAL_PLAN_SHA256, canonical_plan_bytes, load_canonical_plan
+from .packed import SINGLE_SAMPLE_RECORD_BYTES
 from .roll_index import (
     IndexDecodeError,
     IndexGeometry,
@@ -113,6 +114,7 @@ NIKON_COOLSCAN_USB_PRODUCTS = {
     0x4001: "LS-50 ED",
     0x4002: "LS-5000 ED",
 }
+CANONICAL_SCANNER_PRODUCT_ID = 0x4002
 CANONICAL_SCANNER_PRODUCT = "LS-5000 ED"
 READY_POLL_SECONDS = 0.1
 READY_POLL_DEADLINE_SECONDS = 120.0
@@ -566,6 +568,10 @@ class LiveBatchJob:
     # untrusted job JSON by load_validated_batch_job; 4 keeps every traced
     # byte, 1 patches the fine SET_WINDOW multi-read byte before preflight.
     samples_per_scan: int = TRACED_SAMPLES_PER_SCAN
+    expected_usb_vendor_id: int = NIKON_USB_VENDOR_ID
+    expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID
+    expected_scanner_model: str = CANONICAL_SCANNER_PRODUCT
+    allow_unverified: bool = False
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -2034,6 +2040,24 @@ def _validate_boundary_offset(frame: int, offset_rows: int) -> None:
         )
 
 
+def _validate_expected_usb_identity(
+    vendor_id: object,
+    product_id: object,
+    model: object,
+    allow_unverified: object,
+) -> None:
+    if vendor_id != NIKON_USB_VENDOR_ID:
+        raise ProtocolError("expected USB vendor must be Nikon 04b0")
+    if not isinstance(product_id, int) or isinstance(product_id, bool):
+        raise ProtocolError("expected USB product id must be an integer")
+    if NIKON_COOLSCAN_USB_PRODUCTS.get(product_id) != model:
+        raise ProtocolError("expected USB product id and scanner model disagree")
+    if not isinstance(allow_unverified, bool):
+        raise ProtocolError("allow_unverified must be a boolean")
+    if allow_unverified != (product_id != CANONICAL_SCANNER_PRODUCT_ID):
+        raise ProtocolError("allow_unverified does not match the selected scanner identity")
+
+
 def load_validated_batch_job(
     path: Path,
     *,
@@ -2076,8 +2100,12 @@ def load_validated_batch_job(
         "session_contract": "one-process-one-reservation",
     }
     expected_keys = set(expected_top_level) | {
+        "allow_unverified",
+        "expected_scanner_model",
         "expected_usb_address",
         "expected_usb_bus",
+        "expected_usb_product_id",
+        "expected_usb_vendor_id",
         "exposure_override_10ns",
         "frames",
         "manual_boundary_rows",
@@ -2187,6 +2215,16 @@ def load_validated_batch_job(
         or not 1 <= expected_usb_address <= 127
     ):
         raise ProtocolError("batch expected USB address must be an integer in 1..127")
+    expected_usb_vendor_id = payload.get("expected_usb_vendor_id")
+    expected_usb_product_id = payload.get("expected_usb_product_id")
+    expected_scanner_model = payload.get("expected_scanner_model")
+    allow_unverified = payload.get("allow_unverified")
+    _validate_expected_usb_identity(
+        expected_usb_vendor_id,
+        expected_usb_product_id,
+        expected_scanner_model,
+        allow_unverified,
+    )
     raw_frames = payload.get("frames")
     if not isinstance(raw_frames, list) or not raw_frames:
         raise ProtocolError("batch job must contain at least one frame")
@@ -2285,6 +2323,10 @@ def load_validated_batch_job(
         exposure_override_10ns=exposure_override_10ns,
         manual_boundary_rows=manual_boundary_rows,
         samples_per_scan=samples_per_scan,
+        expected_usb_vendor_id=expected_usb_vendor_id,
+        expected_usb_product_id=expected_usb_product_id,
+        expected_scanner_model=expected_scanner_model,
+        allow_unverified=allow_unverified,
     )
 
 
@@ -3191,6 +3233,38 @@ def _patch_samples_contract(
         entry["expected_data_in"] = payload
 
 
+def _patch_fine_read_contract(plan: list[dict], samples_per_scan: int) -> None:
+    """Size the fine READ from the sample count commanded in SET_WINDOW."""
+
+    if (
+        isinstance(samples_per_scan, bool)
+        or not isinstance(samples_per_scan, int)
+        or samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN
+    ):
+        raise ProtocolError(
+            f"samples_per_scan {samples_per_scan!r} is not one of "
+            f"{SUPPORTED_SAMPLES_PER_SCAN}"
+        )
+    matches = [entry for entry in plan if entry.get("role") == "fine-rgbi4-template"]
+    if len(matches) != 1:
+        raise ProtocolError("plan must contain exactly one fine-rgbi4-template")
+    target = matches[0]
+    if samples_per_scan == TRACED_SAMPLES_PER_SCAN:
+        return
+    request_len = SINGLE_SAMPLE_RECORD_BYTES
+    cdb = bytearray.fromhex(target.get("cdb", ""))
+    if len(cdb) != 10 or cdb[0] != 0x28:
+        raise ProtocolError("fine READ template has an invalid CDB")
+    cdb[6:9] = request_len.to_bytes(3, "big")
+    target["cdb"] = bytes(cdb).hex()
+    target["request_len"] = request_len
+    target["request_parts"] = [request_len]
+    if "minimum_data_in" in target:
+        target["minimum_data_in"] = request_len
+    if bytes.fromhex(target["cdb"])[6:9] != request_len.to_bytes(3, "big"):
+        raise ProtocolError("fine READ transfer length patch did not verify")
+
+
 def _patch_exposure_contract(
     plan: list[dict],
     set_sequences: tuple[int, ...],
@@ -3572,7 +3646,7 @@ def _find_ls5000_usb_device(
             )
             or ()
         )
-        if getattr(device, "idProduct", 0x4002) == product_id
+        if getattr(device, "idProduct", None) == product_id
     )
     matches = tuple(
         device
@@ -3593,6 +3667,7 @@ def _connect_device(
     *,
     expected_usb_bus: int | None = None,
     expected_usb_address: int | None = None,
+    expected_scanner_product: str = CANONICAL_SCANNER_PRODUCT,
 ):
     import usb.core
     import usb.util
@@ -3601,9 +3676,7 @@ def _connect_device(
 
     device = _find_ls5000_usb_device(
         usb.core,
-        expected_product=(
-            None if expected_usb_bus is not None else CANONICAL_SCANNER_PRODUCT
-        ),
+        expected_product=expected_scanner_product,
         expected_bus=expected_usb_bus,
         expected_address=expected_usb_address,
         backend=get_libusb_backend(),
@@ -4882,6 +4955,13 @@ def _run_live_continuation_frame(
     target = validate_plan(plan)
     if continuation_plan_sha256 != CANONICAL_CONTINUATION_PLAN_SHA256:
         raise ProtocolError("continuation plan digest is not canonical")
+    active_plan = _bind_plan_to_live_selection(plan, selection)
+    active_target = next(
+        entry for entry in active_plan if entry.get("role") == "fine-rgbi4-template"
+    )
+    active_target.update(target)
+    _patch_fine_read_contract(active_plan, _batch_samples_per_scan(batch_job))
+    target = active_target
     expected_bytes = EXPECTED_FINE_READS * target["request_len"]
     output_path = frame_spec.output
     journal_path = frame_spec.journal
@@ -4905,7 +4985,6 @@ def _run_live_continuation_frame(
         raise ProtocolError(
             "continuation frame does not match its prevalidated batch selection"
         )
-    active_plan = _bind_plan_to_live_selection(plan, selection)
     initial_wire_exposures = _patch_exposure_contract(
         active_plan,
         DYNAMIC_WINDOW_GROUPS[0],
@@ -4939,8 +5018,13 @@ def _run_live_continuation_frame(
         "capture_mode": "full",
         "expected_usb_bus": batch_job.expected_usb_bus,
         "expected_usb_address": batch_job.expected_usb_address,
+        "expected_usb_vendor_id": batch_job.expected_usb_vendor_id,
+        "expected_usb_product_id": batch_job.expected_usb_product_id,
+        "expected_scanner_model": batch_job.expected_scanner_model,
         "actual_usb_bus": actual_usb_bus,
         "actual_usb_address": actual_usb_address,
+        "actual_usb_vendor_id": batch_job.expected_usb_vendor_id,
+        "actual_usb_product_id": batch_job.expected_usb_product_id,
         "requested_frame": frame_spec.slot,
         "expected_frame_count": None,
         "requested_boundary_offset_rows": frame_spec.boundary_offset_rows,
@@ -5508,6 +5592,11 @@ def run_live_capture(
     expected_frame_count: int | None = None,
     expected_usb_bus: int | None = None,
     expected_usb_address: int | None = None,
+    expected_usb_vendor_id: int = NIKON_USB_VENDOR_ID,
+    expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID,
+    expected_scanner_model: str = CANONICAL_SCANNER_PRODUCT,
+    allow_unverified: bool = False,
+    samples_per_scan: int = TRACED_SAMPLES_PER_SCAN,
     batch_job: LiveBatchJob | None = None,
     continuation_plan: dict[str, Any] | None = None,
     continuation_plan_sha256: str | None = None,
@@ -5516,6 +5605,19 @@ def run_live_capture(
     hold_job_path: Path | None = None,
 ) -> None:
     target = validate_plan(plan)
+    _validate_expected_usb_identity(
+        expected_usb_vendor_id,
+        expected_usb_product_id,
+        expected_scanner_model,
+        allow_unverified,
+    )
+    if samples_per_scan not in SUPPORTED_SAMPLES_PER_SCAN or isinstance(
+        samples_per_scan, bool
+    ):
+        raise ProtocolError(
+            f"samples_per_scan {samples_per_scan!r} is not one of "
+            f"{SUPPORTED_SAMPLES_PER_SCAN}"
+        )
     if meter_only and preview_only:
         raise ProtocolError("live capture cannot be both meter-only and preview-only")
     if preview_and_hold and (meter_only or preview_only):
@@ -5606,6 +5708,15 @@ def run_live_capture(
             or expected_usb_address != batch_job.expected_usb_address
         ):
             raise ProtocolError("live batch USB topology does not match its job")
+        if (
+            expected_usb_vendor_id != batch_job.expected_usb_vendor_id
+            or expected_usb_product_id != batch_job.expected_usb_product_id
+            or expected_scanner_model != batch_job.expected_scanner_model
+            or allow_unverified != batch_job.allow_unverified
+        ):
+            raise ProtocolError("live batch USB identity does not match its job")
+        if samples_per_scan != batch_job.samples_per_scan:
+            raise ProtocolError("live batch sample count does not match its job")
         derive_equivalent_continuation_blocks(continuation_plan)
         first_spec = batch_job.frames[0]
         if (
@@ -5692,6 +5803,14 @@ def run_live_capture(
     if meter_sidecar_path is not None and meter_sidecar_path.exists():
         raise ProtocolError(f"refusing to overwrite {meter_sidecar_path}")
 
+    active_plan = [dict(entry) for entry in plan]
+    active_target = next(
+        entry for entry in active_plan if entry.get("role") == "fine-rgbi4-template"
+    )
+    active_target.update(target)
+    active_samples_per_scan = samples_per_scan
+    _patch_fine_read_contract(active_plan, active_samples_per_scan)
+    target = active_target
     expected_bytes = (
         0
         if preview_only or preview_and_hold
@@ -5729,6 +5848,10 @@ def run_live_capture(
         "expected_frame_count": expected_frame_count,
         "expected_usb_bus": expected_usb_bus,
         "expected_usb_address": expected_usb_address,
+        "expected_usb_vendor_id": expected_usb_vendor_id,
+        "expected_usb_product_id": expected_usb_product_id,
+        "expected_scanner_model": expected_scanner_model,
+        "allow_unverified": allow_unverified,
         "actual_usb_bus": None,
         "actual_usb_address": None,
         "requested_boundary_offset_rows": boundary_offset_rows,
@@ -5804,6 +5927,10 @@ def run_live_capture(
             ),
             "expected_usb_bus": expected_usb_bus,
             "expected_usb_address": expected_usb_address,
+            "expected_usb_vendor_id": expected_usb_vendor_id,
+            "expected_usb_product_id": expected_usb_product_id,
+            "expected_scanner_model": expected_scanner_model,
+            "allow_unverified": allow_unverified,
             "actual_usb_bus": None,
             "actual_usb_address": None,
             "reservation_acquired": False,
@@ -5849,21 +5976,30 @@ def run_live_capture(
     density_evidence: NikonDensityEvidence | None = None
     try:
         if expected_usb_bus is None:
-            device, interface, ep_out, ep_in, usb_util = _connect_device()
+            device, interface, ep_out, ep_in, usb_util = _connect_device(
+                expected_scanner_product=expected_scanner_model
+            )
         else:
             device, interface, ep_out, ep_in, usb_util = _connect_device(
                 expected_usb_bus=expected_usb_bus,
                 expected_usb_address=expected_usb_address,
+                expected_scanner_product=expected_scanner_model,
             )
         actual_usb_bus = getattr(device, "bus", None)
         actual_usb_address = getattr(device, "address", None)
-        actual_usb_product = getattr(device, "idProduct", 0x4002)
-        expected_scanner_product = NIKON_COOLSCAN_USB_PRODUCTS.get(actual_usb_product)
-        if expected_scanner_product is None:
+        actual_usb_product = getattr(device, "idProduct", None)
+        if not isinstance(actual_usb_product, int) or isinstance(actual_usb_product, bool):
+            raise ProtocolError("connected USB device did not report a product id")
+        actual_scanner_product = NIKON_COOLSCAN_USB_PRODUCTS.get(actual_usb_product)
+        if actual_scanner_product is None:
             raise ProtocolError(
                 f"connected USB product 04b0:{actual_usb_product:04x} is not a recognized Coolscan"
             )
-        allow_unverified = expected_scanner_product != CANONICAL_SCANNER_PRODUCT
+        if (
+            actual_usb_product != expected_usb_product_id
+            or actual_scanner_product != expected_scanner_model
+        ):
+            raise ProtocolError("connected USB product does not match the selected scanner")
         if expected_usb_bus is not None and (
             isinstance(actual_usb_bus, bool)
             or not isinstance(actual_usb_bus, int)
@@ -5878,12 +6014,14 @@ def run_live_capture(
             )
         journal["actual_usb_bus"] = actual_usb_bus
         journal["actual_usb_address"] = actual_usb_address
-        journal["allow_unverified"] = allow_unverified
+        journal["actual_usb_vendor_id"] = expected_usb_vendor_id
+        journal["actual_usb_product_id"] = actual_usb_product
         if session_journal is not None:
             assert session_journal_path is not None
             session_journal["actual_usb_bus"] = actual_usb_bus
             session_journal["actual_usb_address"] = actual_usb_address
-            session_journal["allow_unverified"] = allow_unverified
+            session_journal["actual_usb_vendor_id"] = expected_usb_vendor_id
+            session_journal["actual_usb_product_id"] = actual_usb_product
             _write_journal(session_journal_path, session_journal)
         journal["status"] = "preamble"
         journal["endpoint_out"] = f"0x{ep_out.bEndpointAddress:02x}"
@@ -5900,7 +6038,6 @@ def run_live_capture(
             fine_output_path = output_path
             if meter_sidecar_path is not None:
                 meter_output = meter_sidecar_path.open("xb")
-            active_plan = [dict(entry) for entry in plan]
             preamble = active_plan[:-1]
             geometry = _derive_index_geometry(active_plan)
             preview_binding = PreviewTraversalBinding(
@@ -5970,7 +6107,7 @@ def run_live_capture(
                         ],
                         expected_origin=live_selection.selected.native_origin,
                         expected_exposures=final_wire_exposures,
-                        expected_samples_per_scan=_batch_samples_per_scan(batch_job),
+                        expected_samples_per_scan=active_samples_per_scan,
                     )
                     journal["fine_set_windows_preflight"] = [
                         {
@@ -6083,7 +6220,7 @@ def run_live_capture(
                 if entry["seq"] == 1:
                     scanner_identity = _validate_scanner_identity(
                         result.payload,
-                        expected_product=expected_scanner_product,
+                        expected_product=expected_scanner_model,
                     )
                     journal["scanner_identity"] = scanner_identity
                     if session_journal is not None and session_journal_path is not None:
@@ -6418,6 +6555,19 @@ def run_live_capture(
                             )
                         derive_equivalent_continuation_blocks(continuation_plan)
                         batch_job = loaded_batch_job
+                        if (
+                            batch_job.expected_usb_vendor_id
+                            != expected_usb_vendor_id
+                            or batch_job.expected_usb_product_id
+                            != expected_usb_product_id
+                            or batch_job.expected_scanner_model
+                            != expected_scanner_model
+                            or batch_job.allow_unverified != allow_unverified
+                        ):
+                            raise ProtocolError(
+                                "resumed batch USB identity does not match held preview"
+                            )
+                        active_samples_per_scan = batch_job.samples_per_scan
                         batch_mode = True
                         first_spec = batch_job.frames[0]
                         frame = first_spec.slot
@@ -6425,6 +6575,10 @@ def run_live_capture(
                         journal["hold_outcome"] = "resumed-as-batch"
                         _write_journal(journal_path, journal)
 
+                        _patch_fine_read_contract(
+                            active_plan, active_samples_per_scan
+                        )
+                        target = active_plan[-1]
                         expected_bytes = read_count * target["request_len"]
                         meter_sidecar_path = _full_capture_meter_path(
                             first_spec.output
@@ -6966,11 +7120,9 @@ def run_live_capture(
                                 active_plan,
                                 DYNAMIC_WINDOW_GROUPS[-1],
                                 FINE_GET_WINDOW_SEQUENCES,
-                                _batch_samples_per_scan(batch_job),
+                                active_samples_per_scan,
                             )
-                            journal["fine_samples_per_scan"] = _batch_samples_per_scan(
-                                batch_job
-                            )
+                            journal["fine_samples_per_scan"] = active_samples_per_scan
                             final_wire_exposures = dict(final_wire)
                             journal["meter_final_exposures"] = {
                                 "controller_channels_raw_10ns": dict(
@@ -7093,7 +7245,7 @@ def run_live_capture(
                     fine_window_payloads,
                     expected_origin=fine_origin,
                     expected_exposures=expected_exposures,
-                    expected_samples_per_scan=_batch_samples_per_scan(batch_job),
+                    expected_samples_per_scan=active_samples_per_scan,
                 )
             journal["fine_windows"] = [
                 {
@@ -7793,6 +7945,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--samples-per-scan",
+        type=int,
+        choices=SUPPORTED_SAMPLES_PER_SCAN,
+        default=TRACED_SAMPLES_PER_SCAN,
+    )
+    parser.add_argument(
         "--confirm-full-capture",
         action="store_true",
         help="required with --reads 2980",
@@ -7831,6 +7989,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         type=int,
         help="exact local USB address parsed from the reviewed SANE device id",
     )
+    parser.add_argument("--expected-usb-vendor-id", type=lambda value: int(value, 0))
+    parser.add_argument("--expected-usb-product-id", type=lambda value: int(value, 0))
+    parser.add_argument("--expected-scanner-model")
+    parser.add_argument("--allow-unverified", action="store_true")
     parser.add_argument(
         "--expected-capture-bundle-sha256",
         help="parent-pinned packaged capture bundle identity for this live child",
@@ -7902,6 +8064,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             or args.expected_frame_count is not None
             or args.expected_usb_bus is not None
             or args.expected_usb_address is not None
+            or args.expected_usb_vendor_id is not None
+            or args.expected_usb_product_id is not None
+            or args.expected_scanner_model is not None
+            or args.allow_unverified
+            or args.samples_per_scan != TRACED_SAMPLES_PER_SCAN
             or args.meter_only
             or args.preview_only
             or args.preview_and_hold
@@ -7957,6 +8124,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             session_journal_path=args.session_journal,
             expected_usb_bus=batch_job.expected_usb_bus,
             expected_usb_address=batch_job.expected_usb_address,
+            expected_usb_vendor_id=batch_job.expected_usb_vendor_id,
+            expected_usb_product_id=batch_job.expected_usb_product_id,
+            expected_scanner_model=batch_job.expected_scanner_model,
+            allow_unverified=batch_job.allow_unverified,
+            samples_per_scan=batch_job.samples_per_scan,
         )
         return
     if args.preview_and_hold:
@@ -8012,6 +8184,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             continuation_plan_sha256=continuation_plan_sha256,
             expected_usb_bus=args.expected_usb_bus,
             expected_usb_address=args.expected_usb_address,
+            expected_usb_vendor_id=(
+                NIKON_USB_VENDOR_ID
+                if args.expected_usb_vendor_id is None
+                else args.expected_usb_vendor_id
+            ),
+            expected_usb_product_id=(
+                CANONICAL_SCANNER_PRODUCT_ID
+                if args.expected_usb_product_id is None
+                else args.expected_usb_product_id
+            ),
+            expected_scanner_model=(
+                CANONICAL_SCANNER_PRODUCT
+                if args.expected_scanner_model is None
+                else args.expected_scanner_model
+            ),
+            allow_unverified=args.allow_unverified,
+            samples_per_scan=args.samples_per_scan,
         )
         return
     if args.continuation_plan is not None:
@@ -8081,6 +8270,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         expected_frame_count=args.expected_frame_count,
         expected_usb_bus=args.expected_usb_bus,
         expected_usb_address=args.expected_usb_address,
+        expected_usb_vendor_id=(
+            NIKON_USB_VENDOR_ID
+            if args.expected_usb_vendor_id is None
+            else args.expected_usb_vendor_id
+        ),
+        expected_usb_product_id=(
+            CANONICAL_SCANNER_PRODUCT_ID
+            if args.expected_usb_product_id is None
+            else args.expected_usb_product_id
+        ),
+        expected_scanner_model=(
+            CANONICAL_SCANNER_PRODUCT
+            if args.expected_scanner_model is None
+            else args.expected_scanner_model
+        ),
+        allow_unverified=args.allow_unverified,
+        samples_per_scan=args.samples_per_scan,
     )
 
 

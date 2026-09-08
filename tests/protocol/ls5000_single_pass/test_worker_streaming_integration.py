@@ -811,7 +811,7 @@ def _drive_two_frame_batch(
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=1, address=2),
+            SimpleNamespace(bus=1, address=2, idProduct=0x4002),
             interface,
             ep_out,
             ep_in,

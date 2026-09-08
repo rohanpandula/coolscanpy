@@ -329,6 +329,9 @@ class _DeviceDouble:
     def _release_roll_lock(self) -> None:
         pass
 
+    def _capture_identity(self) -> tuple[int, int, str, bool]:
+        return 0x04B0, 0x4002, "LS-5000 ED", False
+
     def _mark_fault_if_cleanup_error(self, error: BaseException) -> None:
         del error
 
@@ -422,7 +425,7 @@ def _install_fake_hardware(
         worker_module,
         "_connect_device",
         lambda **_kwargs: (
-            SimpleNamespace(bus=2, address=11),
+            SimpleNamespace(bus=2, address=11, idProduct=0x4002),
             SimpleNamespace(bInterfaceNumber=0),
             SimpleNamespace(bEndpointAddress=0x01),
             SimpleNamespace(bEndpointAddress=0x82),
