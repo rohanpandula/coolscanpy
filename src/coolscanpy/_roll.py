@@ -37,7 +37,7 @@ import time
 import weakref
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 from uuid import uuid4
 
 import numpy as np
@@ -85,6 +85,7 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     HeldSessionExpired,
     ManualFrameApproval,
     POWER_CYCLE_RECOVERY,
+    SkippedBatchFrame,
 )
 from coolscanpy.protocol.ls5000_single_pass.density import (
     NikonDensityEvidence,
@@ -1137,7 +1138,9 @@ class Roll:
         except CaptureStopped as error:
             raise SafeStopRequested(str(error)) from error
         except BaseException as error:
-            if not io_acquired:
+            if not io_acquired or (
+                held.process.poll() is None and not held.hold_ack_path.exists()
+            ):
                 with self._state_condition:
                     self._held_session = held
             self._preserve_evidence(f"held exposure solve failed: {error}")
@@ -1179,6 +1182,10 @@ class Roll:
         exposure_override_10ns: tuple[int, int, int] | None = None,
         eject_after: bool = False,
         samples_per_scan: int = 4,
+        allowed_meter_refusal_slots: Iterable[int] = (),
+        on_meter_refusal_skipped: (
+            Callable[[int, MeterControllerRefused], None] | None
+        ) = None,
     ) -> Iterator[Frame]:
         """One continuous transport reservation for the whole ordered
         ``slots`` list, yielding a Frame as each completes.
@@ -1250,6 +1257,14 @@ class Roll:
         explicit ``applied`` flag; ``receipt.exposure`` itself reflects the
         forced ticks actually used.
 
+        ``allowed_meter_refusal_slots`` is an exact, default-empty allowlist
+        for known blank frames. Only a structured meter-controller refusal
+        for one of those slots may continue after the worker drains the meter
+        scan and reaches READY; transport, feed, recovery, and generic
+        metering failures still stop. ``on_meter_refusal_skipped`` receives
+        the skipped slot and its typed refusal before the parent authorizes
+        the next frame. If that callback raises, the batch stops.
+
         Only ``Material.COLOR_NEGATIVE`` (single-pass RGBI4) is implemented;
         a ``Material.BLACK_AND_WHITE_NEGATIVE`` Roll raises
         ``NotImplementedError`` here (see the module docstring). Argument
@@ -1271,6 +1286,24 @@ class Roll:
                 raise ValueError(
                     "batch scanner slots must be unique and strictly increasing"
                 )
+            allowed_skips = tuple(allowed_meter_refusal_slots)
+            if any(
+                isinstance(slot, bool) or not isinstance(slot, int)
+                for slot in allowed_skips
+            ):
+                raise TypeError("allowed meter-refusal slots must be integers")
+            if (
+                tuple(sorted(set(allowed_skips))) != allowed_skips
+                or not set(allowed_skips).issubset(ordered_slots)
+            ):
+                raise ValueError(
+                    "allowed meter-refusal slots must be a unique sorted subset "
+                    "of scan_many slots"
+                )
+            if on_meter_refusal_skipped is not None and not callable(
+                on_meter_refusal_skipped
+            ):
+                raise TypeError("on_meter_refusal_skipped must be callable")
         _validate_exposure_override_10ns(exposure_override_10ns)
         _validate_samples_per_scan(samples_per_scan)
 
@@ -1366,6 +1399,7 @@ class Roll:
                 expected_usb_product_id=product_id,
                 expected_scanner_model=model,
                 allow_unverified=allow_unverified,
+                allowed_meter_refusal_slots=allowed_skips,
                 # Rung 4 (FEEDING-UX-LADDER-OVERNIGHT-20260807.md): the same
                 # computation RollPreviewSession.to_json() already uses to
                 # decide whether ITS OWN provenance is a manual session's
@@ -1406,6 +1440,7 @@ class Roll:
                 exposure_override_10ns,
                 eject_after,
                 held,
+                on_meter_refusal_skipped,
             )
             owned = self._reserve_batch_locked(iterator)
             self._pending_held_session = held
@@ -1420,6 +1455,9 @@ class Roll:
         exposure_override_10ns: tuple[int, int, int] | None = None,
         eject_after: bool = False,
         held: HeldPreviewSession | None = None,
+        on_meter_refusal_skipped: (
+            Callable[[int, MeterControllerRefused], None] | None
+        ) = None,
     ) -> Iterator[Frame]:
         if self._stop_event.is_set():
             raise SafeStopRequested(
@@ -1447,6 +1485,16 @@ class Roll:
         # put(), which is exactly the "~2 frames in flight" bound this
         # queue exists to enforce.
         frame_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=1)
+
+        def terminal_action(slot: int) -> BatchAckAction:
+            if self._stop_event.is_set():
+                return BatchAckAction.STOP
+            if slot == slots[-1]:
+                if eject_after:
+                    return BatchAckAction.EJECT
+                if held is not None:
+                    return BatchAckAction.CONTINUE_HOLD
+            return BatchAckAction.CONTINUE
 
         def frame_handler(attempt_result: Any) -> BatchAckAction:
             nonlocal density_preview_evidence, produced_count
@@ -1517,25 +1565,15 @@ class Roll:
             # Blocks until the consumer (or an abandonment drain) makes
             # room -- this, not a size counter, is the backpressure.
             frame_queue.put(("frame", frame))
-            if self._stop_event.is_set():
-                # A requested safe-stop always wins: ending early is not
-                # "done with this roll," so it releases plainly and never
-                # ejects, regardless of eject_after.
-                return BatchAckAction.STOP
-            if frame.slot == slots[-1]:
-                if eject_after:
-                    return BatchAckAction.EJECT
-                if held is not None:
-                    # This batch resumed a held reservation and the
-                    # operator asked for neither a safe-stop nor an eject:
-                    # the vendor-traced default is to keep the reservation
-                    # held rather than release it, so a later scan_many()/
-                    # scan() can resume it again without a refeed -- see
-                    # this method's own docstring. A cold batch (no
-                    # preceding preview()) has nothing to hold open and
-                    # keeps today's plain release here, unchanged.
-                    return BatchAckAction.CONTINUE_HOLD
-            return BatchAckAction.CONTINUE
+            return terminal_action(frame.slot)
+
+        def skip_handler(skipped: SkippedBatchFrame) -> BatchAckAction:
+            slot = skipped.request.selected_slot
+            if slot is None:
+                raise BatchIntegrityError("skipped batch frame lost its slot")
+            if on_meter_refusal_skipped is not None:
+                on_meter_refusal_skipped(slot, skipped.refusal)
+            return terminal_action(slot)
 
         def run_batch() -> None:
             try:
@@ -1544,11 +1582,16 @@ class Roll:
                         self._pending_held_session = None
                     if held is not None and held.usable:
                         result = adapter.resume_held_session(
-                            held, batch_request, frame_handler=frame_handler
+                            held,
+                            batch_request,
+                            frame_handler=frame_handler,
+                            skip_handler=skip_handler,
                         )
                     else:
                         result = adapter.run_batch_session(
-                            batch_request, frame_handler=frame_handler
+                            batch_request,
+                            frame_handler=frame_handler,
+                            skip_handler=skip_handler,
                         )
                 except HeldSessionExpired:
                     # Fail-closed per the held-session contract: a dead or

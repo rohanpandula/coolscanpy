@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Sequence
@@ -52,6 +52,7 @@ from coolscanpy.protocol.ls5000_single_pass.capture_process import (
     CaptureIntegrityError,
     CaptureOutcome,
     CaptureProcessAdapter,
+    CaptureProcessError,
     CaptureRequest,
     HeldPreviewSession,
     ManualFrameApproval,
@@ -1436,6 +1437,10 @@ class _FakeHeldWorkerProcess:
             "expected_frame_count": None,
             "expected_usb_bus": self.expected_usb_bus,
             "expected_usb_address": self.expected_usb_address,
+            "expected_usb_vendor_id": 0x04B0,
+            "expected_usb_product_id": 0x4002,
+            "expected_scanner_model": "LS-5000 ED",
+            "allow_unverified": False,
             "actual_usb_bus": self.expected_usb_bus,
             "actual_usb_address": self.expected_usb_address,
             "expected_reads": 0,
@@ -3570,6 +3575,32 @@ class TestRollScanMany:
             roll.close()
             dev.close()
 
+    def test_scan_many_validates_exact_meter_refusal_allowlist_before_motion(
+        self, fake_service_factory, tmp_path: Path
+    ) -> None:
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(tmp_path, dev, batch_spawner=_success_spawner([]))
+        try:
+            roll.preview()
+            for slot in (1, 2):
+                if roll.needs_approval(slot):
+                    roll.approve(slot)
+            with pytest.raises(TypeError, match="must be integers"):
+                roll.scan_many([1, 2], allowed_meter_refusal_slots=(True,))
+            with pytest.raises(ValueError, match="unique sorted subset"):
+                roll.scan_many([1, 2], allowed_meter_refusal_slots=(2, 1))
+            with pytest.raises(ValueError, match="unique sorted subset"):
+                roll.scan_many([1, 2], allowed_meter_refusal_slots=(3,))
+            with pytest.raises(TypeError, match="must be callable"):
+                roll.scan_many(
+                    [1, 2],
+                    allowed_meter_refusal_slots=(2,),
+                    on_meter_refusal_skipped=object(),  # type: ignore[arg-type]
+                )
+        finally:
+            roll.close()
+            dev.close()
+
     def test_scan_many_applies_exposure_override_on_the_cold_path(
         self, fake_service_factory, tmp_path: Path
     ) -> None:
@@ -5405,6 +5436,50 @@ class TestRollMultiBatchHold:
             assert events[-1] == "terminate"
             assert len(processes) == 1
             assert processes[0].poll() == -15
+        finally:
+            roll.close()
+            dev.close()
+
+    @pytest.mark.parametrize("identity_mutation", ["missing", "mismatch"])
+    def test_solve_exposure_refuses_held_preview_usb_identity_drift_before_ack(
+        self, fake_service_factory, tmp_path: Path, identity_mutation: str
+    ) -> None:
+        events: list[str] = []
+        dev = _open_device(fake_service_factory)
+        roll, _worker = _make_roll(
+            tmp_path,
+            dev,
+            batch_spawner=_success_spawner(events),
+        )
+        try:
+            roll.preview()
+            if roll.needs_approval(1):
+                roll.approve(1)
+            held = roll._held_session
+            assert held is not None
+            journal = dict(held.preview_attempt.journal or {})
+            if identity_mutation == "missing":
+                journal.pop("expected_usb_product_id")
+            else:
+                journal["expected_usb_product_id"] = 0xDEAD
+            held.preview_attempt.paths.journal.write_text(
+                json.dumps(journal), encoding="utf-8"
+            )
+            held = replace(
+                held,
+                preview_attempt=replace(held.preview_attempt, journal=journal),
+            )
+            roll._held_session = held
+
+            with pytest.raises(
+                CaptureProcessError,
+                match="does not exactly match the retained preview",
+            ):
+                roll.solve_exposure(1)
+
+            assert not held.hold_job_path.exists()
+            assert not held.hold_ack_path.exists()
+            assert roll._held_session is held
         finally:
             roll.close()
             dev.close()

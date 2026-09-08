@@ -320,6 +320,21 @@ class SynchronizedProtocolError(ProtocolError):
     """The command status was fully consumed; another CDB is safe."""
 
 
+class _MeterControllerRefusalSignal(SynchronizedProtocolError):
+    """Internal structured unwind for an already-drained meter pass."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pass_number: int,
+        refusals: Sequence[SafetyRefusal],
+    ) -> None:
+        super().__init__(message)
+        self.pass_number = pass_number
+        self.refusals = tuple(refusals)
+
+
 class DesynchronizedProtocolError(ProtocolError):
     """The current USB/application phase is unknown; send no more CDBs."""
 
@@ -573,6 +588,7 @@ class LiveBatchJob:
     expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID
     expected_scanner_model: str = CANONICAL_SCANNER_PRODUCT
     allow_unverified: bool = False
+    allowed_meter_refusal_slots: tuple[int, ...] = ()
 
     @property
     def selected_slots(self) -> tuple[int, ...]:
@@ -2092,13 +2108,16 @@ def load_validated_batch_job(
         raise ProtocolError(f"batch job could not be decoded: {error}") from error
     if not isinstance(payload, dict):
         raise ProtocolError("batch job must be a JSON object")
+    schema_version = payload.get("schema_version")
+    if schema_version not in (3, 4):
+        raise ProtocolError("batch job schema version must be 3 or 4")
     expected_top_level = {
         "apply_all_boundary_offsets_before_first_frame": True,
         "capture_plan_sha256": expected_plan_sha256,
         "continuation_plan_sha256": expected_continuation_sha256,
         "parent_ack_required_after_every_frame": True,
         "release_once_after_last_frame": True,
-        "schema_version": 3,
+        "schema_version": schema_version,
         "session_contract": "one-process-one-reservation",
     }
     expected_keys = set(expected_top_level) | {
@@ -2115,6 +2134,8 @@ def load_validated_batch_job(
         "samples_per_scan",
         "session_id",
     }
+    if schema_version == 4:
+        expected_keys.add("allowed_meter_refusal_slots")
     if set(payload) != expected_keys:
         raise ProtocolError(
             "batch job keys changed: "
@@ -2321,6 +2342,22 @@ def load_validated_batch_job(
     slots = tuple(frame.slot for frame in frames)
     if slots != tuple(sorted(set(slots))):
         raise ProtocolError("batch frame slots must be unique and increasing")
+    raw_allowed_slots = payload.get("allowed_meter_refusal_slots", [])
+    if not isinstance(raw_allowed_slots, list) or any(
+        isinstance(slot, bool) or not isinstance(slot, int)
+        for slot in raw_allowed_slots
+    ):
+        raise ProtocolError("batch allowed meter-refusal slots must be an integer array")
+    allowed_meter_refusal_slots = tuple(raw_allowed_slots)
+    if (
+        tuple(sorted(set(allowed_meter_refusal_slots)))
+        != allowed_meter_refusal_slots
+        or not set(allowed_meter_refusal_slots).issubset(slots)
+    ):
+        raise ProtocolError(
+            "batch allowed meter-refusal slots must be a unique sorted subset "
+            "of selected slots"
+        )
     return LiveBatchJob(
         session_id=session_id,
         root=root,
@@ -2338,6 +2375,7 @@ def load_validated_batch_job(
         expected_usb_product_id=expected_usb_product_id,
         expected_scanner_model=expected_scanner_model,
         allow_unverified=allow_unverified,
+        allowed_meter_refusal_slots=allowed_meter_refusal_slots,
     )
 
 
@@ -2993,9 +3031,92 @@ def _raise_meter_controller_refusal(
     _write_journal(journal_path, journal)
     codes = ", ".join(refusal.code for refusal in refusals)
     final_label = " final" if final else ""
-    raise SynchronizedProtocolError(
-        f"meter pass {pass_number}{final_label} controller refused: {codes}"
+    raise _MeterControllerRefusalSignal(
+        f"meter pass {pass_number}{final_label} controller refused: {codes}",
+        pass_number=pass_number,
+        refusals=refusals,
     )
+
+
+def _finish_allowed_meter_refusal_skip(
+    error: BaseException,
+    *,
+    ep_out: Any,
+    ep_in: Any,
+    lifecycle: SessionLifecycle,
+    batch_job: LiveBatchJob,
+    frame_spec: BatchFrameSpec,
+    frame_index: int,
+    journal_path: Path,
+    journal: dict[str, Any],
+    session_journal_path: Path,
+    session_journal: dict[str, Any],
+) -> bool:
+    """Publish one skip only after the drained meter scan reaches READY."""
+
+    if not isinstance(error, _MeterControllerRefusalSignal):
+        return False
+    if frame_spec.slot not in batch_job.allowed_meter_refusal_slots:
+        return False
+    if (
+        not lifecycle.at_transaction_boundary
+        or lifecycle.scan_active
+        or not lifecycle.ready_required
+    ):
+        return False
+
+    polls, stalls = _wait_post_scan_ready(ep_out, ep_in)
+    lifecycle.scan_active = False
+    lifecycle.ready_required = False
+    if not frame_spec.output.is_file() or frame_spec.output.stat().st_size != 0:
+        raise SynchronizedProtocolError(
+            "allowed meter refusal did not retain its unused output placeholder"
+        )
+
+    refusal = {
+        "pass": error.pass_number,
+        "reasons": [reason.to_dict() for reason in error.refusals],
+    }
+    skip = {
+        "slot": frame_spec.slot,
+        "frame_index": frame_index,
+        "code": "METER_CONTROLLER_REFUSED",
+        "refusal": refusal,
+    }
+    journal.pop("nikon_density_frame_ownership", None)
+    journal.update(
+        {
+            "status": "meter-controller-refusal-skipped",
+            "frame_complete": False,
+            "frame_skipped": True,
+            "skip": skip,
+            "batch_job_sha256": batch_job.job_sha256,
+            "ack_nonce": secrets.token_hex(16),
+            "post_scan_ready_polls": polls,
+            "stall_recoveries": journal.get("stall_recoveries", 0) + stalls,
+            "output_placeholder_retained": True,
+            "output_placeholder_bytes": 0,
+            "session_reservation_retained": True,
+            "unit_released": False,
+            "recovery_required": None,
+            "finished_unix": time.time(),
+        }
+    )
+    _write_journal(journal_path, journal)
+    skipped = session_journal.get("skipped_frames")
+    if not isinstance(skipped, list):
+        raise ProtocolError("batch session skipped_frames is not a list")
+    skipped.append(skip)
+    session_journal.update(
+        {
+            "active_frame_index": frame_index,
+            "active_slot": frame_spec.slot,
+            "status": "awaiting-parent-ack",
+            "recovery_required": None,
+        }
+    )
+    _write_journal(session_journal_path, session_journal)
+    return True
 
 
 def _fsync_parent_directory(path: Path) -> None:
@@ -4938,6 +5059,9 @@ def _run_live_continuation_frame(
     actual_usb_address: int,
     expected_calibration_session_id: str,
     allow_unverified: bool = False,
+    session_journal_path: Path | None = None,
+    session_journal: dict[str, Any] | None = None,
+    include_density_evidence: bool | None = None,
     # Type-only: the caller's own local is `str | None` (set once the
     # batch's first INQUIRY validates it), so a `str`-only annotation here
     # was already an unsound accepted-argument type, not a runtime
@@ -5111,7 +5235,9 @@ def _run_live_continuation_frame(
         journal["fine_completed_reads"] = 0
     if density_ownership is not None:
         journal["nikon_density_frame_ownership"] = density_ownership
-    if frame_index == 1 and not meter_only:
+    if include_density_evidence is None:
+        include_density_evidence = frame_index == 1
+    if include_density_evidence and not meter_only:
         # Frame 1 of every batch carries the reservation's density evidence
         # receipt: that is the rule the parent validates against
         # (capture_process._validate_batch_frame_result's own
@@ -5637,6 +5763,24 @@ def _run_live_continuation_frame(
             fine_stream,
             reason=f"capture-error:{type(error).__name__}",
         )
+        if (
+            session_journal_path is not None
+            and session_journal is not None
+            and _finish_allowed_meter_refusal_skip(
+                error,
+                ep_out=ep_out,
+                ep_in=ep_in,
+                lifecycle=lifecycle,
+                batch_job=batch_job,
+                frame_spec=frame_spec,
+                frame_index=frame_index,
+                journal_path=journal_path,
+                journal=journal,
+                session_journal_path=session_journal_path,
+                session_journal=session_journal,
+            )
+        ):
+            return journal
         if isinstance(error, MeterUnusableError):
             journal["meter_unusable"] = {"channel": error.channel}
         journal["status"] = (
@@ -6076,6 +6220,7 @@ def run_live_capture(
             "density_calibration_session_id": calibration_session_id,
             "selected_slots": list(batch_job.selected_slots),
             "completed_slots": [],
+            "skipped_frames": [],
             "active_frame_index": 1,
             "active_slot": batch_job.frames[0].slot,
             "batch_job_sha256": batch_job.job_sha256,
@@ -6217,6 +6362,7 @@ def run_live_capture(
                 mode="pending-startup-table",
             )
             entry_index = 0
+            first_frame_skip_error: _MeterControllerRefusalSignal | None = None
             fine_window_payloads: list[bytes] = []
             preview_window_payloads: list[bytes] = []
             preview_windows: list[WindowBlock] | None = None
@@ -6964,6 +7110,7 @@ def run_live_capture(
                                 "session_id": batch_job.session_id,
                                 "selected_slots": list(batch_job.selected_slots),
                                 "completed_slots": [],
+                                "skipped_frames": [],
                                 "active_frame_index": 1,
                                 "active_slot": first_spec.slot,
                                 "batch_job_sha256": batch_job.job_sha256,
@@ -7262,12 +7409,22 @@ def run_live_capture(
                             meter_controller_proposals.append(proposal_record)
                             _write_journal(journal_path, journal)
                             if not proposal.accepted:
-                                _raise_meter_controller_refusal(
-                                    journal_path,
-                                    journal,
-                                    pass_number=group_index + 1,
-                                    refusals=proposal.refusals,
-                                )
+                                try:
+                                    _raise_meter_controller_refusal(
+                                        journal_path,
+                                        journal,
+                                        pass_number=group_index + 1,
+                                        refusals=proposal.refusals,
+                                    )
+                                except _MeterControllerRefusalSignal as error:
+                                    if (
+                                        batch_job is not None
+                                        and frame
+                                        in batch_job.allowed_meter_refusal_slots
+                                    ):
+                                        first_frame_skip_error = error
+                                        break
+                                    raise
                             next_group = group_index + 1
                             patched_wire = _patch_exposure_contract(
                                 active_plan,
@@ -7295,13 +7452,23 @@ def run_live_capture(
                                 not final_result.accepted
                                 or final_result.final_exposures is None
                             ):
-                                _raise_meter_controller_refusal(
-                                    journal_path,
-                                    journal,
-                                    pass_number=3,
-                                    refusals=final_result.refusals,
-                                    final=True,
-                                )
+                                try:
+                                    _raise_meter_controller_refusal(
+                                        journal_path,
+                                        journal,
+                                        pass_number=3,
+                                        refusals=final_result.refusals,
+                                        final=True,
+                                    )
+                                except _MeterControllerRefusalSignal as error:
+                                    if (
+                                        batch_job is not None
+                                        and frame
+                                        in batch_job.allowed_meter_refusal_slots
+                                    ):
+                                        first_frame_skip_error = error
+                                        break
+                                    raise
                             commanded_exposures = _resolve_parity_active_exposures(
                                 journal,
                                 observation=observation,
@@ -7422,7 +7589,12 @@ def run_live_capture(
             # inside the "scan" branch above, so this distinguishes the two
             # preview_and_hold outcomes without a third top-level mode flag.
             released_hold_without_scan = preview_and_hold and not batch_mode
-            if meter_only or preview_only or released_hold_without_scan:
+            if (
+                first_frame_skip_error is not None
+                or meter_only
+                or preview_only
+                or released_hold_without_scan
+            ):
                 fine_windows = []
             else:
                 if live_selection is None:
@@ -7466,7 +7638,12 @@ def run_live_capture(
                 }
                 for window in fine_windows
             ]
-            if not meter_only and not preview_only and not released_hold_without_scan:
+            if (
+                first_frame_skip_error is None
+                and not meter_only
+                and not preview_only
+                and not released_hold_without_scan
+            ):
                 journal["status"] = "fine-capture"
                 _write_journal(journal_path, journal)
                 fine_stream = _open_fine_stream_session(
@@ -7518,32 +7695,59 @@ def run_live_capture(
                 meter_output.close()
                 meter_output = None
 
-        journal["output_sha256"] = output_sha256.hexdigest()
+        if first_frame_skip_error is not None:
+            assert batch_job is not None
+            assert session_journal is not None
+            assert session_journal_path is not None
+            first_lifecycle = SessionLifecycle(
+                at_transaction_boundary=at_transaction_boundary,
+                scan_active=scan_active,
+                ready_required=ready_required,
+            )
+            if not _finish_allowed_meter_refusal_skip(
+                first_frame_skip_error,
+                ep_out=ep_out,
+                ep_in=ep_in,
+                lifecycle=first_lifecycle,
+                batch_job=batch_job,
+                frame_spec=batch_job.frames[0],
+                frame_index=1,
+                journal_path=journal_path,
+                journal=journal,
+                session_journal_path=session_journal_path,
+                session_journal=session_journal,
+            ):
+                raise first_frame_skip_error
+            at_transaction_boundary = first_lifecycle.at_transaction_boundary
+            scan_active = first_lifecycle.scan_active
+            ready_required = first_lifecycle.ready_required
+        else:
+            journal["output_sha256"] = output_sha256.hexdigest()
 
-        if journal["completed_bytes"] != expected_bytes:
-            raise SynchronizedProtocolError(
-                f"final size {journal['completed_bytes']} != expected {expected_bytes}"
+            if journal["completed_bytes"] != expected_bytes:
+                raise SynchronizedProtocolError(
+                    f"final size {journal['completed_bytes']} != expected {expected_bytes}"
+                )
+            disk_bytes = fine_output_path.stat().st_size
+            journal["disk_bytes"] = disk_bytes
+            if disk_bytes != expected_bytes:
+                raise SynchronizedProtocolError(
+                    f"file size {disk_bytes} != expected {expected_bytes}"
+                )
+            journal["status"] = "teardown"
+            _write_journal(journal_path, journal)
+            at_transaction_boundary = False
+            polls, stalls = _wait_post_scan_ready(ep_out, ep_in)
+            at_transaction_boundary = True
+            scan_active = False
+            ready_required = False
+            journal["post_scan_ready_polls"] = polls
+            journal["stall_recoveries"] += stalls
+            journal["streaming_decode"] = _finish_fine_stream(
+                fine_stream,
+                raw_sha256=journal["output_sha256"],
+                raw_bytes=expected_bytes,
             )
-        disk_bytes = fine_output_path.stat().st_size
-        journal["disk_bytes"] = disk_bytes
-        if disk_bytes != expected_bytes:
-            raise SynchronizedProtocolError(
-                f"file size {disk_bytes} != expected {expected_bytes}"
-            )
-        journal["status"] = "teardown"
-        _write_journal(journal_path, journal)
-        at_transaction_boundary = False
-        polls, stalls = _wait_post_scan_ready(ep_out, ep_in)
-        at_transaction_boundary = True
-        scan_active = False
-        ready_required = False
-        journal["post_scan_ready_polls"] = polls
-        journal["stall_recoveries"] += stalls
-        journal["streaming_decode"] = _finish_fine_stream(
-            fine_stream,
-            raw_sha256=journal["output_sha256"],
-            raw_bytes=expected_bytes,
-        )
         if density_calibration is None:
             raise SynchronizedProtocolError(
                 "capture completed without the RGB READ(0x8c) calibration"
@@ -7564,29 +7768,29 @@ def run_live_capture(
                     "batch first frame lost its retained roll-index evidence"
                 )
 
-            journal["ack_nonce"] = secrets.token_hex(16)
-            journal["frame_complete"] = True
-            journal["recovery_required"] = None
-            journal["session_reservation_retained"] = True
-            journal["unit_released"] = False
-            journal["status"] = "frame-complete"
-            journal["finished_unix"] = time.time()
-            _write_journal(journal_path, journal)
-            frame_journal_finalized = True
-
             completed_slots = session_journal["completed_slots"]
             if not isinstance(completed_slots, list):
                 raise ProtocolError("batch session completed_slots is not a list")
-            completed_slots.append(batch_job.frames[0].slot)
-            session_journal.update(
-                {
-                    "active_frame_index": 1,
-                    "active_slot": batch_job.frames[0].slot,
-                    "recovery_required": None,
-                    "status": "awaiting-parent-ack",
-                }
-            )
-            _write_journal(session_journal_path, session_journal)
+            if first_frame_skip_error is None:
+                journal["ack_nonce"] = secrets.token_hex(16)
+                journal["frame_complete"] = True
+                journal["recovery_required"] = None
+                journal["session_reservation_retained"] = True
+                journal["unit_released"] = False
+                journal["status"] = "frame-complete"
+                journal["finished_unix"] = time.time()
+                _write_journal(journal_path, journal)
+                completed_slots.append(batch_job.frames[0].slot)
+                session_journal.update(
+                    {
+                        "active_frame_index": 1,
+                        "active_slot": batch_job.frames[0].slot,
+                        "recovery_required": None,
+                        "status": "awaiting-parent-ack",
+                    }
+                )
+                _write_journal(session_journal_path, session_journal)
+            frame_journal_finalized = True
             action = wait_for_parent_ack(
                 batch_job.frames[0].ack,
                 session_id=batch_job.session_id,
@@ -7641,16 +7845,20 @@ def run_live_capture(
                         expected_calibration_session_id=calibration_session_id,
                         scanner_identity=scanner_identity,
                         allow_unverified=allow_unverified,
+                        session_journal_path=session_journal_path,
+                        session_journal=session_journal,
+                        include_density_evidence=not completed_slots,
                     )
-                    completed_slots.append(frame_spec.slot)
-                    session_journal.update(
-                        {
-                            "active_frame_index": frame_index,
-                            "active_slot": frame_spec.slot,
-                            "status": "awaiting-parent-ack",
-                        }
-                    )
-                    _write_journal(session_journal_path, session_journal)
+                    if frame_journal.get("status") == "frame-complete":
+                        completed_slots.append(frame_spec.slot)
+                        session_journal.update(
+                            {
+                                "active_frame_index": frame_index,
+                                "active_slot": frame_spec.slot,
+                                "status": "awaiting-parent-ack",
+                            }
+                        )
+                        _write_journal(session_journal_path, session_journal)
                     action = wait_for_parent_ack(
                         frame_spec.ack,
                         session_id=batch_job.session_id,
@@ -7752,6 +7960,9 @@ def run_live_capture(
                         expected_scanner_model=expected_scanner_model,
                         scanner_identity=scanner_identity,
                         allow_unverified=allow_unverified,
+                        session_journal_path=session_journal_path,
+                        session_journal=session_journal,
+                        include_density_evidence=not completed_slots,
                     )
                     action = wait_for_hold_decision(
                         round_hold_ack_path,
@@ -7812,6 +8023,7 @@ def run_live_capture(
                         "batch_job_sha256": batch_job.job_sha256,
                         "selected_slots": list(batch_job.selected_slots),
                         "completed_slots": [],
+                        "skipped_frames": [],
                         "active_frame_index": 1,
                         "active_slot": batch_job.frames[0].slot,
                         "manual_review_approval_sha256_by_slot": {
@@ -7866,16 +8078,20 @@ def run_live_capture(
                         expected_calibration_session_id=calibration_session_id,
                         scanner_identity=scanner_identity,
                         allow_unverified=allow_unverified,
+                        session_journal_path=session_journal_path,
+                        session_journal=session_journal,
+                        include_density_evidence=not completed_slots,
                     )
-                    completed_slots.append(frame_spec.slot)
-                    session_journal.update(
-                        {
-                            "active_frame_index": frame_index,
-                            "active_slot": frame_spec.slot,
-                            "status": "awaiting-parent-ack",
-                        }
-                    )
-                    _write_journal(session_journal_path, session_journal)
+                    if frame_journal.get("status") == "frame-complete":
+                        completed_slots.append(frame_spec.slot)
+                        session_journal.update(
+                            {
+                                "active_frame_index": frame_index,
+                                "active_slot": frame_spec.slot,
+                                "status": "awaiting-parent-ack",
+                            }
+                        )
+                        _write_journal(session_journal_path, session_journal)
                     action = wait_for_parent_ack(
                         frame_spec.ack,
                         session_id=batch_job.session_id,

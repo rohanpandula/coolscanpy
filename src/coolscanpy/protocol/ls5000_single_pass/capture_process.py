@@ -1272,6 +1272,7 @@ class CaptureBatchRequest:
     expected_usb_product_id: int = CANONICAL_SCANNER_PRODUCT_ID
     expected_scanner_model: str = CANONICAL_SCANNER_MODEL
     allow_unverified: bool = False
+    allowed_meter_refusal_slots: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.frames, tuple):
@@ -1325,6 +1326,15 @@ class CaptureBatchRequest:
         if tuple(sorted(set(slots))) != slots:
             raise ValueError(
                 "batch scanner slots must be unique and strictly increasing"
+            )
+        allowed = self.allowed_meter_refusal_slots
+        if not isinstance(allowed, tuple) or any(
+            isinstance(slot, bool) or not isinstance(slot, int) for slot in allowed
+        ):
+            raise TypeError("allowed meter-refusal slots must be an immutable integer tuple")
+        if tuple(sorted(set(allowed))) != allowed or not set(allowed).issubset(slots):
+            raise ValueError(
+                "allowed meter-refusal slots must be a unique sorted subset of batch slots"
             )
         if self.exposure_override_10ns is not None:
             override = self.exposure_override_10ns
@@ -1559,6 +1569,17 @@ class CaptureAttemptResult:
 
 
 @dataclass(frozen=True)
+class SkippedBatchFrame:
+    """Validated worker handoff for one explicitly allowed meter refusal."""
+
+    request: CaptureRequest
+    paths: AttemptPaths
+    frame_index: int
+    refusal: MeterControllerRefused
+    journal: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class CaptureBatchResult:
     """One child process, its finalized frames, and final release receipt."""
 
@@ -1586,6 +1607,7 @@ class CaptureBatchResult:
     # call consumes this exactly like the original ``begin_held_preview``
     # session -- see ``CaptureProcessAdapter._resolve_held_after_batch``.
     held_again: HeldPreviewSession | None = None
+    skipped: tuple[SkippedBatchFrame, ...] = ()
 
     @property
     def density_evidence(self) -> NikonDensityEvidence | None:
@@ -1751,6 +1773,14 @@ class BatchProcessSpawner(Protocol):
 
 class BatchFrameHandler(Protocol):
     def __call__(self, result: CaptureAttemptResult) -> BatchAckAction: ...
+
+
+class BatchSkipHandler(Protocol):
+    def __call__(self, result: SkippedBatchFrame) -> BatchAckAction: ...
+
+
+def _stop_skipped_frame(_result: SkippedBatchFrame) -> BatchAckAction:
+    return BatchAckAction.STOP
 
 
 def _run_subprocess(
@@ -2190,6 +2220,7 @@ class CaptureProcessAdapter:
         request: CaptureBatchRequest,
         *,
         frame_handler: BatchFrameHandler,
+        skip_handler: BatchSkipHandler | None = None,
     ) -> CaptureBatchResult:
         """Run one child and ACK only frames the parent finished consuming.
 
@@ -2204,6 +2235,10 @@ class CaptureProcessAdapter:
             raise TypeError("request must be a CaptureBatchRequest")
         if not callable(frame_handler):
             raise TypeError("frame_handler must be callable")
+        if skip_handler is None:
+            skip_handler = _stop_skipped_frame
+        if not callable(skip_handler):
+            raise TypeError("skip_handler must be callable")
         with self._attempt_lock:
             if self._stop_requested.is_set():
                 raise CaptureStopped(
@@ -2212,12 +2247,13 @@ class CaptureProcessAdapter:
             prepared = self._prepare_batch_session_locked(request)
             if self._stop_requested.is_set():
                 raise CaptureStopped("capture stopped before batch worker launch")
-            return self._run_prepared_batch(prepared, frame_handler)
+            return self._run_prepared_batch(prepared, frame_handler, skip_handler)
 
     def _run_prepared_batch(
         self,
         prepared: PreparedCaptureBatch,
         frame_handler: BatchFrameHandler,
+        skip_handler: BatchSkipHandler | None = None,
     ) -> CaptureBatchResult:
         paths = prepared.paths
         process: RunningBatchProcess | None = None
@@ -2244,13 +2280,14 @@ class CaptureProcessAdapter:
             raise CaptureProcessError(
                 f"could not launch batch capture worker: {error}"
             ) from error
-        return self._drive_prepared_batch(prepared, process, frame_handler)
+        return self._drive_prepared_batch(prepared, process, frame_handler, skip_handler)
 
     def _drive_prepared_batch(
         self,
         prepared: PreparedCaptureBatch,
         process: RunningBatchProcess,
         frame_handler: BatchFrameHandler,
+        skip_handler: BatchSkipHandler | None = None,
     ) -> CaptureBatchResult:
         """Drive one already-running batch child through its frames, ACKing
         only what the parent has finished consuming, until a durable
@@ -2272,6 +2309,7 @@ class CaptureProcessAdapter:
 
         paths = prepared.paths
         handled: list[CaptureAttemptResult] = []
+        skipped: list[SkippedBatchFrame] = []
         stopped = False
         ejected = False
         held_after = False
@@ -2290,7 +2328,35 @@ class CaptureProcessAdapter:
                         prepared,
                         frame_request,
                         frame_index=frame_index,
+                        expect_density_evidence=not handled,
                     )
+                    if isinstance(frame_result, SkippedBatchFrame):
+                        try:
+                            action = skip_handler(frame_result)
+                            if not isinstance(action, BatchAckAction):
+                                raise TypeError(
+                                    "skip_handler must return BatchAckAction"
+                                )
+                        except BaseException as error:
+                            handler_error = error
+                            action = BatchAckAction.STOP
+                        skipped.append(frame_result)
+                        with self._stop_gate:
+                            if self._stop_requested.is_set():
+                                action = BatchAckAction.STOP
+                            self._write_batch_skip_ack(
+                                frame_result, prepared, action=action
+                            )
+                        if action is BatchAckAction.STOP:
+                            stopped = True
+                            break
+                        if action is BatchAckAction.EJECT:
+                            ejected = True
+                            break
+                        if action is BatchAckAction.CONTINUE_HOLD:
+                            held_after = True
+                            break
+                        continue
                     ownership_error: BaseException | None = None
                     if handled:
                         try:
@@ -2374,7 +2440,9 @@ class CaptureProcessAdapter:
             monitor_error = monitor_error or error
 
         if held_after and monitor_error is None:
-            return self._resolve_held_after_batch(prepared, process, handled)
+            return self._resolve_held_after_batch(
+                prepared, process, handled, skipped=skipped
+            )
 
         if returncode is None:
             raise CaptureProcessError(
@@ -2402,6 +2470,7 @@ class CaptureProcessAdapter:
                 prepared,
                 returncode=returncode,
                 handled=handled,
+                skipped=skipped,
                 stopped=stopped,
                 stopped_unhandled_slot=stopped_unhandled_slot,
                 ejected=ejected,
@@ -2463,6 +2532,7 @@ class CaptureProcessAdapter:
             stderr=stderr,
             ejected=ejected,
             held_again=None,
+            skipped=tuple(skipped),
         )
 
     def _resolve_held_after_batch(
@@ -2470,6 +2540,8 @@ class CaptureProcessAdapter:
         prepared: PreparedCaptureBatch,
         process: RunningBatchProcess,
         handled: Sequence[CaptureAttemptResult],
+        *,
+        skipped: Sequence[SkippedBatchFrame] = (),
     ) -> CaptureBatchResult:
         """The terminal frame ack was CONTINUE_HOLD: this same still-running
         child persisted this batch's results, did not release, and is
@@ -2511,7 +2583,7 @@ class CaptureProcessAdapter:
                 if isinstance(payload, dict) and payload.get("status") == "held":
                     try:
                         session_journal = self._validate_held_after_batch_journal(
-                            prepared, payload, handled=handled
+                            prepared, payload, handled=handled, skipped=skipped
                         )
                     except BaseException as error:
                         rendezvous = payload.get("hold_resume")
@@ -2552,13 +2624,27 @@ class CaptureProcessAdapter:
                     # per-frame journal (that file is an immutable
                     # parent/child handoff -- see run_live_capture's own
                     # comment on frame_journal_finalized).
-                    last = handled[-1]
+                    template = handled[-1] if handled else skipped[-1]
+                    preview_attempt = (
+                        template
+                        if isinstance(template, CaptureAttemptResult)
+                        else CaptureAttemptResult(
+                            outcome=CaptureOutcome.COMPLETE,
+                            request=template.request,
+                            paths=template.paths,
+                            argv=prepared.argv,
+                            returncode=0,
+                            stdout="",
+                            stderr="",
+                            journal=template.journal,
+                        )
+                    )
                     held_again = HeldPreviewSession(
                         preview_attempt=replace(
-                            last,
+                            preview_attempt,
                             outcome=CaptureOutcome.COMPLETE,
                             paths=replace(
-                                last.paths,
+                                preview_attempt.paths,
                                 journal=Path(resume["hold_release_journal_path"]),
                             ),
                         ),
@@ -2592,6 +2678,7 @@ class CaptureProcessAdapter:
                         stderr="",
                         ejected=False,
                         held_again=held_again,
+                        skipped=tuple(skipped),
                     )
             returncode = process.poll()
             if returncode is not None:
@@ -2608,6 +2695,7 @@ class CaptureProcessAdapter:
         payload: dict[str, Any],
         *,
         handled: Sequence[CaptureAttemptResult],
+        skipped: Sequence[SkippedBatchFrame] = (),
     ) -> dict[str, Any]:
         """Fail-closed validation for a CONTINUE_HOLD terminal ack's session
         journal: the reservation must be reported as still held (never
@@ -2677,6 +2765,12 @@ class CaptureProcessAdapter:
             raise CaptureProcessError(
                 f"held-after-batch session journal completed_slots={completed!r} "
                 f"does not match the observed frame prefix {expected_completed!r}"
+            )
+        if payload.get("skipped_frames", []) != [
+            result.journal["skip"] for result in skipped
+        ]:
+            raise CaptureProcessError(
+                "held-after-batch skipped frames do not match validated handoffs"
             )
         resume = payload.get("hold_resume")
         if (
@@ -3238,6 +3332,7 @@ class CaptureProcessAdapter:
         request: CaptureBatchRequest,
         *,
         frame_handler: BatchFrameHandler,
+        skip_handler: BatchSkipHandler | None = None,
     ) -> CaptureBatchResult:
         """Resume a still-held preview directly into its own reservation's
         fine scan -- no RESERVE_UNIT, no repeated command 64, no repeated
@@ -3251,6 +3346,10 @@ class CaptureProcessAdapter:
             raise TypeError("request must be a CaptureBatchRequest")
         if not callable(frame_handler):
             raise TypeError("frame_handler must be callable")
+        if skip_handler is None:
+            skip_handler = _stop_skipped_frame
+        if not callable(skip_handler):
+            raise TypeError("skip_handler must be callable")
         if not held.usable:
             raise HeldSessionExpired(
                 "this held session's own preview attempt did not complete; "
@@ -3335,7 +3434,9 @@ class CaptureProcessAdapter:
                 raise CaptureProcessError(
                     f"could not publish resume decision: {error}"
                 ) from error
-            return self._drive_prepared_batch(prepared, held.process, frame_handler)
+            return self._drive_prepared_batch(
+                prepared, held.process, frame_handler, skip_handler
+            )
 
     def meter_held_session(
         self,
@@ -3352,6 +3453,24 @@ class CaptureProcessAdapter:
             if held.process.poll() is not None:
                 raise HeldSessionExpired(
                     "the held preview's child is no longer running"
+                )
+            preview_journal = held.preview_attempt.journal
+            expected_identity = {
+                "expected_usb_bus": request.expected_usb_bus,
+                "expected_usb_address": request.expected_usb_address,
+                "expected_usb_vendor_id": request.frame.expected_usb_vendor_id,
+                "expected_usb_product_id": request.frame.expected_usb_product_id,
+                "expected_scanner_model": request.frame.expected_scanner_model,
+                "allow_unverified": request.frame.allow_unverified,
+            }
+            if not isinstance(preview_journal, dict) or any(
+                key not in preview_journal
+                or preview_journal.get(key) != expected
+                for key, expected in expected_identity.items()
+            ):
+                raise CaptureProcessError(
+                    "held meter request USB identity does not exactly match "
+                    "the retained preview reservation"
                 )
             if self._stop_requested.is_set():
                 self._release_held_session_locked(held)
@@ -4150,6 +4269,9 @@ class CaptureProcessAdapter:
             "expected_usb_product_id": request.expected_usb_product_id,
             "expected_scanner_model": request.expected_scanner_model,
             "allow_unverified": request.allow_unverified,
+            "allowed_meter_refusal_slots": list(
+                request.allowed_meter_refusal_slots
+            ),
             "exposure_override_10ns": (
                 None
                 if request.exposure_override_10ns is None
@@ -4168,7 +4290,7 @@ class CaptureProcessAdapter:
             "release_once_after_last_frame": True,
             "reviewed_roll_fingerprint": request.reviewed_fingerprint.to_payload(),
             "samples_per_scan": request.samples_per_scan,
-            "schema_version": 3,
+            "schema_version": 4,
             "session_id": session_id,
             "session_contract": "one-process-one-reservation",
         }
@@ -4240,7 +4362,8 @@ class CaptureProcessAdapter:
         request: CaptureRequest,
         *,
         frame_index: int,
-    ) -> CaptureAttemptResult:
+        expect_density_evidence: bool,
+    ) -> CaptureAttemptResult | SkippedBatchFrame:
         paths = self._batch_frame_paths(prepared, request)
         while True:
             if paths.journal.is_file():
@@ -4259,6 +4382,7 @@ class CaptureProcessAdapter:
                             paths,
                             payload,
                             frame_index=frame_index,
+                            expect_density_evidence=expect_density_evidence,
                         )
                     except Exception as error:
                         self._write_identifiable_batch_stop(
@@ -4278,6 +4402,18 @@ class CaptureProcessAdapter:
                             f"stopped: {error}",
                             slot=slot,
                         ) from error
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("status")
+                    == "meter-controller-refusal-skipped"
+                ):
+                    return self._validate_batch_skipped_result(
+                        prepared,
+                        request,
+                        paths,
+                        payload,
+                        frame_index=frame_index,
+                    )
             if self._terminal_batch_receipt_is_published(prepared):
                 raise _BatchTerminalReceiptObserved
             returncode = process.poll()
@@ -4288,6 +4424,100 @@ class CaptureProcessAdapter:
                 )
             if self._batch_poll_seconds:
                 time.sleep(self._batch_poll_seconds)
+
+    def _validate_batch_skipped_result(
+        self,
+        prepared: PreparedCaptureBatch,
+        request: CaptureRequest,
+        paths: AttemptPaths,
+        payload: dict[str, Any],
+        *,
+        frame_index: int,
+    ) -> SkippedBatchFrame:
+        slot = request.selected_slot
+        if slot not in prepared.request.allowed_meter_refusal_slots:
+            raise CaptureProcessError(
+                f"worker skipped slot {slot!r} without exact parent authorization"
+            )
+        expected_batch = {
+            "frame_index": frame_index,
+            "frame_total": len(prepared.request.frames),
+            "selected_slots": list(prepared.request.selected_slots),
+            "session_id": prepared.session_id,
+        }
+        invariants: dict[str, object] = {
+            "status": "meter-controller-refusal-skipped",
+            "frame_complete": False,
+            "frame_skipped": True,
+            "batch_session": expected_batch,
+            "batch_job_sha256": prepared.job_sha256,
+            "plan_sha256": CANONICAL_PLAN_SHA256,
+            "continuation_plan_sha256": CANONICAL_CONTINUATION_PLAN_SHA256,
+            "capture_engine_sha256": self._expected_worker_sha256,
+            "capture_bundle_sha256": (
+                self._expected_bundle_sha256 or CAPTURE_BUNDLE_SHA256
+            ),
+            "output": str(paths.output.resolve()),
+            "requested_frame": slot,
+            "requested_boundary_offset_rows": request.boundary_offset_rows,
+            "reviewed_roll_fingerprint_sha256": (
+                prepared.request.reviewed_fingerprint.binding_sha256
+            ),
+            "expected_usb_bus": prepared.request.expected_usb_bus,
+            "expected_usb_address": prepared.request.expected_usb_address,
+            "expected_usb_vendor_id": prepared.request.expected_usb_vendor_id,
+            "expected_usb_product_id": prepared.request.expected_usb_product_id,
+            "expected_scanner_model": prepared.request.expected_scanner_model,
+            "allow_unverified": prepared.request.allow_unverified,
+            "session_reservation_retained": True,
+            "unit_released": False,
+            "recovery_required": None,
+            "output_placeholder_retained": True,
+            "output_placeholder_bytes": 0,
+        }
+        for key, expected in invariants.items():
+            if payload.get(key) != expected:
+                raise CaptureProcessError(
+                    f"skipped batch frame {frame_index} journal {key}="
+                    f"{payload.get(key)!r}, expected {expected!r}"
+                )
+        raw_refusal = payload.get("meter_controller_refusal")
+        skip = payload.get("skip")
+        if (
+            not isinstance(skip, dict)
+            or skip
+            != {
+                "slot": slot,
+                "frame_index": frame_index,
+                "code": "METER_CONTROLLER_REFUSED",
+                "refusal": raw_refusal,
+            }
+        ):
+            raise CaptureProcessError("skipped batch frame handoff is malformed")
+        try:
+            refusal = MeterControllerRefused.from_dict(raw_refusal)
+        except ValueError as error:
+            raise CaptureProcessError(
+                "skipped batch frame meter refusal is malformed"
+            ) from error
+        nonce = payload.get("ack_nonce")
+        if (
+            not isinstance(nonce, str)
+            or not 1 <= len(nonce) <= 128
+            or any(not (character.isascii() and (character.isalnum() or character in "-_")) for character in nonce)
+        ):
+            raise CaptureProcessError("skipped batch frame has no valid ACK nonce")
+        if not paths.output.is_file() or paths.output.stat().st_size != 0:
+            raise CaptureProcessError(
+                "skipped batch frame did not retain its create-only output placeholder"
+            )
+        return SkippedBatchFrame(
+            request=request,
+            paths=paths,
+            frame_index=frame_index,
+            refusal=refusal,
+            journal=payload,
+        )
 
     @staticmethod
     def _terminal_batch_receipt_is_published(
@@ -4322,6 +4552,7 @@ class CaptureProcessAdapter:
         payload: dict[str, Any],
         *,
         frame_index: int,
+        expect_density_evidence: bool | None = None,
     ) -> CaptureAttemptResult:
         expected_bytes = _fine_capture_bytes(prepared.request.samples_per_scan)
         selected_slots = prepared.request.selected_slots
@@ -4507,12 +4738,14 @@ class CaptureProcessAdapter:
                 f"batch frame {frame_index} output is missing or incomplete"
             )
         try:
+            if expect_density_evidence is None:
+                expect_density_evidence = frame_index == 1
             density_evidence = (
                 _validated_density_evidence(
                     payload,
                     source_path=prepared.density_source_path,
                 )
-                if frame_index == 1
+                if expect_density_evidence
                 else None
             )
             _validated_density_frame_ownership(
@@ -4573,6 +4806,31 @@ class CaptureProcessAdapter:
         }
         _publish_exclusive(
             ack_path,
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            ),
+        )
+
+    def _write_batch_skip_ack(
+        self,
+        result: SkippedBatchFrame,
+        prepared: PreparedCaptureBatch,
+        *,
+        action: BatchAckAction,
+    ) -> None:
+        slot = result.request.selected_slot
+        if slot is None:
+            raise CaptureProcessError("cannot ACK a skipped frame without identity")
+        payload = {
+            "ack_nonce": result.journal["ack_nonce"],
+            "action": action.value,
+            "frame_index": result.frame_index,
+            "schema_version": 1,
+            "session_id": prepared.session_id,
+            "slot": slot,
+        }
+        _publish_exclusive(
+            result.paths.directory / "parent-ack.json",
             (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             ),
@@ -4642,6 +4900,7 @@ class CaptureProcessAdapter:
         *,
         returncode: int,
         handled: Sequence[CaptureAttemptResult],
+        skipped: Sequence[SkippedBatchFrame] = (),
         stopped: bool,
         stopped_unhandled_slot: int | None = None,
         ejected: bool = False,
@@ -4696,6 +4955,8 @@ class CaptureProcessAdapter:
                     f"expected {expected!r}"
                 )
         completed = payload.get("completed_slots")
+        expected_skipped = [result.journal["skip"] for result in skipped]
+        recorded_skipped = payload.get("skipped_frames", [])
         selected = list(prepared.request.selected_slots)
         if (
             not isinstance(completed, list)
@@ -4703,12 +4964,28 @@ class CaptureProcessAdapter:
                 isinstance(slot, bool) or not isinstance(slot, int)
                 for slot in completed
             )
-            or completed != selected[: len(completed)]
             or completed != expected_completed
         ):
             raise CaptureProcessError(
                 f"batch session journal completed_slots={completed!r} does not "
                 f"match the observed frame prefix {expected_completed!r}"
+            )
+        if recorded_skipped != expected_skipped:
+            raise CaptureProcessError(
+                "batch session journal skipped_frames does not match the "
+                "validated skipped-frame handoffs"
+            )
+        observed_slots = [
+            slot
+            for slot in selected
+            if slot in set(completed)
+            or any(record.get("slot") == slot for record in expected_skipped)
+        ]
+        if stopped_unhandled_slot is not None and stopped_unhandled_slot not in observed_slots:
+            observed_slots.append(stopped_unhandled_slot)
+        if observed_slots != selected[: len(observed_slots)]:
+            raise CaptureProcessError(
+                "batch completed/skipped frames are not an ordered selected-slot prefix"
             )
         status = payload.get("status")
         release_attempts = payload.get("unit_release_attempts")
@@ -5018,6 +5295,7 @@ class CaptureProcessAdapter:
 __all__ = [
     "BatchAckAction",
     "BatchFrameHandler",
+    "BatchSkipHandler",
     "BatchProcessSpawner",
     "BatchSessionPaths",
     "CaptureAttemptResult",
@@ -5037,4 +5315,5 @@ __all__ = [
     "HeldMeterResult",
     "HeldSessionExpired",
     "PreparedCaptureBatch",
+    "SkippedBatchFrame",
 ]

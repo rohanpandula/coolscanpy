@@ -62,8 +62,8 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # is_attended_roll_binding; worker.py gained the attended branch of the
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
-    "capture_process.py": "d82379f517d1eb7ce447c45a587e8a9a5d51ed53dda33d81a1b856d6d13812b1",
-    "worker.py": "8d96a80b096afae1c0fe5ad98305d22fd3f1e45942e554f5af2877591d22cca4",
+    "capture_process.py": "b32fd312b9ae540c9d0d1c203adc8ccd28bc73e7b76dd34473b88b44fd2a4ee0",
+    "worker.py": "ee6980d4ad4f840e47f5ef1ba535171ae3e9f6d2c5576e7190acc85de246b76e",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
