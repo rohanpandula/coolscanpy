@@ -64,7 +64,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
     "capture_process.py": "e66a50d07a4704a10f38f3d477432e0e2b3853c23c43a70e740950bd2dccb2ea",
-    "worker.py": "cf86931034df9a415f044f972050c3fb89735e9aa0543891b67da150daa7d354",
+    "worker.py": "5ae9ea9d0cc450fd4bc84322f0417c16d2dc1486f4f8a84f057494949f5b5faf",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
