@@ -1,6 +1,6 @@
 # CoolscanPy
 
-CoolscanPy 0.7.10 is a standalone Python acquisition library for the Nikon
+CoolscanPy 0.7.11 is a standalone Python acquisition library for the Nikon
 Super Coolscan 5000 ED (LS-5000). Its main path previews a strip or roll,
 binds reviewed frame positions to that insertion, and captures color-negative
 frames over direct USB. It returns scanner-linear pixels and acquisition
@@ -11,7 +11,7 @@ public API does not depend on either application.
 
 ## Scope and support
 
-| Area | Contract in 0.7.10 |
+| Area | Contract in 0.7.11 |
 | --- | --- |
 | Scanner | LS-5000. LS-40 and LS-50 direct-USB identities require explicit `allow_unverified=True`; all other unsupported identities remain refused. The opt-in paths are hardware-unvalidated. |
 | Roll adapter | Strip-feeder identities `6Strip` and `36Strip` are accepted. A positively identified mount adapter is refused by the roll path. This allowlist is not a hardware-validation matrix. |
@@ -23,6 +23,16 @@ public API does not depend on either application.
 
 Tests use synthetic devices and protocol replays. They do not establish
 compatibility with every firmware or feeder modification.
+
+Version 0.7.11 accepts an explicitly commanded RGB authority after capture
+only when its applied, bounded ticks match the fine-scan contract and the
+accepted controller and infrared bindings remain intact. One LS-5000 ED /
+firmware 1.03 / SA-30 first capture completed and its receipt passed roll
+verification after this fix. A second held round refused before capture on a
+plan-validation mismatch because it reused the prior round's already patched
+one-sample plan. Resumed rounds now derive selection from the original
+canonical plan before applying their current sample contract. This second fix
+remains pending repeat hardware validation.
 
 Version 0.7.10 routes presence checks through an existing preview-held worker
 and gives each resumed held scan round a distinct artifact directory bound to
@@ -38,7 +48,7 @@ failures still stop. These new workflows remain hardware-unvalidated.
 The matching single-sample validation-order fix completed one LS-5000 ED /
 firmware 1.03 / SA-30 4000 dpi 16-bit RGBI frame in ScanStudio on 2026-09-08,
 with exactly 189,194,240 fine bytes. This is one-frame evidence, not full-roll
-or other-model qualification. See [CHANGELOG.md](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/CHANGELOG.md).
+or other-model qualification. See [CHANGELOG.md](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/CHANGELOG.md).
 
 Version 0.7.7 adds `samples_per_scan` (1 or 4, default 4) to `Roll.scan`,
 `Roll.scan_many`, and the batch job. The 4-sample capture is byte-for-byte
@@ -54,7 +64,7 @@ Use Python 3.13 or later in a virtual environment:
 ```sh
 python3.13 -m venv .venv
 source .venv/bin/activate
-python -m pip install 'coolscanpy==0.7.10'
+python -m pip install 'coolscanpy==0.7.11'
 ```
 
 Direct USB requires a host libusb 1.0 runtime that PyUSB can load. Typical
@@ -71,7 +81,7 @@ sudo apt install libusb-1.0-0
 The process needs USB access permission and exclusive interface ownership.
 Close competing scanner applications and resolve surviving workers before
 opening a replacement session. Frozen applications must bundle libusb; see
-the [loader contract](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py).
+the [loader contract](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/protocol/ls5000_single_pass/usb_backend.py).
 
 Discovery, the color roll workflow, presence probing, and `Device.eject()`
 use the base installation. SANE is not required for those paths.
@@ -82,7 +92,7 @@ Install the extra only when using the plain `Device.scan()` API or the
 SANE-based diagnostic workflows:
 
 ```sh
-python -m pip install 'coolscanpy[scanner]==0.7.10'
+python -m pip install 'coolscanpy[scanner]==0.7.11'
 ```
 
 Building `python-sane` requires host SANE headers. On macOS:
@@ -91,7 +101,7 @@ Building `python-sane` requires host SANE headers. On macOS:
 brew install sane-backends
 CPPFLAGS="-I$(brew --prefix)/include" \
 LDFLAGS="-L$(brew --prefix)/lib" \
-python -m pip install 'coolscanpy[scanner]==0.7.10'
+python -m pip install 'coolscanpy[scanner]==0.7.11'
 ```
 
 On Debian / Ubuntu, install `libsane-dev` before installing the extra.
@@ -216,12 +226,12 @@ meter measurements. Advanced contracts live alongside the implementation:
 
 | Contract | Reference |
 | --- | --- |
-| Frame arrays, receipts, density ownership and repair inputs | [Public types](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/types.py) |
-| Validated manual placement and restored preview state | [Preview sessions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/roll/preview_session.py), [Roll API](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/_roll.py) |
-| Short-strip geometry, terminal slots and fingerprint validation | [Transport index](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/protocol/ls5000_single_pass/roll_index.py) |
-| Capture resource and implementation hashes | [Bundle integrity](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/protocol/ls5000_single_pass/bundle.py) |
-| Strict EBDE padding validation and streaming/offline parity | [Packed decoder](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/protocol/ls5000_single_pass/packed.py) |
-| Streaming artifact validation and raw-capture fallback | [Capture finalization](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/capture/single_pass_workflow.py) |
+| Frame arrays, receipts, density ownership and repair inputs | [Public types](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/types.py) |
+| Validated manual placement and restored preview state | [Preview sessions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/roll/preview_session.py), [Roll API](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/_roll.py) |
+| Short-strip geometry, terminal slots and fingerprint validation | [Transport index](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/protocol/ls5000_single_pass/roll_index.py) |
+| Capture resource and implementation hashes | [Bundle integrity](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/protocol/ls5000_single_pass/bundle.py) |
+| Strict EBDE padding validation and streaming/offline parity | [Packed decoder](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/protocol/ls5000_single_pass/packed.py) |
+| Streaming artifact validation and raw-capture fallback | [Capture finalization](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/capture/single_pass_workflow.py) |
 
 Concurrent decoding is advisory: invalid or unavailable derived data falls
 back to the retained raw capture. `COOLSCANPY_CAPTURE_STREAMING=0` disables
@@ -287,8 +297,8 @@ return into an error. A transport-index stall is a stop condition: preserve
 the attempt and do not repeatedly retry the same insertion.
 
 For exact exception payloads and held-child teardown behavior, see
-[exceptions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/exceptions.py) and the
-[capture process adapter](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/src/coolscanpy/protocol/ls5000_single_pass/capture_process.py).
+[exceptions](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/exceptions.py) and the
+[capture process adapter](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/src/coolscanpy/protocol/ls5000_single_pass/capture_process.py).
 
 ## Plain scan and diagnostic commands
 
@@ -383,8 +393,8 @@ Change capture-bundle hashes only after the affected regression checks pass.
 2. Review the change and merge a green PR into `port/cross-platform` after
    the full tests and Ruff pass on the CI matrix.
 3. Tag the reviewed, merged release commit with the matching version and
-   push that tag. For this release, the tag is `v0.7.10`.
-4. Monitor [the publishing workflow](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/.github/workflows/publish.yml), then
+   push that tag. For this release, the tag is `v0.7.11`.
+4. Monitor [the publishing workflow](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/.github/workflows/publish.yml), then
    verify both PyPI artifacts, metadata, source contents, and attestations.
 
 Pushing a `v*` tag triggers publication. The workflow first requires the tag
@@ -406,4 +416,4 @@ install them or assert equivalence between their rendered output and a
 particular scanner application.
 
 CoolscanPy originated in a NegPy fork and is distributed independently under
-[GPL-3.0-only](https://github.com/rohanpandula/coolscanpy/blob/v0.7.10/LICENSE).
+[GPL-3.0-only](https://github.com/rohanpandula/coolscanpy/blob/v0.7.11/LICENSE).
