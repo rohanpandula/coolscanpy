@@ -29,7 +29,10 @@ only when its applied, bounded ticks match the fine-scan contract and the
 accepted controller and infrared bindings remain intact. One LS-5000 ED /
 firmware 1.03 / SA-30 first capture completed and its receipt passed roll
 verification after this fix. A second held round refused before capture on a
-session-identity mismatch, so repeated held capture remains unqualified.
+plan-validation mismatch because it reused the prior round's already patched
+one-sample plan. Resumed rounds now derive selection from the original
+canonical plan before applying their current sample contract. This second fix
+remains pending repeat hardware validation.
 
 Version 0.7.10 routes presence checks through an existing preview-held worker
 and gives each resumed held scan round a distinct artifact directory bound to

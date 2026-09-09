@@ -9,9 +9,12 @@
   sources and tampered override evidence still fail closed. Legacy
   `nikon-parity-guarded-v2` journals remain compatible. On one LS-5000 ED /
   firmware 1.03 / SA-30 run, the first capture completed and its receipt passed
-  roll verification after this fix. A second held round then refused before
-  capture on a session-identity mismatch, so repeated held capture remains
-  unqualified.
+  roll verification after this fix. The next held round exposed a separate
+  refusal: frame selection was revalidated against the prior round's already
+  patched one-sample plan instead of the original canonical plan. Resumed
+  rounds now derive their selection from the canonical plan before applying
+  the current round's sample contract. This second fix remains pending repeat
+  hardware validation.
 
 ## 0.7.10 - 2026-09-08
 

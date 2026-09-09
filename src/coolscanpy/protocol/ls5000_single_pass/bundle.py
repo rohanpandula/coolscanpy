@@ -28,6 +28,8 @@ CANONICAL_MANIFEST_FILENAME = "replay-first-rgbi4-manifest.json"
 # density-source cap-0x10d/f03 exposures, the proven 97-dpi reservation-preview
 # evidence, runtime arithmetic gate, and exact per-frame ownership receipt.
 CAPTURE_BUNDLE_COMPONENT_SHA256 = {
+    # Resealed 2026-09-08: resumed held rounds derive frame selection from the
+    # canonical plan before applying that round's fine-read sample contract.
     # Resealed 2026-09-08: held-child non-motion film-status rendezvous.
     # Resealed 2026-09-08: held-session meter-only authority and 1x validation
     # ordering; wire plans and continuation resources are unchanged.
@@ -64,7 +66,7 @@ CAPTURE_BUNDLE_COMPONENT_SHA256 = {
     # roll-confidence gate plus its journal marker. No wire resource, plan,
     # or continuation template changed, so their pins are untouched.
     "capture_process.py": "e66a50d07a4704a10f38f3d477432e0e2b3853c23c43a70e740950bd2dccb2ea",
-    "worker.py": "5ae9ea9d0cc450fd4bc84322f0417c16d2dc1486f4f8a84f057494949f5b5faf",
+    "worker.py": "d638aaff349895352a086343581b86cfc1bff3d266d23ef9e8104c8b41876bd5",
     "manual_frames.py": "8fc4ba82c177e1b7ecd6943354db33930b468ef3b4b82c712202b8caea54c9bb",
     "usb_backend.py": "666a476ce706a4a854aac50116575e7143f5a1a7c1b1085125347696d89348d1",
     "density.py": "c2c47de2886bc4b60197d2721b6d72050a76f1095760590fa7bb34a728b9da76",
