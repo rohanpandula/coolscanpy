@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.11 - 2026-09-08
+
+- Accept the worker's `explicit-rgb-override` authority at both post-capture
+  consumers only when the journal records an applied override whose exact,
+  bounded RGB ticks match the commanded fine-scan contract. Controller
+  acceptance, the active solve, and unchanged infrared remain bound; unknown
+  sources and tampered override evidence still fail closed. Legacy
+  `nikon-parity-guarded-v2` journals remain compatible. On one LS-5000 ED /
+  firmware 1.03 / SA-30 run, the first capture completed and its receipt passed
+  roll verification after this fix. A second held round then refused before
+  capture on a session-identity mismatch, so repeated held capture remains
+  unqualified.
+
 ## 0.7.10 - 2026-09-08
 
 - Route `Roll.film_present()` through the child that owns a preview-held USB
